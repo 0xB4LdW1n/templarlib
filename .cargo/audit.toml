@@ -1,0 +1,13 @@
+# cargo-audit configuration. Keep the ignore list identical to deny.toml,
+# where each entry carries its reason.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0346",
+    "RUSTSEC-2026-0349",
+    "RUSTSEC-2026-0098",
+    "RUSTSEC-2026-0099",
+    "RUSTSEC-2026-0104",
+    "RUSTSEC-2026-0382",
+    "RUSTSEC-2026-0381",
+    "RUSTSEC-2021-0127",
+]

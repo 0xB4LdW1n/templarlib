@@ -1,0 +1,102 @@
+# The checks every change must pass: formatting, lints, tests, the build with
+# the optional features off, and the dependency policy (licences, sources,
+# advisories).
+#
+# Runs on every push to main and on every pull request, forks included.
+# Nothing here is privileged: the token is read-only and no secret is used.
+#
+# Third-party actions are pinned to a full commit SHA (the comment names the
+# release). To update one, resolve the new tag's commit, dereferencing an
+# annotated tag: gh api repos/<owner>/<repo>/git/ref/tags/<tag>
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # A new advisory can land without any change here: check once a day too.
+  schedule:
+    - cron: "17 5 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Pinned rather than `stable` so the lint set is fixed: a new Rust release
+  # cannot fail `-D warnings` on a tree that did not change. Keep in step with
+  # templar-wallet's ci.yml. Bump on purpose, after running clippy with it.
+  RUST_TOOLCHAIN: "1.95.0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The USB stack (hidapi's hidraw backend, serialport) finds devices
+      # through libudev; nothing else in Cargo.lock needs a system library.
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libudev-dev pkg-config
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master, 2026-09-12 (no release tags)
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format
+        run: cargo fmt --all -- --check
+      # --locked: a Cargo.lock that no longer matches the manifests fails here
+      # instead of being rewritten.
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --locked --workspace
+      # The optional features must stay optional: no `hardware` (the Android
+      # build of templar-wallet) and no `protocol`.
+      - name: Build without default features
+        run: |
+          cargo check --locked -p templar-core --no-default-features
+          cargo clippy --locked -p templarlib --no-default-features --all-targets -- -D warnings
+      - name: Examples
+        run: cargo build --locked --workspace --examples
+
+  deny:
+    name: Dependency policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Licences, sources, bans and advisories, as configured in deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: --all-features
+
+  audit:
+    name: Advisories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-audit
+      # Ignored advisories are listed in .cargo/audit.toml (reasons in deny.toml).
+      - name: cargo audit
+        run: cargo audit
