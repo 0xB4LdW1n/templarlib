@@ -440,7 +440,7 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
             liquid::protocol_escrow_xpub(state, &p.wallet_id).map(Value::String)
         }
 
-        // Proof of key (connector-protocol.md §9): build the check for a
+        // Proof of key (docs/CONNECTOR.md §9): build the check for a
         // connect, judge the one a `proof` signing request carries. Neither
         // needs the wallet open — the key comes from the seed and the shape
         // from the challenge; signing goes through `sign_pset` as usual.

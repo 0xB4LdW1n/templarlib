@@ -737,7 +737,7 @@ pub struct PsetParams {
     pub pset_base64: String,
 }
 
-/// `protocol_check_pset`: build the proof-of-key check (connector-protocol.md
+/// `protocol_check_pset`: build the proof-of-key check (docs/CONNECTOR.md
 /// §9.1) for this wallet's loan key and a site's challenge text.
 #[derive(Deserialize, Debug)]
 pub struct ProtocolCheckParams {

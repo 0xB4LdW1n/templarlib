@@ -341,8 +341,8 @@ pub fn open_by_fingerprint(fingerprint: &str) -> Result<(NativeDeviceInfo, Devic
 
 /// USB vendor IDs we recognise, with the transport each uses.
 ///
-/// Sourced from the udev rules this repo bundles for Linux
-/// (`src/templar_wallet/assets/udev/`), which come from the HWI project — so the
+/// Sourced from the udev rules templar-wallet bundles for Linux
+/// (`apps/gui/assets/udev/` there), which come from the HWI project — so the
 /// three places that need to agree about what a hardware wallet looks like
 /// (Linux permissions, native enumeration, the docs) agree by construction.
 const KNOWN_VENDORS: &[(u16, DeviceFamily, Transport)] = &[

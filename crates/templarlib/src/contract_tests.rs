@@ -5,7 +5,7 @@
 //! offline (nothing here calls `sync_wallet` or touches an Electrum server).
 //!
 //! The key assertions mirror the exact JSON keys the Dart decode sites read
-//! (`src/templar_wallet/lib/bridge/ffi_wallet_bridge.dart` and the model
+//! (templar-wallet's `apps/gui/lib/bridge/ffi_wallet_bridge.dart` and the model
 //! `fromJson` factories), so a shape drift on either side of the boundary
 //! fails here before it ships — a decode-shape bug already shipped once
 //! (commit 0b75bd9).
@@ -2078,7 +2078,7 @@ fn get_protocol_escrow_xpub_has_the_protocol_shape() {
     let xpub = xpub.as_str().expect("keyorigin xpub string");
     assert!(
         xpub.starts_with("[73c5da0a/2121h/1h/0h]tpub"),
-        "docs/connector-protocol.md §2 shape expected, got {xpub}"
+        "docs/CONNECTOR.md §2 shape expected, got {xpub}"
     );
     // The same value the core derives directly.
     assert_eq!(

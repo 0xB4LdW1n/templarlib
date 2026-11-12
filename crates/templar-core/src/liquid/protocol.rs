@@ -1,5 +1,5 @@
-//! Templar Protocol connector helpers — the wallet side of
-//! `docs/connector-protocol.md` in the Templar Protocol repository.
+//! Templar Protocol connector helpers — the wallet side of the connector
+//! contract in `docs/CONNECTOR.md`.
 //!
 //! A loan escrow is a per-loan CT descriptor
 //!
@@ -71,7 +71,7 @@ pub fn escrow_xpub_from_mnemonic(mnemonic: &str) -> Result<String, TemplarError>
     escrow_account_xpub(&signer)
 }
 
-// ── Proof of key: the check PSET (connector-protocol.md §9) ──────────────────
+// ── Proof of key: the check PSET (docs/CONNECTOR.md §9) ──────────────────────
 //
 // A site identifies a wallet by its loan key — the `2121h` escrow account,
 // or a Jade's `87h` BIP87 account — and lets it back in by a signature on a

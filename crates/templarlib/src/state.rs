@@ -531,7 +531,7 @@ impl AppState {
     ///      by templar-core's binary lookup).
     ///   2. App-managed standalone binary at `<data_dir>/hwi/` (auto-downloaded
     ///      by the UI from bitcoin-core/HWI releases — identical on every OS).
-    ///   3. App-managed venv at `<data_dir>/venv` (scripts/setup_hwi_macos.sh).
+    ///   3. App-managed venv at `<data_dir>/venv` (templar-wallet's scripts/setup_hwi_macos.sh).
     ///   4. Nothing found — no override installed; `hwi` is looked up on PATH.
     #[cfg(feature = "hardware")]
     fn setup_hwi_env(data_dir: &std::path::Path) {

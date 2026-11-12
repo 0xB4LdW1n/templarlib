@@ -83,7 +83,7 @@ fn protocol_proof_key(state: &AppState, wallet_id: &str) -> Result<String, Strin
 }
 
 #[cfg(feature = "protocol")]
-/// Builds the unsigned check PSET of connector-protocol.md §9.1 for this
+/// Builds the unsigned check PSET of docs/CONNECTOR.md §9.1 for this
 /// wallet's loan key and the site's `challenge` — what a v1.1 connect signs
 /// (with `sign_pset`, like any PSET naming the key) and sends as `proof`.
 pub fn protocol_check_pset(
