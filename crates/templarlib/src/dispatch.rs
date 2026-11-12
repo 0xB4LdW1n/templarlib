@@ -20,17 +20,19 @@ use crate::types::{
     CreateWatchOnlyParams, DeleteWalletParams, DeriveCosignerXpubParams,
     DeriveLiquidDescriptorParams, GenerateAddressParams, GenerateMnemonicParams, InspectPsbtParams,
     IssueAssetParams, ListActivityParams, ListUtxosParams, OpenWalletParams, PreviewFeeBumpParams,
-    PreviewTxParams, ProtocolCheckParams, ProtocolIsCheckParams, PsetParams, ReissueAssetParams,
-    RenameWalletParams, ReregisterAssetParams, SendTxParams, SetLiquidNetworkParams,
-    SetUtxosFrozenParams, SignPsbtParams, SyncOutcomeDto, TxOutputSpec, UrDecodePartsParams,
-    UrPsbtEncodeParams, UrPsetEncodeParams, ValidateCosignerKeyParams, VaultKeyParams,
-    VaultPassphraseParams, VerifyBackupParams, WalletIdParams,
+    PreviewTxParams, PsetParams, ReissueAssetParams, RenameWalletParams, ReregisterAssetParams,
+    SendTxParams, SetLiquidNetworkParams, SetUtxosFrozenParams, SignPsbtParams, SyncOutcomeDto,
+    TxOutputSpec, UrDecodePartsParams, UrPsbtEncodeParams, UrPsetEncodeParams,
+    ValidateCosignerKeyParams, VaultKeyParams, VaultPassphraseParams, VerifyBackupParams,
+    WalletIdParams,
 };
 #[cfg(feature = "hardware")]
 use crate::types::{
     HwFingerprintParams, ImportHwWalletParams, ImportJadeLiquidParams, SetHwiPathParams,
     SignPsbtHwParams, VerifyHwAddressParams,
 };
+#[cfg(feature = "protocol")]
+use crate::types::{ProtocolCheckParams, ProtocolIsCheckParams};
 
 /// Entry point — returns `{"ok": value}` or `{"err": "message"}`.
 pub fn dispatch(state: &mut AppState, method: &str, params: &Value) -> Value {
@@ -431,6 +433,7 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         // Every one of these needs the wallet open: PSET amounts are blinded,
         // and finalize/broadcast go through the wallet's own descriptor.
         // ── Templar Protocol connector ─────────────────────────────
+        #[cfg(feature = "protocol")]
         "get_protocol_escrow_xpub" => {
             let p: WalletIdParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
@@ -441,6 +444,7 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         // connect, judge the one a `proof` signing request carries. Neither
         // needs the wallet open — the key comes from the seed and the shape
         // from the challenge; signing goes through `sign_pset` as usual.
+        #[cfg(feature = "protocol")]
         "protocol_check_pset" => {
             let p: ProtocolCheckParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
@@ -448,6 +452,7 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
                 .map(|v| serde_json::to_value(v).unwrap())
         }
 
+        #[cfg(feature = "protocol")]
         "protocol_is_check_pset" => {
             let p: ProtocolIsCheckParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;

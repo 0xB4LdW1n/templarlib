@@ -23,5 +23,8 @@ tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
 [features]
-default = ["hardware"]
+default = ["hardware", "protocol"]
+# The Templar Protocol connector methods: `get_protocol_escrow_xpub`,
+# `protocol_check_pset`, `protocol_is_check_pset` (docs/CONNECTOR.md).
+protocol = ["templar-core/protocol"]
 hardware = ["templar-core/hardware"]

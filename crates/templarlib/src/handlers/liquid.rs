@@ -11,11 +11,13 @@ use templar_core::{LiquidBackend, LiquidNetwork, REGTEST_DEFAULT_POLICY_ASSET};
 
 use crate::state::AppState;
 use crate::types::{
-    IssueResultDto, LiquidNetworkDto, NetChangeDto, ProtocolCheckDto, ProtocolCheckVerdictDto,
-    PsetInputDto, PsetInspectionDto, PsetOutputDto, PsetRecipientDto, TxIoDto, TxOutputSpec,
-    TxPreviewDto,
+    IssueResultDto, LiquidNetworkDto, NetChangeDto, PsetInputDto, PsetInspectionDto, PsetOutputDto,
+    PsetRecipientDto, TxIoDto, TxOutputSpec, TxPreviewDto,
 };
+#[cfg(feature = "protocol")]
+use crate::types::{ProtocolCheckDto, ProtocolCheckVerdictDto};
 
+#[cfg(feature = "protocol")]
 /// The clear message every proof route gives a Jade-backed wallet until the
 /// check has been exercised on a device: Jade signs confidential inputs, and
 /// the zero-value check carries an explicit one.
@@ -23,6 +25,7 @@ pub const JADE_PROOF_UNSUPPORTED: &str =
     "Proof of key through a Jade is not supported yet: the check needs a zero-value input the \
      device has not been tested with. Connect a software wallet, or sign the proof with one.";
 
+#[cfg(feature = "protocol")]
 /// The wallet's Templar Protocol loan key in keyorigin form — what the
 /// `templar://connect` callback sends as `escrow_xpub`.
 ///
@@ -61,6 +64,7 @@ pub fn protocol_escrow_xpub(state: &AppState, wallet_id: &str) -> Result<String,
     }
 }
 
+#[cfg(feature = "protocol")]
 /// The loan key a proof is built or judged with, from the registry alone:
 /// a software wallet's escrow account. A Jade would have to be asked for
 /// its 87h key on every call and cannot sign the check yet, so every proof
@@ -78,6 +82,7 @@ fn protocol_proof_key(state: &AppState, wallet_id: &str) -> Result<String, Strin
     }
 }
 
+#[cfg(feature = "protocol")]
 /// Builds the unsigned check PSET of connector-protocol.md §9.1 for this
 /// wallet's loan key and the site's `challenge` — what a v1.1 connect signs
 /// (with `sign_pset`, like any PSET naming the key) and sends as `proof`.
@@ -98,6 +103,7 @@ pub fn protocol_check_pset(
     })
 }
 
+#[cfg(feature = "protocol")]
 /// §9.5: whether `pset_base64` is exactly the check of `challenge` for this
 /// wallet's loan key on the active network — recomputed here, never taken
 /// from the site. A false verdict carries the reason the review shows.

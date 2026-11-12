@@ -7,6 +7,7 @@ pub mod hardware;
 pub mod liquidex;
 pub mod multisig;
 pub mod network;
+#[cfg(feature = "protocol")]
 pub mod protocol;
 pub mod pset;
 pub mod wallet;

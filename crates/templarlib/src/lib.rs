@@ -65,8 +65,11 @@ pub const METHODS: &[&str] = &[
     "repair_multisig_wallet",
     "validate_cosigner_key",
     "ur_decode_parts",
+    #[cfg(feature = "protocol")]
     "get_protocol_escrow_xpub",
+    #[cfg(feature = "protocol")]
     "protocol_check_pset",
+    #[cfg(feature = "protocol")]
     "protocol_is_check_pset",
     "inspect_pset",
     "sign_pset",

@@ -80,7 +80,11 @@ rand            = "0.8"
 tempfile = "3"
 
 [features]
-default = ["hardware"]
+default = ["hardware", "protocol"]
+# The wallet side of Templar Protocol (docs/CONNECTOR.md): the escrow account
+# key and the proof-of-key check PSET, in `liquid::protocol`. Pure Rust, no
+# extra dependencies; a host that never talks to the protocol can leave it out.
+protocol = []
 # USB hardware wallets: Ledger and the other HID signers (hidapi), Jade over
 # serial (serialport, lwk_jade), Ledger's Bitcoin-app client and the CBOR
 # dialect. None of it runs on stock Android — that build uses

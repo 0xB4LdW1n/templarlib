@@ -734,14 +734,17 @@ mod tests {
         escrow.extend([0xad, 0x03, 0x40, 0xf1, 0x19, 0xb1, 0x68]);
         assert_eq!(multisig_threshold(&escrow), Some(2));
         // The real thing, from the Templar Protocol fixture.
-        let pset = crate::liquid::protocol::tests::escrow_spend_pset(
-            &crate::liquid::network::LiquidNetwork::testnet(),
-            crate::liquid::protocol::tests::dummy_payout_script(),
-            1_000,
-            500,
-        );
-        let script = pset.inputs()[0].witness_script.clone().unwrap();
-        assert_eq!(multisig_threshold(script.as_bytes()), Some(2));
+        #[cfg(feature = "protocol")]
+        {
+            let pset = crate::liquid::protocol::tests::escrow_spend_pset(
+                &crate::liquid::network::LiquidNetwork::testnet(),
+                crate::liquid::protocol::tests::dummy_payout_script(),
+                1_000,
+                500,
+            );
+            let script = pset.inputs()[0].witness_script.clone().unwrap();
+            assert_eq!(multisig_threshold(script.as_bytes()), Some(2));
+        }
 
         // Not judged: single key, k > n, wrong key count, truncated, and a
         // script that only *ends* in CHECKMULTISIG.

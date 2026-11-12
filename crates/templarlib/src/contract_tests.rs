@@ -2069,6 +2069,7 @@ fn regtest_node_sync_and_send_end_to_end() {
 /// `liquid::protocol::tests::print_escrow_fixture`.
 const ESCROW_FIXTURE: &str = "cHNldP8BAgQCAAAAAQQBAQEFAQIB+wQCAAAAAAEBTgFJmoGFRfa645/AO2N/Kk4eZOWQysG8Om9tcapEQ2VMFAEAAAAAAA9CQAAiACCgE5MA82qHuUPx4nzHNwjxWCSc8+rg4rQ5CNB5Vs74AAEFclIhAhdnH707KagoCN5XkC2n+EOOzDitCmvJT01Ihb6KrdQaIQNjxKZ9muqLcb6BIp5cvl1jHmT6QMHHAlKIgyIYaGd7QlKuc2QhA2PEpn2a6otxvoEinly+XWMeZPpAwccCUoiDIhhoZ3tCrQOg8BmxaCIGAhdnH707KagoCN5XkC2n+EOOzDitCmvJT01Ihb6KrdQaGHPF2gpJCACAAQAAgAAAAIAAAAAABwAAACIGA2PEpn2a6otxvoEinly+XWMeZPpAwccCUoiDIhhoZ3tCGD9jWmNJCACAAQAAgAAAAIAAAAAABwAAAAEOICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiAQ8EAAAAAAf8BHBzZXQRCEBCDwAAAAAAB/wEcHNldBMgSZqBhUX2uuOfwDtjfypOHmTlkMrBvDpvbXGqRENlTBQAAQMITEAPAAAAAAAH/ARwc2V0AiBJmoGFRfa645/AO2N/Kk4eZOWQysG8Om9tcapEQ2VMFAEEFgAUAQIDBAUGBwgJCgsMDQ4PEBESExQAAQMI9AEAAAAAAAAH/ARwc2V0AiBJmoGFRfa645/AO2N/Kk4eZOWQysG8Om9tcapEQ2VMFAEEAAA=";
 
+#[cfg(feature = "protocol")]
 #[test]
 fn get_protocol_escrow_xpub_has_the_protocol_shape() {
     let mut env = TestEnv::new();
@@ -2102,11 +2103,13 @@ fn get_protocol_escrow_xpub_has_the_protocol_shape() {
     assert!(err.contains("not found"), "{err}");
 }
 
+#[cfg(feature = "protocol")]
 /// The exact §9.1 challenge line a site sends; the proof is bound to it.
 const CHALLENGE: &str = "Templar Protocol · access · http://127.0.0.1:8087 · \
                          nonce=AAAAAAAAAAAAAAAAAAAAAA · expires=2026-10-03T10:15:00Z · \
                          this signature never moves funds";
 
+#[cfg(feature = "protocol")]
 /// Proof of key, end to end through the shared API: the check is built for the
 /// wallet's escrow key, reads as "not my coin, 0, OP_RETURN, fee 0", is
 /// recognised as the check of its own challenge, signs once through the
@@ -2270,7 +2273,7 @@ fn protocol_check_pset_is_built_signed_and_judged() {
 // ── Live acceptance against the Templar Protocol site (regtest) ────────────
 //
 // The same dispatch the app's bridge calls, driven against the running site
-// (`cargo run -p squid-ops -- up` in the protocol repository; the site reads
+// (`cargo run -p templar-lend-ops -- up` in the protocol repository; the site reads
 // its env from `data/regtest/regtest.env`). Ignored by default: each needs a
 // link the site hands out to a browser.
 //
@@ -2284,14 +2287,17 @@ fn protocol_check_pset_is_built_signed_and_judged() {
 //   TEMPLAR_LIVE_CONNECT_LINK='templar://connect?url=…&nonce=…' \
 //     cargo test -p templarlib live_connect -- --ignored --nocapture
 
+#[cfg(feature = "protocol")]
 fn live_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("set {name} (see the comment above)"))
 }
 
+#[cfg(feature = "protocol")]
 fn live_mnemonic() -> String {
     std::env::var("TEMPLAR_LIVE_MNEMONIC").unwrap_or_else(|_| MNEMONIC.to_string())
 }
 
+#[cfg(feature = "protocol")]
 /// `templar://<action>?url=<percent-encoded>&nonce=<…>` → (url, nonce).
 fn live_link(link: &str, action: &str) -> (String, String) {
     let (head, query) = link
@@ -2315,6 +2321,7 @@ fn live_link(link: &str, action: &str) -> (String, String) {
     (url, nonce)
 }
 
+#[cfg(feature = "protocol")]
 fn live_percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -2333,6 +2340,7 @@ fn live_percent_decode(s: &str) -> String {
     String::from_utf8(out).expect("utf-8 link")
 }
 
+#[cfg(feature = "protocol")]
 fn live_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
@@ -2340,6 +2348,7 @@ fn live_client() -> reqwest::blocking::Client {
         .expect("http client")
 }
 
+#[cfg(feature = "protocol")]
 fn live_json(resp: reqwest::blocking::Response) -> (u16, Value) {
     let status = resp.status().as_u16();
     let text = resp.text().unwrap_or_default();
@@ -2347,6 +2356,7 @@ fn live_json(resp: reqwest::blocking::Response) -> (u16, Value) {
     (status, body)
 }
 
+#[cfg(feature = "protocol")]
 fn live_get(url: &str) -> (u16, Value) {
     live_json(
         live_client()
@@ -2357,6 +2367,7 @@ fn live_get(url: &str) -> (u16, Value) {
     )
 }
 
+#[cfg(feature = "protocol")]
 fn live_post(url: &str, body: &Value) -> (u16, Value) {
     live_json(
         live_client()
@@ -2368,6 +2379,7 @@ fn live_post(url: &str, body: &Value) -> (u16, Value) {
     )
 }
 
+#[cfg(feature = "protocol")]
 fn live_bearer(method: &str, url: &str, token: &str, body: Option<&Value>) -> (u16, Value) {
     let client = live_client();
     let req = match method {
@@ -2384,6 +2396,7 @@ fn live_bearer(method: &str, url: &str, token: &str, body: Option<&Value>) -> (u
     live_json(req.send().unwrap_or_else(|e| panic!("{method} {url}: {e}")))
 }
 
+#[cfg(feature = "protocol")]
 /// A regtest environment holding the live wallet, opened.
 fn live_wallet(env: &mut TestEnv, site_policy_asset: Option<&str>) -> String {
     let mut params = json!({ "network": "regtest" });
@@ -2398,6 +2411,7 @@ fn live_wallet(env: &mut TestEnv, site_policy_asset: Option<&str>) -> String {
     created["id"].as_str().unwrap().to_string()
 }
 
+#[cfg(feature = "protocol")]
 /// §3 v1.1 + §7 + §8 against the live site: connect with the proof of key
 /// in the callback, get the portfolio token back, read the loans, mint a
 /// one-time browser link. What the Loans screen does, minus the pixels.
@@ -2553,6 +2567,7 @@ fn live_connect_with_proof_then_portfolio_and_open() {
     assert_eq!(status, 401);
 }
 
+#[cfg(feature = "protocol")]
 /// §9.2 / §9.5 against the live site: a `proof` signing request the site
 /// built is recognised as the check of its own challenge by the wallet's
 /// recomputation, signed once, and accepted by the site.
