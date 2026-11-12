@@ -1,0 +1,32 @@
+[workspace]
+members = [
+    "crates/templar-core",
+    "crates/templarlib",
+]
+resolver = "2"
+
+# Cargo honours [profile.*] only at the workspace root. A host that builds
+# these crates inside its own workspace must carry the same profiles there.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# Hosts that load the library across a C boundary (templar-wallet's FFI) rely
+# on catch_unwind for panic containment; panic="abort" would turn any Rust
+# panic into a full process crash. Pin it so a future edit can't defeat that.
+panic = "unwind"
+
+# Debug builds keep the memory-hard KDF and the AEAD at full speed: an
+# unoptimised Argon2id at 256 MiB takes many seconds and would misreport the
+# vault as slow. Only these crates are affected; the rest of a dev build stays
+# fast to compile.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
