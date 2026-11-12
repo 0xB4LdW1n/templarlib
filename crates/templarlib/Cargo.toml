@@ -22,6 +22,13 @@ hex = "0.4"
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 
+# The host-embedding walkthrough of docs/INTEGRATION.md. It lives at the
+# repository root so it reads as the library's example, not this crate's;
+# `cargo build --workspace --examples` (CI) builds it.
+[[example]]
+name = "embed"
+path = "../../examples/embed.rs"
+
 [features]
 default = ["hardware", "protocol"]
 # The Templar Protocol connector methods: `get_protocol_escrow_xpub`,
