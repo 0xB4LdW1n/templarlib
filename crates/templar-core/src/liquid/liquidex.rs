@@ -1552,8 +1552,7 @@ fn build_take_tx_core<R: RngCore + CryptoRng>(
     let maker_tx = proposal.transaction()?;
     let maker_in_secrets = proposal.input_secrets()?;
     let maker_out_secrets = proposal.output_secrets()?;
-    let maker_nonce =
-        output_blinding_nonce(proposal).map_err(|e| LiquidError::PsetBuildFailed(e))?;
+    let maker_nonce = output_blinding_nonce(proposal).map_err(LiquidError::PsetBuildFailed)?;
     let offered_asset = maker_in_secrets.asset;
     let offered_amount = maker_in_secrets.value;
     let wanted_asset = maker_out_secrets.asset;
