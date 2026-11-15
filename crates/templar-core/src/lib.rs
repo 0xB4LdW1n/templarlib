@@ -55,7 +55,7 @@ pub use derivation::{
     keyorigin_xpub_bip48, master_xprv, public_descriptor, slip77_blinding_key, validate_mnemonic,
     xpub_to_vpub_testnet, LiquidDerivationInfo, WalletPubInfo,
 };
-pub use endpoints::{Endpoints, Resolved, Source};
+pub use endpoints::{Endpoints, NativePegTerms, PegProvider, Resolved, Source};
 pub use error::{
     BitcoinError, HardwareError, LiquidError, PegError, PolicyError, StorageError, TemplarError,
     TemplarResult, TestServerError, VaultError, ERR_PEG_EXPIRED, ERR_PEG_NOT_READY,

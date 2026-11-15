@@ -19,7 +19,7 @@
 use serde::Serialize;
 
 use crate::bitcoin::wallet::{electrum_env_override, BitcoinBackend};
-use crate::error::TemplarError;
+use crate::error::{PegError, TemplarError};
 use crate::liquid::chain::LiquidBackend;
 use crate::liquid::network::{env_non_empty, LiquidNetwork, ENV_REGTEST_POLICY_ASSET};
 use crate::test_server::TestServerProfile;
@@ -179,6 +179,112 @@ impl<'a> Endpoints<'a> {
     }
 }
 
+/// A test server's native Elements peg: its regtest `peg` block, complete,
+/// and where the claim evidence comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePegTerms {
+    /// The test server's base URL (orders remember which lab they belong to).
+    pub lab_url: String,
+    /// The lab's chain instance; a reset changes it.
+    pub instance_id: String,
+    /// Esplora REST of the lab's Bitcoin regtest (raw transactions and
+    /// merkle proofs for claims).
+    pub esplora_url: String,
+    /// Bitcoin confirmations a peg-in deposit needs before its claim.
+    pub pegin_confirmations: u32,
+    /// Liquid confirmations after which the lab pays a peg-out.
+    pub pegout_confirmations: u32,
+    /// Largest peg-out the lab pays on its own.
+    pub pegout_max_sat: u64,
+}
+
+/// Who performs peg-ins and peg-outs on the active network.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PegProvider {
+    /// The Elements peg of a Templar test server's regtest.
+    Native(NativePegTerms),
+}
+
+impl PegProvider {
+    /// Wire name: `native`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PegProvider::Native(_) => "native",
+        }
+    }
+}
+
+impl Endpoints<'_> {
+    /// The peg provider of the Liquid network `liquid`, or why there is
+    /// none (a [`PegError::Unavailable`]):
+    ///
+    /// - on regtest: the joined test server's native peg, when its config
+    ///   names `"native"` with all three terms and the regtest in use is the
+    ///   lab's own (an environment policy asset that points elsewhere is
+    ///   not);
+    /// - on Liquid testnet: none — testnet has no parent chain, so an
+    ///   Elements peg cannot exist there.
+    pub fn peg_provider(
+        &self,
+        liquid: &LiquidNetwork,
+    ) -> Result<Resolved<PegProvider>, TemplarError> {
+        let unavailable = |why: String| -> TemplarError { PegError::Unavailable(why).into() };
+        if !liquid.is_regtest() {
+            return Err(unavailable(
+                "Liquid testnet has no parent chain, so it has no native peg-in / peg-out.".into(),
+            ));
+        }
+        let Some(p) = self.profile else {
+            return Err(unavailable(
+                "a plain Liquid regtest has no peg. Join a Templar test server (Settings → \
+                 Test server) to use its native peg."
+                    .into(),
+            ));
+        };
+        let peg = &p.regtest.peg;
+        if peg.provider != "native" {
+            return Err(unavailable(format!(
+                "the test server names peg provider {:?} for its regtest, which this wallet \
+                 does not support there.",
+                peg.provider
+            )));
+        }
+        if *liquid != p.regtest.liquid_network() || !p.regtest.bitcoin_is_regtest() {
+            return Err(unavailable(format!(
+                "the Liquid regtest in use is not the test server's own chain (check \
+                 {ENV_REGTEST_POLICY_ASSET})."
+            )));
+        }
+        let (Some(pegin), Some(pegout), Some(max)) = (
+            peg.pegin_confirmations,
+            peg.pegout_confirmations,
+            peg.pegout_max_sat,
+        ) else {
+            return Err(unavailable(
+                "the test server's peg terms are incomplete (pegin_confirmations, \
+                 pegout_confirmations and pegout_max_sat are all needed)."
+                    .into(),
+            ));
+        };
+        if pegin == 0 || pegout == 0 {
+            return Err(unavailable(
+                "the test server's peg asks for zero confirmations.".into(),
+            ));
+        }
+        Ok(Resolved::new(
+            PegProvider::Native(NativePegTerms {
+                lab_url: p.base_url.clone(),
+                instance_id: p.regtest.instance_id.clone(),
+                esplora_url: p.regtest.bitcoin_esplora_url.clone(),
+                pegin_confirmations: pegin,
+                pegout_confirmations: pegout,
+                pegout_max_sat: max,
+            }),
+            Source::Profile,
+        ))
+    }
+}
+
 /// `scheme://user:pass@host…` → `scheme://***@host…`: for describing a URL
 /// that may carry credentials (an RPC URL from the environment).
 pub fn redact_userinfo(url: &str) -> String {
@@ -273,6 +379,45 @@ mod tests {
             BitcoinBackend::regtest("tcp://h:1").data_root(dir),
             dir.join("bitcoin-regtest")
         );
+    }
+
+    #[test]
+    fn the_native_peg_is_the_labs_and_only_on_its_regtest() {
+        let p = profile();
+        let lab = p.regtest.liquid_network();
+        let r = Endpoints::new(Some(&p)).peg_provider(&lab).unwrap();
+        assert_eq!(r.source, Source::Profile);
+        assert_eq!(r.value.name(), "native");
+        let PegProvider::Native(t) = r.value;
+        assert_eq!(t.pegin_confirmations, 2);
+        assert_eq!(t.pegout_confirmations, 2);
+        assert_eq!(t.pegout_max_sat, 100_000_000);
+        assert_eq!(t.esplora_url, "https://lab.example.org/bitcoin-esplora");
+        assert_eq!(t.instance_id, p.regtest.instance_id);
+
+        let why = |e: &Endpoints<'_>, n: &LiquidNetwork| e.peg_provider(n).unwrap_err().to_string();
+        // Testnet: no parent chain, profile or not.
+        let err = why(&Endpoints::new(Some(&p)), &LiquidNetwork::testnet());
+        assert!(err.starts_with("PEG_UNAVAILABLE: Liquid testnet"), "{err}");
+        // A regtest without a lab.
+        let err = why(&Endpoints::default(), &LiquidNetwork::regtest_default());
+        assert!(err.contains("Join a Templar test server"), "{err}");
+        // Another regtest than the lab's.
+        let err = why(&Endpoints::new(Some(&p)), &LiquidNetwork::regtest_default());
+        assert!(err.contains("not the test server's own chain"), "{err}");
+        // Incomplete or foreign terms.
+        let mut q = p.clone();
+        q.regtest.peg.pegout_max_sat = None;
+        let err = why(&Endpoints::new(Some(&q)), &lab);
+        assert!(err.contains("incomplete"), "{err}");
+        let mut q = p.clone();
+        q.regtest.peg.provider = "sideswap".into();
+        let err = why(&Endpoints::new(Some(&q)), &lab);
+        assert!(err.contains("does not support"), "{err}");
+        let mut q = p.clone();
+        q.regtest.peg.pegin_confirmations = Some(0);
+        let err = why(&Endpoints::new(Some(&q)), &lab);
+        assert!(err.contains("zero confirmations"), "{err}");
     }
 
     #[test]
