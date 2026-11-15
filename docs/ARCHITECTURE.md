@@ -115,7 +115,7 @@ Everything lives under the data directory. Which directory:
 | `templar_wallet.json` | App config (`data_dir`, last wallet, Liquid network) when the data directory was given explicitly. | no |
 | `bdk_sw_<fingerprint>/`, `bdk_ms_<wallet id>/`, `bdk_hw_db/`, `bdk_watchonly_db/` | BDK sled databases (addresses, transactions, sync state). | no |
 | LWK cache directories | `Wollet` persistence per network and descriptor; a cache, rebuilt when inconsistent. | no |
-| `peg_orders.json`, `swap_offers.json`, `atomic_swaps.json` | Simulated peg orders, the wallet's own LiquiDEX offers, HTLC swap records. | no keys (swap keys and the maker's preimage are re-derived from the seed when needed) |
+| `peg_orders.json`, `swap_offers.json`, `atomic_swaps.json` | Peg orders (addresses, txids, a peg-in's claim script and derivation index, signed transactions kept until they are seen on chain), the wallet's own LiquiDEX offers, HTLC swap records. | no keys (swap keys and the maker's preimage are re-derived from the seed when needed) |
 | `hwi/`, `venv/` | An HWI binary or virtualenv a host installed (with `hardware`). | no |
 
 Writes of the registry and the JSON stores go through a temporary file and
@@ -161,6 +161,54 @@ hand) > **default**.
   single routes.
 - Hardware: Ledger and Jade in-process over USB; Trezor, Coldcard, KeepKey,
   BitBox through the `hwi` binary (`TEMPLAR_HWI_BIN` overrides the lookup).
+- Peg provider (`Endpoints::peg_provider`): the lab's native Elements peg
+  on its own regtest, when its config names `"native"` with complete
+  terms; none on Liquid testnet (no parent chain) or a plain regtest. See
+  [Peg](#peg).
+
+## Peg
+
+`handlers/peg/` keeps the orders (`peg_orders.json`) and routes each step
+to the provider of the active network; `handlers/peg/native.rs` is the
+native provider, built from `templar_core::peg` (the peg-out script, the
+Bitcoin chain view, claim-evidence checks), `LiquidChain::fed_peg` and
+`LiquidWalletManager::{pegin_address, create_pegin_claim, create_pegout}`.
+
+- **Peg-in.** The federation comes from the Liquid chain itself (the full
+  dynafed header at the current epoch boundary); the deposit address is
+  LWK's `pegin_address` over one of the wallet's external indexes, a
+  P2SH-P2WSH address on the lab. The order stores the index, the epoch
+  height and the federation script and program, so the same address is
+  rebuilt at claim time. An address is only guaranteed valid through a
+  Liquid height; past it, a status check renews it while the federation is
+  unchanged and expires the order otherwise. Deposits are followed on the
+  wallet's Bitcoin Electrum server.
+- **Claim evidence.** The wallet's Bitcoin Electrum server is the chain
+  view; the lab's Esplora only supplies the raw deposit and its merkle
+  proof. `verify_pegin_evidence` requires the transaction to pay the
+  address exactly once, the proof to commit to it (LWK's `PeginFunding`),
+  the transaction to be the one Electrum lists, the proof's block hash to
+  be Electrum's block at that height, and the depth to be reached. LWK
+  alone checks only the proof against its own header.
+- **Claim.** `add_pegin_input` with an empty manual coin selection (no
+  wallet coin, frozen or not) and everything but the fee to the payout
+  address; signed by `LiquidWalletManager::sign`, so the signing guard
+  runs; the finalized transaction is checked to spend only the peg-in.
+- **Peg-out.** LWK has no peg-out builder. The peg-out output is added as
+  an ordinary LWK `Recipient` whose script is `OP_RETURN <parent genesis>
+  <Bitcoin scriptPubKey>` and which has no blinding key — exactly how LWK
+  builds a burn — so LWK selects coins, adds change and the fee, and
+  blinds the other outputs around the explicit one, balanced. The builder
+  checks the output came out explicit; the finalized transaction is
+  checked with Elements' own `pegout_data()` (one peg-out, the amount, the
+  policy asset, the genesis, the destination). The guard counts only
+  empty-script outputs as fees, so the `OP_RETURN` output is not one.
+  The Bitcoin genesis is read from the wallet's Bitcoin server and must be
+  the one the Liquid chain is pegged to.
+- **Signing only on request.** `peg_status` / `peg_list` read chains and
+  never sign. `peg_fund` and `peg_claim` sign; each signed transaction is
+  written to the order before its broadcast and rebroadcast as is on a
+  retry, so a lost answer never pays twice.
 
 ### Test servers
 

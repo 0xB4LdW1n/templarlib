@@ -6,13 +6,13 @@ Every method `TemplarLib::call` accepts, read from
 `crates/templarlib/src/types.rs`. When this page and the code disagree, the
 code is right and this page has a bug.
 
-**100 methods** with the default features (`METHODS` in
+**102 methods** with the default features (`METHODS` in
 `crates/templarlib/src/lib.rs`, also `TemplarLib::methods()`):
 
-- 97 always present;
+- 99 always present;
 - 3 only with the `protocol` feature, marked **[protocol]**: without it they
   are absent from `METHODS` and answer `Unknown method`;
-- 14 of the 97 marked **[hardware]** need the `hardware` feature: without it
+- 14 of the 99 marked **[hardware]** need the `hardware` feature: without it
   they stay in `METHODS` and answer `HW_UNSUPPORTED: Hardware wallets over
   USB are not available on this platform. Use a QR air-gap wallet to sign
   instead.`
@@ -58,7 +58,8 @@ for as long as that takes. Everything else is local.
 | `Vault is locked — unlock with your passphrase first` | A vault exists and is locked, and the method reads a secret or saves the registry. |
 | `Wallet not found` / `Wallet not found: <id>` | Unknown `wallet_id`. |
 | `Bitcoin wallet not open` / `Liquid wallet not open` | The wallet has no side on that chain (a Bitcoin-only wallet asked for Liquid, a Liquid-only device entry asked for Bitcoin). |
-| `<feature> is not available on Liquid regtest. Switch the Liquid network to testnet in Settings to use it.` | Peg and the public asset registry on regtest. |
+| `<feature> is not available on Liquid regtest. Switch the Liquid network to testnet in Settings to use it.` | The public asset registry on regtest. |
+| Peg tags `PEG_UNAVAILABLE`, `PEG_NOT_READY`, `PEG_EXPIRED`, `PEG_PROOF_REJECTED` | Prefixes of peg refusals ([Peg-in / peg-out](#peg-in--peg-out)). |
 | `HW_UNSUPPORTED: …` | A [hardware] method in a build without `hardware`. |
 | `LIQUID_HW_UNSUPPORTED: …` | A Liquid asset on a Bitcoin-only hardware or air-gap path. |
 | Hardware tags `HWI_MISSING`, `HWI_PERMISSION`, `DEVICE_NOT_READY`, `DEVICE_NOT_FOUND`, `SIGNING_FAILED` | Prefixes of device errors; the text after the tag explains. |
@@ -135,7 +136,9 @@ amount_sats: int, display_amount}]`.
 `backend_description` (no credentials), `env_locked: bool`,
 `regtest_default_policy_asset`, `backend_source` (`env` | `profile` |
 `default`: where the backend came from), `test_server: string?` (base URL
-of the joined test server).
+of the joined test server), `peg_provider: string?` (`native`, or null
+when no peg serves this network), `peg_unavailable_reason: string?` (the
+`PEG_UNAVAILABLE: …` message when `peg_provider` is null).
 
 **TestServer** (`TestServerDto`), the answer of the three test-server
 methods:
@@ -170,12 +173,22 @@ methods:
   source}}`. No credentials appear.
 
 **PegOrder** (`PegOrderDto`): `order_id`, `wallet_id`, `direction` (`in` =
-BTC → L-BTC, `out` = L-BTC → BTC), `status` (`awaiting_deposit` |
-`deposit_seen` | `confirming` | `settling` | `completed` | `cancelled`),
-`deposit_address`, `deposit_expected_sats: u64`, `payout_address`,
-`payout_expected_sats: u64`, `created_at: u64`, `updated_at: u64`,
-`eta_minutes: u32`, `txid_deposit?`, `txid_payout?`, `simulated: bool`,
-`status_history: [{status, at: u64}]`.
+BTC → L-BTC, `out` = L-BTC → BTC), `status` (see
+[statuses](#peg-statuses)), `deposit_address` (peg-in: the Bitcoin address
+to pay; native peg-out: empty, `peg_fund` makes the peg-out),
+`deposit_expected_sats: u64`, `payout_address`, `payout_expected_sats:
+u64` (after a claim: the claim's actual output), `created_at: u64`,
+`updated_at: u64`, `eta_minutes: u32`, `txid_deposit?` (peg-in: the
+Bitcoin deposit; peg-out: the Liquid peg-out), `txid_payout?` (peg-in: the
+claim; peg-out: the federation's Bitcoin payment), `simulated: bool`
+(false for real orders), `status_history: [{status, at: u64}]`, and since
+the native peg: `provider` (`native` | `simulated`), `confirmations: u32`
+(of the deposit: Bitcoin for a peg-in, Liquid for a peg-out),
+`confirmations_required: u32`, `deposit_received_sats: u64?`,
+`txid_claim?`, `valid_until_liquid_height: u32?` (native peg-in: the
+deposit address is guaranteed valid through this Liquid height; renewed
+while the federation is unchanged), `last_error: string?` (why the last
+status check could not read the chains; null when it could).
 
 **SwapLeg** (`SwapLegDto`): `asset_id`, `ticker`, `amount_sats: u64`,
 `display_amount`.
@@ -1221,50 +1234,173 @@ A wrong shape, an unreadable PSET or an unsupported wallet is a `false`
 verdict with the reason, not an error. Errors: wallet not found; an
 invalid stored key.
 
-## Peg-in / peg-out (simulated)
+## Peg-in / peg-out
 
-A simulated provider: no real funds move. Refused on regtest. Orders are
-kept in `peg_orders.json`.
+Pegs go through the **provider** of the active network
+(`get_liquid_network` → `peg_provider`):
+
+- **native**, on the joined test server's Liquid regtest when its config
+  names `"native"` with `pegin_confirmations`, `pegout_confirmations` and
+  `pegout_max_sat`: the Elements peg between the lab's Bitcoin regtest and
+  its Liquid regtest. Real coins, a real claim, a real federation payment.
+  Needs a software wallet with Liquid (it signs with this app's keys).
+- none elsewhere: Liquid testnet has no parent chain, and a plain regtest
+  without a test server has no peg. `peg_quote`, `peg_start`, `peg_fund`
+  and `peg_claim` then answer `PEG_UNAVAILABLE: <why>`.
+
+Orders are kept in `peg_orders.json` and survive network switches;
+`peg_status`, `peg_list` and `peg_cancel` work without a provider (an order
+of another chain is read but not followed: `last_error` says which test
+server it needs). Orders of the retired simulated provider still list
+(`simulated: true`, `provider: "simulated"`); an open one is closed as
+`expired` once, and nothing can be paid to it or claimed from it.
+
+**Nothing is signed while polling.** `peg_status` and `peg_list` only read
+the chains (*network*). Signing happens in `peg_fund` and `peg_claim`, the
+steps the user confirms; like `sign_pset` they reload the registry first
+(so a locked vault refuses: `Vault is locked …`), open the order's wallet
+and sign with its software signers, so the Liquid signing guard (SIGHASH_ALL
+only, one fee output, no taproot input) and the frozen-coin rules apply.
+Each signed transaction is written to the order before its broadcast; a
+retry of the same call rebroadcasts those bytes rather than paying twice.
+
+### Peg statuses
+
+| Status | Peg-in (native) | Peg-out (native) |
+|---|---|---|
+| `awaiting_deposit` | waiting for BTC at `deposit_address` (pay it with `peg_fund` or from anywhere) | waiting for `peg_fund` |
+| `deposit_seen` | the deposit is in the Bitcoin mempool | the peg-out is in the Liquid mempool |
+| `confirming` | the deposit has fewer than `confirmations_required` Bitcoin confirmations | the peg-out has fewer than `confirmations_required` Liquid confirmations |
+| `claimable` | deep enough: waiting for `peg_claim` | — |
+| `settling` | the claim is broadcast, not yet in a block | deep enough: waiting for the federation's payment (`txid_payout` appears with it) and its first Bitcoin confirmation |
+| `completed` | the claim is in a block | the payment is in a block |
+| `cancelled` | `peg_cancel` before any deposit | `peg_cancel` before `peg_fund` |
+| `expired` | the federation changed before a deposit: never pay this address; or the test server reset its chains | the test server reset its chains |
+
+`completed`, `cancelled` and `expired` are final. A status can step back
+(`claimable` → `confirming`) if a Bitcoin reorg makes the deposit shallower.
+
+**Peg tags.** `PEG_UNAVAILABLE` (no provider here, or the order belongs to
+another provider or chain), `PEG_NOT_READY` (the order is not where the
+step needs it: no deposit yet, too few confirmations, already funded or
+claimed, cancelled), `PEG_EXPIRED` (the deposit address expired),
+`PEG_PROOF_REJECTED` (the deposit's merkle proof or block does not match
+the wallet's own Bitcoin chain view — the claim is not built). Other
+failures are plain text: limits (`Amount is below the minimum of N sats` /
+`above the maximum`), bad addresses, chain servers unreachable, builder
+and broadcast errors.
 
 ### `peg_quote`
 
 | Param | Type | Req. | Notes |
 |---|---|---|---|
 | `direction` | string | yes | `in` \| `out` |
-| `amount_sats` | u64 | yes | |
+| `amount_sats` | u64 | yes | peg-in: the BTC deposit; peg-out: the L-BTC to peg out (what the federation pays) |
 
 Returns: `{direction, amount_sats: u64, rate: f64, service_fee_sats: u64,
 network_fee_sats: u64, receive_sats: u64, min_sats: u64, max_sats: u64,
-eta_minutes: u32, simulated: bool}`. Errors: `Unknown peg direction …`;
-`Amount is below the minimum of N sats` / `above the maximum`; regtest.
+eta_minutes: u32, simulated: bool, provider, confirmations_required: u32,
+network_fee_included: bool}`. Native: `rate` 1, no service fee;
+`network_fee_sats` is the estimated Liquid fee — of the claim, taken out of
+the deposit (`network_fee_included: true`, `receive_sats = amount − fee`),
+or of the peg-out, paid on top (`false`, `receive_sats = amount`); the
+Bitcoin fee of a deposit is paid on top by whoever sends it. `min_sats`
+10 000; `max_sats` 21 million BTC for a peg-in, the lab's
+`pegout_max_sat` for a peg-out. `eta_minutes` assumes nominal block
+intervals (10 min Bitcoin, 1 min Liquid) over `confirmations_required`.
+Reads no chain. Errors: `Unknown peg direction …`; the limits;
+`PEG_UNAVAILABLE`.
 
 ### `peg_start`
 
-| Param | Type | Req. |
-|---|---|---|
-| `wallet_id` | string | yes |
-| `direction` | string | yes |
-| `amount_sats` | u64 | yes |
-| `payout_address` | string | yes |
+*opens*, *network* (peg-in).
 
-Returns: **PegOrder**. Errors: as `peg_quote`; wallet not found.
+| Param | Type | Req. | Notes |
+|---|---|---|---|
+| `wallet_id` | string | yes | a software wallet with Liquid |
+| `direction` | string | yes | |
+| `amount_sats` | u64 | yes | |
+| `payout_address` | string | yes | peg-in: a Liquid address of the active network; peg-out: a Bitcoin regtest address |
 
-### `peg_status`
+Returns: **PegOrder** in `awaiting_deposit`. A native peg-in reads the
+federation from the Liquid chain and returns the deposit address with
+`valid_until_liquid_height`; a native peg-out reads no chain. Errors: as
+`peg_quote`; wallet not found or not a software wallet; `Payout address …`
+/ `Bitcoin address of another network`; the Liquid chain unreachable.
+
+### `peg_fund`
+
+*opens*, *network*. The user-confirmed signing step that pays an order's
+deposit from its own wallet.
+
+| Param | Type | Req. | Notes |
+|---|---|---|---|
+| `order_id` | string | yes | |
+| `fee_rate` | f32 | no | peg-in: Bitcoin sat/vB of the deposit, default 1; ignored for a peg-out |
+
+- Peg-in: a Bitcoin payment of `deposit_expected_sats` to
+  `deposit_address`, from coins that are not frozen. (The deposit may
+  also be paid from elsewhere; the order follows whatever arrives.)
+- Peg-out: the Liquid transaction with the peg-out output (`OP_RETURN
+  <Bitcoin genesis> <payout scriptPubKey>`, explicit L-BTC), change and one
+  fee output, from coins that are not frozen. The Bitcoin genesis is
+  checked against the wallet's Bitcoin server first, and the signed
+  transaction is checked to carry exactly that output.
+
+Returns: **PegOrder** in `deposit_seen` with `txid_deposit`. Errors:
+`PEG_NOT_READY` (already funded, cancelled), `PEG_EXPIRED`,
+`PEG_UNAVAILABLE` (no provider, a simulated order, another chain), the
+limits, builder errors (insufficient funds, frozen coins), signing and
+broadcast errors, `Vault is locked …`.
+
+### `peg_claim`
+
+*opens*, *network*. Native peg-in only: the user-confirmed signing step
+that claims a deposit once it is `claimable`.
 
 | Param | Type | Req. |
 |---|---|---|
 | `order_id` | string | yes |
 
-Returns: **PegOrder** (advanced along its simulated timeline). Errors:
-unknown order; regtest.
+Before anything is signed the wallet reads, from its own Bitcoin Electrum
+server, the deposit's height, the block hash at that height and the tip;
+fetches the raw deposit and its merkle-block proof from the lab's Esplora;
+and checks that the transaction pays the deposit address exactly once,
+that the proof commits to it, that it is the transaction the Electrum
+server listed, that the proof's block is the Electrum server's block at
+that height, and that it has `confirmations_required` confirmations. The
+claim spends the peg-in alone and pays everything but its fee to
+`payout_address`.
+
+Returns: **PegOrder** in `settling` with `txid_claim`. Errors:
+`PEG_NOT_READY` (no deposit, too few confirmations — e.g. `PEG_NOT_READY:
+the deposit has 1 of the 2 Bitcoin confirmations a claim needs.` —, a
+peg-out, already claimed), `PEG_PROOF_REJECTED`, `PEG_EXPIRED` (the
+federation changed), `PEG_UNAVAILABLE`, signing and broadcast errors,
+`Vault is locked …`.
+
+### `peg_status`
+
+*network*.
+
+| Param | Type | Req. |
+|---|---|---|
+| `order_id` | string | yes |
+
+Returns: **PegOrder**, read from the chains first (an open order of the
+active provider). A chain that cannot be read is `last_error`, not an
+error. Errors: unknown order.
 
 ### `peg_list`
+
+*network*.
 
 | Param | Type | Req. |
 |---|---|---|
 | `wallet_id` | string | yes |
 
-Returns: `[PegOrder]`. Errors: regtest.
+Returns: `[PegOrder]`, newest first; open orders are read from the chains
+as in `peg_status`.
 
 ### `peg_cancel`
 
@@ -1272,8 +1408,10 @@ Returns: `[PegOrder]`. Errors: regtest.
 |---|---|---|
 | `order_id` | string | yes |
 
-Returns: **PegOrder**. Errors: unknown order; `Order can no longer be
-cancelled (status: …)` once the deposit has been seen; regtest.
+Returns: **PegOrder** in `cancelled`. A native peg-in is read from the
+chain first. Errors: unknown order; `Order can no longer be cancelled
+(status: …)` once anything was paid; `Order cannot be cancelled now: its
+deposit could not be checked (…)`.
 
 ## LiquiDEX swaps
 

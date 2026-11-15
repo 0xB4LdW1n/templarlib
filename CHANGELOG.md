@@ -65,6 +65,22 @@ with 0, any release may change the method contract.
   chains (`instance_id`), the regtest chain caches and regtest swap offers
   are dropped; keys and the wallet list never are.
 - `get_liquid_network` answers with `backend_source` and `test_server`.
+- Native peg-in / peg-out on a joined test server's regtest (the lab's
+  Elements peg between its Bitcoin regtest and its Liquid regtest), in
+  place of the simulated provider: real deposit addresses bound to the
+  wallet's claim scripts, real claims and real federation payments. New
+  methods `peg_fund` (pay an order's deposit from its wallet: the BTC of a
+  peg-in, the peg-out transaction) and `peg_claim` (claim a peg-in once
+  deep enough), the only peg steps that sign. Before a claim the deposit's
+  merkle proof is checked against the wallet's own Bitcoin Electrum view
+  (the transaction it lists, the block it has at that height, the depth),
+  not only against the proof's own header. New statuses `claimable` and
+  `expired`; new `PegOrder` keys `provider`, `confirmations`,
+  `confirmations_required`, `deposit_received_sats`, `txid_claim`,
+  `valid_until_liquid_height`, `last_error`; new quote keys `provider`,
+  `confirmations_required`, `network_fee_included`; `get_liquid_network`
+  names the `peg_provider` or why there is none. Stable tags
+  `PEG_UNAVAILABLE`, `PEG_NOT_READY`, `PEG_EXPIRED`, `PEG_PROOF_REJECTED`.
 - `swap_publish` refusals carry a tag per HTTP status of the order book:
   `BOOK_RATE_LIMITED`, `BOOK_CHAIN_UNREACHABLE`, `BOOK_DUPLICATE`,
   `BOOK_PUBLISH_DISABLED`, `BOOK_REJECTED`, `BOOK_UNAVAILABLE`,
@@ -81,6 +97,12 @@ with 0, any release may change the method contract.
 
 ### Changed
 
+- The peg methods no longer refuse regtest as such: `peg_quote`,
+  `peg_start`, `peg_fund` and `peg_claim` need a provider for the active
+  network (`PEG_UNAVAILABLE: <why>` otherwise; Liquid testnet has none);
+  `peg_status`, `peg_list` and `peg_cancel` work on stored orders anywhere.
+  Orders of the retired simulated provider still list; an open one is
+  closed as `expired` once and nothing can be paid to it.
 - `swap_publish` posts to the order book's public, chain-verified
   `POST /api/offers` instead of the admin route (which answers 401 on a
   book with an admin password). `TEMPLAR_SWAP_ADMIN_URL` still overrides
