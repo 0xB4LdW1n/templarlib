@@ -7,7 +7,7 @@ what ends up on disk. For the rules a change must keep, see
 ## Crates and hosts
 
 ```text
-host ──► TemplarLib::call(method, params) ──► dispatch ──► handlers ──► templar-core ──► BDK 0.30 / LWK 0.9
+host ──► TemplarLib::call(method, params) ──► dispatch ──► handlers ──► templar-core ──► BDK 0.30 / LWK 0.20
                                               (templarlib)                                 Electrum, elementsd RPC,
                                                                                            USB devices, HTTP services
 ```

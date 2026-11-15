@@ -53,14 +53,13 @@ informational warnings about unmaintained or unsound crates deeper in the
 graph; those do not fail CI, and `cargo deny` fails on an unmaintained
 crate only when this workspace depends on it directly.
 
-**Old TLS stacks pinned by the Electrum clients.** BDK 0.30 pulls
+**Old TLS stack pinned by the Bitcoin Electrum client.** BDK 0.30 pulls
 `electrum-client` 0.18 (rustls 0.21, rustls-webpki 0.101, webpki-roots
-0.22); LWK 0.9, and `templar-core` in step with it, use `electrum-client`
-0.21 (webpki-roots 0.25). Neither line has a fixed release. These stacks
-are used only for Electrum connections to the configured Bitcoin and Liquid
-servers; every other HTTPS client (reqwest) runs on rustls 0.23,
-rustls-webpki 0.103 and webpki-roots 1.x, kept on fixed versions by
-`Cargo.lock`.
+0.22), and that line has no fixed release. This stack is used only for
+Electrum connections to the configured Bitcoin servers. LWK 0.20, and
+`templar-core` in step with it, use `electrum-client` 0.25 on the same
+rustls 0.23, rustls-webpki 0.103 and webpki-roots 1.x as every other HTTPS
+client (reqwest), kept on fixed versions by `Cargo.lock`.
 
 | Advisory | Crate | Issue | Removed by |
 |---|---|---|---|
@@ -70,7 +69,7 @@ rustls-webpki 0.103 and webpki-roots 1.x, kept on fixed versions by
 | RUSTSEC-2026-0099 | rustls-webpki 0.101 | name constraints accepted for certificates asserting a wildcard name | BDK upgrade off `electrum-client` 0.18 |
 | RUSTSEC-2026-0104 | rustls-webpki 0.101 | reachable panic in certificate revocation list parsing | BDK upgrade off `electrum-client` 0.18 |
 | RUSTSEC-2026-0382 | rustls-webpki 0.101 | certificate verification may accept distrusted intermediates | BDK upgrade off `electrum-client` 0.18 |
-| RUSTSEC-2026-0381 | webpki-roots 0.22 / 0.25 | bundled roots allow trust in distrusted emSign intermediates | both: the BDK upgrade above, and an LWK upgrade (with `templar-core`'s own `electrum-client`) to a release on webpki-roots 1.x |
+| RUSTSEC-2026-0381 | webpki-roots 0.22 | bundled roots allow trust in distrusted emSign intermediates | BDK upgrade off `electrum-client` 0.18 |
 
 **Unmaintained crate.**
 

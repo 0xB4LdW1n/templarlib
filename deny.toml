@@ -8,13 +8,13 @@ version = 2
 # Unmaintained crates fail the check only when this workspace depends on them
 # directly; transitive ones are the upstream crates' call.
 unmaintained = "workspace"
-# Advisories against the two old TLS stacks that BDK 0.30 and LWK 0.9 pin
-# through their Electrum clients (electrum-client 0.18 -> rustls 0.21,
-# webpki 0.22, webpki-roots 0.22; electrum-client 0.21 -> webpki-roots 0.25).
-# None has a fixed release on those lines: they go away only with a BDK / LWK
-# upgrade, which is tracked in SECURITY.md. The modern stack reqwest uses
-# (rustls 0.23, rustls-webpki 0.103, webpki-roots 1.x) is kept on fixed
-# versions by Cargo.lock. Remove an entry as soon as its crate leaves the graph.
+# Advisories against the old TLS stack that BDK 0.30 pins through its
+# Electrum client (electrum-client 0.18 -> rustls 0.21, webpki 0.22,
+# webpki-roots 0.22). None has a fixed release on that line: they go away
+# only with a BDK upgrade, which is tracked in SECURITY.md. The modern stack
+# reqwest and LWK's Electrum client use (rustls 0.23, rustls-webpki 0.103,
+# webpki-roots 1.x) is kept on fixed versions by Cargo.lock. Remove an entry
+# as soon as its crate leaves the graph.
 ignore = [
     { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 via bdk 0.30 -> electrum-client 0.18; no fix on that line" },
     { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 via bdk 0.30 -> electrum-client 0.18; no fix on that line" },
@@ -22,7 +22,7 @@ ignore = [
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101 via bdk 0.30 -> electrum-client 0.18; no fix on that line" },
     { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101 via bdk 0.30 -> electrum-client 0.18; no fix on that line" },
     { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101 via bdk 0.30 -> electrum-client 0.18; no fix on that line" },
-    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.22 / 0.25 via the bdk and lwk electrum clients; fixed only in 1.x" },
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.22 via bdk 0.30 -> electrum-client 0.18; fixed only in 1.x" },
     { id = "RUSTSEC-2021-0127", reason = "serde_cbor is unmaintained; used only for Jade's CBOR dialect behind the `hardware` feature" },
 ]
 

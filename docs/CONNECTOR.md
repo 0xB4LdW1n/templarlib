@@ -20,10 +20,10 @@ comments cite them as `docs/CONNECTOR.md §n`.
 
 ## 1. Networks
 
-| `network` value | LWK `ElementsNetwork` | Policy asset (L-BTC) | Address prefix |
+| `network` value | LWK `Network` | Policy asset (L-BTC) | Address prefix |
 |---|---|---|---|
-| `liquid-testnet` | `LiquidTestnet` | `144c6543…9a49` | `tlq1` / `tex1` |
-| `liquid-regtest` | `ElementsRegtest { policy_asset }` | `5ac9f65c…b225` (default `elementsd -chain=liquidregtest`) | `el1` / `ert1` |
+| `liquid-testnet` | `TestnetLiquid` | `144c6543…9a49` | `tlq1` / `tex1` |
+| `liquid-regtest` | `CustomElements(params)`, params carrying `policy_asset` | `5ac9f65c…b225` (default `elementsd -chain=liquidregtest`) | `el1` / `ert1` |
 | `liquid` | `Liquid` | `6f0279e9…526d` | `lq1` / `ex1` — **not enabled** |
 
 Today the protocol runs on a test regtest; in beta it will run on a server of ours; then Liquid mainnet.
@@ -365,8 +365,8 @@ Callback as §4; the site verifies §9.4 and answers `next` = `/wallet` (connect
 `"proof": {"kind": "check-pset", "pset": "<signed base64>"}` built from the connect `challenge` and the
 wallet's loan key; later `{"kind": "message", "signature": "<65-byte recoverable, base64>"}` over the
 same challenge string with the legacy «Bitcoin Signed Message» prefix (preferred when present). The
-message variant is not implemented on the wallet side: `templar-core` has no message signing, and the
-LWK release that adds `Signer::sign_message` (≥ 0.15) is beyond the 0.9 line this library stays on. With a valid proof the site attaches the
+message variant is not implemented on the wallet side: `templar-core` has no message signing (LWK's
+`Signer::sign_message`, there since 0.15, is not wired in). With a valid proof the site attaches the
 browser session to the row that owns `escrow_xpub` — the person's loans come back; without one, the
 0.1.0 path (§9.2) is used when the xpub is known.
 

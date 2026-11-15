@@ -22,15 +22,17 @@ for its full duration.
 - Miniscript works inside `wsh()` only. `tr()` script paths and `musig()`
   need BDK 1.x; do not add them on 0.30.
 
-## 2. LWK stays on 0.9
+## 2. LWK stays on 0.20
 
-`lwk_wollet`, `lwk_signer`, `lwk_common` and `lwk_jade` stay on the 0.9
+`lwk_wollet`, `lwk_signer`, `lwk_common` and `lwk_jade` stay on the 0.20
 line, in step with the Templar Protocol server, which builds the same
-escrow descriptors and PSETs from `templar-core`. Use the 0.9 API:
-`Wollet::with_fs_persist` under the data directory (a cache only: on an
-inconsistent cache it is deleted and rebuilt), `Wollet::without_persist()`
-when there is no data directory, `get_details(&pset)`, `combine()`,
-`finalize(&mut pset)`; never the old `MemoryPersist` pattern.
+escrow descriptors and PSETs from `templar-core`. Use the 0.20 API:
+`WolletBuilder::with_legacy_fs_store` under the data directory (a cache
+only: on an inconsistent cache it is deleted and rebuilt),
+`Wollet::new(network, FakeStore)` when there is no data directory,
+`get_details(&pset)`, `combine()`, `finalize(&mut pset)`; never the
+deprecated `with_fs_persist` / `without_persist`. Software signers are
+`SwSigner::new_with_network(…, Network::TestnetLiquid)`.
 
 - A Liquid `ct()` descriptor wraps Elements scripts only (`elwpkh`,
   `elwsh`); plain `wpkh` inside `ct()` is rejected.

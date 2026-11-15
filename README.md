@@ -10,7 +10,7 @@ let reply = engine.call("vault_status", &serde_json::json!({}));
 
 It holds the wallets, the encrypted vault, the signing checks and the chain
 access, so a host only has to render screens or run business logic around
-it. It is built on BDK 0.30 (Bitcoin, Miniscript in `wsh()`) and LWK 0.9
+it. It is built on BDK 0.30 (Bitcoin, Miniscript in `wsh()`) and LWK 0.20
 (Liquid, confidential assets, PSET). Today it runs on Bitcoin testnet and
 Liquid testnet, plus a local Liquid regtest for development; mainnet is
 refused.
