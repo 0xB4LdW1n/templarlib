@@ -238,8 +238,6 @@ pub fn refuse_non_testnet_paths(
 
 /// Sighash type value of SIGHASH_ALL.
 const SIGHASH_ALL: u32 = 0x01;
-/// Sighash type value of SIGHASH_DEFAULT (taproot only; commits like ALL).
-const SIGHASH_DEFAULT: u32 = 0x00;
 
 /// Whether a key with one of `signers` as master fingerprint would sign
 /// `input`: the fingerprint appears in its `bip32_derivation` (ECDSA) or
@@ -279,13 +277,20 @@ pub fn refuse_bad_fee_outputs(pset: &PartiallySignedTransaction) -> Result<(), T
 /// none of `signers` would sign any input it lets the PSET through, since
 /// the signer then adds nothing.
 ///
+/// - No input such a key would sign is a taproot input or names the key in
+///   `tap_key_origins`: this wallet does not sign taproot inputs on Liquid.
+///   LWK 0.9 never signed through `tap_key_origins`; 0.20 does, with
+///   whatever path the PSET names — a mainnet coin type included, which
+///   [`refuse_non_testnet_paths`] (it reads `bip32_derivation`) does not
+///   see.
 /// - Every input such a key would sign declares no sighash type or
-///   SIGHASH_ALL (SIGHASH_DEFAULT too on a taproot input). LWK 0.9's
-///   signers always produced SIGHASH_ALL signatures; 0.20's sign whatever
-///   type the input declares, and a SIGHASH_NONE, SINGLE or ANYONECANPAY
-///   signature lets whoever holds the PSET change what it pays. Inputs only
-///   other keys sign are not judged: their sighash is their signer's call.
+///   SIGHASH_ALL. LWK 0.9's signers always produced SIGHASH_ALL signatures;
+///   0.20's sign whatever type the input declares, and a SIGHASH_NONE,
+///   SINGLE or ANYONECANPAY signature lets whoever holds the PSET change
+///   what it pays.
 /// - Exactly one fee output ([`refuse_bad_fee_outputs`]).
+///
+/// Inputs only other keys sign are not judged: they are their signer's call.
 pub fn refuse_unsafe_signing(
     pset: &PartiallySignedTransaction,
     signers: &[Fingerprint],
@@ -301,12 +306,22 @@ pub fn refuse_unsafe_signing(
     }
     refuse_bad_fee_outputs(pset)?;
     for (index, input) in ours {
+        let names_tap_key = input
+            .tap_key_origins
+            .values()
+            .any(|(_, (fp, _))| signers.contains(fp));
+        if names_tap_key || lwk_common::is_taproot_input(input) {
+            return Err(LiquidError::SigningFailed(format!(
+                "refusing to sign input {index}: it is a taproot input, and this wallet \
+                 does not sign taproot inputs on Liquid"
+            ))
+            .into());
+        }
         let Some(declared) = input.sighash_type else {
             continue;
         };
         let declared = declared.to_u32();
-        let taproot_default = declared == SIGHASH_DEFAULT && lwk_common::is_taproot_input(input);
-        if declared != SIGHASH_ALL && !taproot_default {
+        if declared != SIGHASH_ALL {
             return Err(LiquidError::SigningFailed(format!(
                 "refusing to sign input {index}: it asks for sighash type 0x{declared:02x}, \
                  and this wallet signs SIGHASH_ALL only — any other type would let \
@@ -836,18 +851,41 @@ mod tests {
     }
 
     #[test]
-    fn taproot_inputs_may_ask_for_default_or_all_only() {
+    fn our_taproot_inputs_are_never_signed_whatever_their_sighash() {
         let ours = Fingerprint::from_str("73c5da0a").unwrap();
-        for ok in [None, Some(0x00), Some(0x01)] {
-            refuse_unsafe_signing(&with_fee(taproot_input(ours, ok)), &[ours])
-                .unwrap_or_else(|e| panic!("{ok:?}: {e}"));
-        }
-        for bad in [0x02u32, 0x03, 0x81, 0x82, 0x83] {
-            let err = refuse_unsafe_signing(&with_fee(taproot_input(ours, Some(bad))), &[ours])
-                .expect_err("non-default taproot sighash")
+        for sighash in [
+            None,
+            Some(0x00),
+            Some(0x01),
+            Some(0x02),
+            Some(0x81),
+            Some(0x83),
+        ] {
+            let err = refuse_unsafe_signing(&with_fee(taproot_input(ours, sighash)), &[ours])
+                .expect_err("our taproot input")
                 .to_string();
-            assert!(err.contains("SIGHASH_ALL only"), "{err}");
+            assert!(
+                err.starts_with("Signing failed: refusing to sign input 0:")
+                    && err.contains("does not sign taproot inputs"),
+                "{sighash:?}: {err}"
+            );
         }
+        // A taproot output named only through `bip32_derivation` is refused
+        // as well: what makes it taproot is the coin it spends.
+        let mut by_bip32 = taproot_input(Fingerprint::from_str("deadbeef").unwrap(), None);
+        let pk = lwk_wollet::bitcoin::PublicKey::new(
+            lwk_wollet::elements::secp256k1_zkp::SecretKey::from_slice(&[6u8; 32])
+                .unwrap()
+                .public_key(&Secp256k1::new()),
+        );
+        by_bip32.bip32_derivation.insert(
+            pk,
+            (
+                ours,
+                lwk_wollet::bitcoin::bip32::DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap(),
+            ),
+        );
+        assert!(refuse_unsafe_signing(&with_fee(by_bip32), &[ours]).is_err());
         // Someone else's taproot input is theirs to judge.
         let theirs = Fingerprint::from_str("deadbeef").unwrap();
         refuse_unsafe_signing(&with_fee(taproot_input(theirs, Some(0x83))), &[ours]).unwrap();

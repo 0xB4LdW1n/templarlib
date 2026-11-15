@@ -770,8 +770,10 @@ Returns: `string`, the signed PSET. Errors: `Open this wallet's Liquid side
 before signing a Liquid transaction`; `PSET inspection failed: PSET doesn't
 contain a fee output` and `PSET inspection failed: Multiple fee outputs`
 (exactly one fee output is signed; `inspect_pset` still describes the
-others); `Signing failed: refusing to sign input <n>: it asks for sighash
-type 0x<hh>, …` (an input this wallet signs may declare no sighash type or
+others); `Signing failed: refusing to sign input <n>: it is a taproot
+input, …` (the wallet does not sign taproot inputs on Liquid);
+`Signing failed: refusing to sign input <n>: it asks for sighash type
+0x<hh>, …` (an input this wallet signs may declare no sighash type or
 SIGHASH_ALL only); `Refusing to sign: an output of this transaction claims
 an amount or asset its commitment does not prove, …`; a frozen input; `This wallet's key lives on a device — use the device to
 sign.`; a multisig holding no local key; a policy wallet; `No signature

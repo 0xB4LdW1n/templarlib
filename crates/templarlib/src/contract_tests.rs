@@ -2177,6 +2177,76 @@ fn sign_pset_signs_sighash_all_and_one_fee_output_only() {
     }
 }
 
+/// `sign_pset` never signs a taproot input of this wallet, on a mainnet or
+/// a test path: LWK 0.9 never signed through `tap_key_origins`. The PSET
+/// names the test mnemonic's key there only (no `bip32_derivation`).
+#[test]
+fn sign_pset_never_signs_a_taproot_input() {
+    use lwk_wollet::bitcoin::bip32::{DerivationPath, Xpriv};
+    use lwk_wollet::bitcoin::secp256k1::Secp256k1;
+    use lwk_wollet::elements::pset::{Output, PartiallySignedTransaction};
+    use lwk_wollet::elements::{confidential, AssetId, OutPoint, Script, TxOut, Txid};
+    use std::str::FromStr;
+
+    let mut env = TestEnv::new();
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Cosigner", "mnemonic": MNEMONIC, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let secp = Secp256k1::new();
+    let master = Xpriv::from_str(&templar_core::master_xprv(MNEMONIC).unwrap()).unwrap();
+    let lbtc = AssetId::from_str(templar_core::TESTNET_POLICY_ASSET).unwrap();
+    for path in ["m/86'/1776'/0'/0/0", "m/86'/1'/0'/0/0"] {
+        let path = DerivationPath::from_str(path).unwrap();
+        let (xonly, _) = master
+            .derive_priv(&secp, &path)
+            .unwrap()
+            .to_keypair(&secp)
+            .x_only_public_key();
+        let mut input = lwk_wollet::elements::pset::Input::from_prevout(OutPoint::new(
+            Txid::from_byte_array([0x55; 32]),
+            0,
+        ));
+        input.witness_utxo = Some(TxOut {
+            asset: confidential::Asset::Explicit(lbtc),
+            value: confidential::Value::Explicit(10_000),
+            nonce: confidential::Nonce::Null,
+            script_pubkey: Script::new_v1_p2tr(
+                &lwk_wollet::elements::secp256k1_zkp::Secp256k1::new(),
+                xonly,
+                None,
+            ),
+            witness: Default::default(),
+        });
+        input.tap_internal_key = Some(xonly);
+        input
+            .tap_key_origins
+            .insert(xonly, (vec![], (master.fingerprint(&secp), path.clone())));
+        let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(input);
+        pset.add_output(Output::new_explicit(
+            Script::from(vec![0u8, 20, 9, 9, 9]),
+            9_000,
+            lbtc,
+            None,
+        ));
+        pset.add_output(Output::from_txout(TxOut::new_fee(1_000, lbtc)));
+        let pset = templar_core::LiquidWalletManager::pset_to_base64(&pset).unwrap();
+
+        let resp = env.call("sign_pset", json!({ "wallet_id": id, "pset_base64": pset }));
+        assert_keys("sign_pset taproot refusal", &resp, &["err"]);
+        assert!(resp.get("ok").is_none(), "{path}: {resp}");
+        let err = resp["err"].as_str().unwrap();
+        assert!(
+            err.starts_with("Signing failed: refusing to sign input 0:")
+                && err.contains("does not sign taproot inputs"),
+            "{path}: {err}"
+        );
+    }
+}
+
 // ── Templar Protocol connector ─────────────────────────────────────
 
 /// A testnet PSET spending a fake Templar Protocol escrow whose contract names the
