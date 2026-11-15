@@ -2400,6 +2400,7 @@ const PEG_ORDER_KEYS: &[&str] = &[
     "txid_claim",
     "valid_until_liquid_height",
     "last_error",
+    "expires_at",
 ];
 
 const PEG_QUOTE_KEYS: &[&str] = &[
@@ -2590,6 +2591,22 @@ fn native_peg_orders_have_the_contract_shape() {
     assert_eq!(s["status"], json!("cancelled"));
     let err = env.err("peg_fund", json!({ "order_id": oid }));
     assert!(err.starts_with("PEG_UNAVAILABLE:"), "{err}");
+}
+
+#[test]
+fn sideswap_serves_testnet_only_when_the_lab_names_it() {
+    let mut env = TestEnv::new();
+    let lab = offline_lab_server();
+    env.ok("set_test_server", json!({ "url": lab }));
+    // The lab's regtest has the native peg; its testnet block names
+    // SideSwap, which serves Liquid testnet (no chain is contacted here).
+    env.ok("set_liquid_network", json!({ "network": "testnet" }));
+    let net = env.ok("get_liquid_network", json!({}));
+    assert_eq!(net["peg_provider"], json!("sideswap"));
+    assert!(net["peg_unavailable_reason"].is_null());
+    env.ok("clear_test_server", json!({}));
+    let net = env.ok("get_liquid_network", json!({}));
+    assert!(net["peg_provider"].is_null());
 }
 
 // ── Live: LiquiDEX on a Templar testlab ────────────────────────────

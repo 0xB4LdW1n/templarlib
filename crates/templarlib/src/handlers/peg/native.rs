@@ -269,8 +269,10 @@ pub(super) fn start(
             txid_claim: None,
             valid_until_liquid_height: valid_until,
             last_error: None,
+            expires_at: None,
         },
         native: Some(native),
+        sideswap: None,
     })
 }
 

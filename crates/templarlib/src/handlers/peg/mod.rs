@@ -10,6 +10,8 @@
 //!   regtest — a peg-in address bound to this wallet's claim script, a claim
 //!   built from a verified merkle proof, a peg-out output the lab's
 //!   federation pays.
+//! - **sideswap** ([`sideswap`]): SideSwap's swap service on Liquid
+//!   testnet, custodial and third-party (testnet has no parent chain).
 //!
 //! Orders the retired simulated provider created still load and list
 //! (`simulated: true`); they never advance and nothing can be paid to them.
@@ -19,6 +21,7 @@
 //! user-confirmed steps, through the wallet's normal signers.
 
 mod native;
+mod sideswap;
 
 use std::fs;
 use std::path::Path;
@@ -47,10 +50,13 @@ pub const COMPLETED: &str = "completed";
 pub const CANCELLED: &str = "cancelled";
 /// The deposit address (or the whole order) can no longer be used.
 pub const EXPIRED: &str = "expired";
+/// The provider will not complete the order (SideSwap: the deposit does not
+/// cover its fees). `last_error` says why.
+pub const FAILED: &str = "failed";
 
 /// Statuses an order never leaves.
 fn is_terminal(status: &str) -> bool {
-    matches!(status, COMPLETED | CANCELLED | EXPIRED)
+    matches!(status, COMPLETED | CANCELLED | EXPIRED | FAILED)
 }
 
 // ── DTOs (wire shapes fixed by the host contract; new keys are additive) ────
@@ -67,7 +73,7 @@ pub struct PegQuoteDto {
     pub max_sats: u64,
     pub eta_minutes: u32,
     pub simulated: bool,
-    /// `native`.
+    /// `native` | `sideswap`.
     #[serde(default)]
     pub provider: String,
     /// Deposit confirmations before the claim (peg-in, Bitcoin) or the
@@ -113,7 +119,8 @@ pub struct PegOrderDto {
     pub txid_payout: Option<String>,
     pub simulated: bool,
     pub status_history: Vec<PegStatusEntryDto>,
-    /// `native` | `simulated` (orders of the retired simulated provider).
+    /// `native` | `sideswap` | `simulated` (orders of the retired simulated
+    /// provider).
     #[serde(default = "provider_simulated")]
     pub provider: String,
     /// Confirmations of the deposit seen so far (Bitcoin for a peg-in,
@@ -137,6 +144,10 @@ pub struct PegOrderDto {
     /// another chain); null when it succeeded.
     #[serde(default)]
     pub last_error: Option<String>,
+    /// SideSwap: Unix seconds after which it no longer takes the deposit;
+    /// null when the order does not expire.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
 }
 
 // ── Params (deserialized by dispatch.rs) ────────────────────────────────────
@@ -197,11 +208,13 @@ pub fn provider_info(state: &AppState) -> (Option<String>, Option<String>) {
     }
 }
 
-/// Quote a peg without creating an order. Reads no chain.
+/// Quote a peg without creating an order. Native reads no chain; SideSwap
+/// asks for its terms.
 pub fn quote(state: &AppState, direction: &str, amount_sats: u64) -> Result<PegQuoteDto, String> {
     let direction = normalize_direction(direction)?;
     match provider(state)? {
         PegProvider::Native(terms) => native::quote(&terms, direction, amount_sats),
+        PegProvider::SideSwap { url } => sideswap::quote(&url, direction, amount_sats),
     }
 }
 
@@ -240,6 +253,18 @@ pub fn start(
                 },
             )?
         }
+        PegProvider::SideSwap { url } => sideswap::start(
+            state,
+            &url,
+            native::NewOrder {
+                order_id,
+                wallet_id,
+                direction,
+                amount_sats,
+                payout_address,
+                taken_indexes: Vec::new(),
+            },
+        )?,
     };
     let dto = order.order.clone();
     store.orders.push(order);
@@ -325,9 +350,10 @@ pub fn fund(
     let store = load_store(&state.data_dir)?;
     let mut order = store.orders[find_index(&store, order_id)?].clone();
     refuse_simulated(&order)?;
-    let provider = provider(state)?;
+    let provider = provider_of(state, &order)?;
     match provider {
         PegProvider::Native(terms) => native::fund(state, &terms, &mut order, fee_rate)?,
+        PegProvider::SideSwap { .. } => sideswap::fund(state, &mut order, fee_rate)?,
     }
     Ok(order.order)
 }
@@ -338,9 +364,15 @@ pub fn claim(state: &mut AppState, order_id: &str) -> Result<PegOrderDto, String
     let store = load_store(&state.data_dir)?;
     let mut order = store.orders[find_index(&store, order_id)?].clone();
     refuse_simulated(&order)?;
-    let provider = provider(state)?;
+    let provider = provider_of(state, &order)?;
     match provider {
         PegProvider::Native(terms) => native::claim(state, &terms, &mut order)?,
+        PegProvider::SideSwap { .. } => {
+            return Err(PegError::Unavailable(
+                "SideSwap pays out by itself; there is nothing to claim.".into(),
+            )
+            .to_string())
+        }
     }
     Ok(order.order)
 }
@@ -355,6 +387,20 @@ fn normalize_direction(direction: &str) -> Result<&'static str, String> {
             "Unknown peg direction '{other}' — expected \"in\" or \"out\""
         )),
     }
+}
+
+/// The active provider, which must be the one that opened `order`.
+fn provider_of(state: &AppState, order: &StoredOrder) -> Result<PegProvider, String> {
+    let provider = provider(state)?;
+    if provider.name() != order.order.provider {
+        return Err(PegError::Unavailable(format!(
+            "this order belongs to the {} provider, not to {}, the provider of the active network.",
+            order.order.provider,
+            provider.name()
+        ))
+        .to_string());
+    }
+    Ok(provider)
 }
 
 fn refuse_simulated(order: &StoredOrder) -> Result<(), String> {
@@ -396,6 +442,8 @@ fn refresh(state: &mut AppState, order: &mut StoredOrder, payouts_taken: &[Strin
     let before = order.clone();
     if order.native.is_some() {
         native::refresh(state, order, payouts_taken);
+    } else if order.sideswap.is_some() {
+        sideswap::refresh(state, order);
     }
     *order != before
 }
@@ -460,6 +508,8 @@ struct StoredOrder {
     order: PegOrderDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     native: Option<native::NativeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sideswap: Option<sideswap::SideSwapState>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
