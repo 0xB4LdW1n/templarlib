@@ -28,6 +28,15 @@
 //! input set — which by construction contains the wanted asset, supplied by
 //! the taker) and the rangeproof from the revealed blinders.
 //!
+//! The rangeproof is what the maker's wallet rewinds to recognise the
+//! payment: it is sealed with `sha256(ECDH(ephemeral key, maker blinding
+//! key))`, the secret behind the output's nonce, which only the maker knows.
+//! A taker sealing it with anything else pays the maker an output the
+//! maker's wallet can never unblind. So the maker reveals that secret as the
+//! output leg's optional `blinding_nonce` (GDK's name for it); it opens only
+//! the values the legs already reveal. Without it (proposals from other
+//! makers) the taker falls back to a random secret, as before.
+//!
 //! Network access happens **only** inside deep verification, take, broadcast
 //! and unspent-check paths — never in constructors or offline verification.
 
@@ -106,6 +115,11 @@ pub struct LiquidexLeg {
     pub asset_blinder: String,
     pub amount_blinder: String,
     pub amount: u64,
+    /// Output leg only, optional: the 32-byte secret (hex) the output's
+    /// rangeproof must be sealed with for the maker's wallet to unblind it
+    /// (see the module docs). Absent on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blinding_nonce: Option<String>,
 }
 
 /// A LiquiDEX v0 proposal as found on the wire (e.g. liquidex.it book rows).
@@ -196,7 +210,23 @@ fn secrets_to_leg(s: &TxOutSecrets) -> LiquidexLeg {
         asset_blinder: s.asset_bf.to_string(),
         amount_blinder: s.value_bf.to_string(),
         amount: s.value,
+        blinding_nonce: None,
     }
+}
+
+/// The maker output's revealed rangeproof secret, if the proposal has one.
+fn output_blinding_nonce(proposal: &LiquidexProposal) -> Result<Option<SecretKey>, String> {
+    let Some(hex_str) = proposal
+        .outputs
+        .first()
+        .and_then(|l| l.blinding_nonce.as_deref())
+    else {
+        return Ok(None);
+    };
+    let bytes = hex::decode(hex_str.trim()).map_err(|e| format!("output blinding_nonce: {e}"))?;
+    SecretKey::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| format!("output blinding_nonce: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +436,10 @@ fn check_structure(proposal: &LiquidexProposal) -> Result<Transaction, String> {
     // the non-downgrading network pin in verify_proposal.
     leg_to_secrets(&proposal.inputs[0]).map_err(|e| e.to_string())?;
     leg_to_secrets(&proposal.outputs[0]).map_err(|e| e.to_string())?;
+    if proposal.inputs[0].blinding_nonce.is_some() {
+        return Err("input leg carries a blinding_nonce (only the output leg may)".into());
+    }
+    output_blinding_nonce(proposal)?;
     Ok(tx)
 }
 
@@ -665,7 +699,17 @@ fn verify_proposal_inner(
     let valid = offline_ok && !any_failed;
 
     let (takeable, take_block_reason) = if !valid {
-        (false, Some("proposal failed verification".to_string()))
+        let why = checks
+            .iter()
+            .find(|c| c.ok == Some(false))
+            .and_then(|c| c.note.clone());
+        (
+            false,
+            Some(match why {
+                Some(note) => format!("proposal failed verification: {note}"),
+                None => "proposal failed verification".to_string(),
+            }),
+        )
     } else if network == SwapNetwork::Mainnet {
         (
             false,
@@ -1265,7 +1309,9 @@ fn make_proposal_core<R: RngCore + CryptoRng>(
     let asset_gen = Generator::new_blinded(secp, want_asset.into_tag(), out_abf.into_inner());
     let value_commitment = Value::new_confidential(secp, want_amount, asset_gen, out_vbf);
     let ephemeral_sk = SecretKey::new(rng);
-    let (nonce, _shared) = Nonce::with_ephemeral_sk(secp, ephemeral_sk, &blinding_pk);
+    // `shared` seals the rangeproof the taker builds: revealed below so the
+    // payment reaches this wallet in a form it can unblind.
+    let (nonce, shared) = Nonce::with_ephemeral_sk(secp, ephemeral_sk, &blinding_pk);
 
     let mut tx = Transaction {
         version: 2,
@@ -1306,7 +1352,10 @@ fn make_proposal_core<R: RngCore + CryptoRng>(
         version: 0,
         tx: serialize_hex(&tx),
         inputs: vec![secrets_to_leg(&utxo.unblinded)],
-        outputs: vec![secrets_to_leg(&out_secrets)],
+        outputs: vec![LiquidexLeg {
+            blinding_nonce: Some(hex::encode(shared.secret_bytes())),
+            ..secrets_to_leg(&out_secrets)
+        }],
     })
 }
 
@@ -1503,6 +1552,8 @@ fn build_take_tx_core<R: RngCore + CryptoRng>(
     let maker_tx = proposal.transaction()?;
     let maker_in_secrets = proposal.input_secrets()?;
     let maker_out_secrets = proposal.output_secrets()?;
+    let maker_nonce =
+        output_blinding_nonce(proposal).map_err(|e| LiquidError::PsetBuildFailed(e))?;
     let offered_asset = maker_in_secrets.asset;
     let offered_amount = maker_in_secrets.value;
     let wanted_asset = maker_out_secrets.asset;
@@ -1528,6 +1579,7 @@ fn build_take_tx_core<R: RngCore + CryptoRng>(
             &maker_tx,
             &maker_in_secrets,
             &maker_out_secrets,
+            maker_nonce,
             &candidates,
             policy_asset,
             fee,
@@ -1606,6 +1658,7 @@ fn build_take_once<R: RngCore + CryptoRng>(
     maker_tx: &Transaction,
     maker_in_secrets: &TxOutSecrets,
     maker_out_secrets: &TxOutSecrets,
+    maker_nonce: Option<SecretKey>,
     candidates: &[&WalletTxOut],
     policy_asset: AssetId,
     fee: u64,
@@ -1732,11 +1785,17 @@ fn build_take_once<R: RngCore + CryptoRng>(
     )
     .map_err(|e| LiquidError::PsetBuildFailed(format!("maker surjection proof: {e}")))?;
     let msg = RangeProofMessage::new(wanted_asset, maker_out_secrets.asset_bf);
+    // Sealed with the maker's revealed secret, so the maker's wallet can
+    // rewind it; a random one only for proposals that do not carry it.
+    let rangeproof_secret = match maker_nonce {
+        Some(secret) => secret,
+        None => SecretKey::new(rng),
+    };
     let (value_commitment, rangeproof) = Value::Explicit(wanted_amount)
         .blind_with_shared_secret(
             secp,
             maker_out_secrets.value_bf,
-            SecretKey::new(rng),
+            rangeproof_secret,
             &maker_out.script_pubkey,
             &msg,
         )
@@ -2330,6 +2389,94 @@ mod tests {
         // Maker output witness was rebuilt.
         assert!(!build.tx.output[0].witness.rangeproof.is_empty());
         assert!(!build.tx.output[0].witness.surjection_proof.is_empty());
+    }
+
+    /// The maker's wallet must be able to unblind the payment it receives:
+    /// that is how LWK finds it. With the revealed `blinding_nonce` the
+    /// rebuilt rangeproof rewinds under the maker's blinding key; without
+    /// it (a proposal from another maker) it does not.
+    #[test]
+    fn the_maker_can_unblind_the_payment_it_receives() {
+        let secp = Secp256k1::new();
+        let mut rng = rand::thread_rng();
+        let policy = AssetId::from_str(LBTC_TESTNET_ASSET_ID).unwrap();
+        let asset_a = synth_asset(b"unblind-asset-a");
+        let (maker_utxo, (maker_sk, maker_pk)) =
+            synth_utxo(&mut rng, &secp, asset_a, 5000, 0, b"unblind-maker");
+        let blind_sk = SecretKey::new(&mut rng);
+        let spend_pk = PublicKey::new(SecretKey::new(&mut rng).public_key(&secp));
+        let receive = Address::p2wpkh(
+            &spend_pk,
+            Some(blind_sk.public_key(&secp)),
+            &AddressParams::LIQUID_TESTNET,
+        );
+        let proposal = make_proposal_core(
+            &mut rng,
+            &secp,
+            &maker_utxo,
+            &maker_sk,
+            &maker_pk,
+            &receive,
+            policy,
+            700,
+        )
+        .unwrap();
+        assert!(proposal.outputs[0].blinding_nonce.is_some());
+        assert!(proposal.inputs[0].blinding_nonce.is_none());
+        let reparsed = LiquidexProposal::from_json(&proposal.to_json().unwrap()).unwrap();
+        assert!(verify_proposal(&reparsed, false).unwrap().valid);
+
+        let (utxo_l, key_l) = synth_utxo(&mut rng, &secp, policy, 10_000, 1, b"unblind-taker");
+        let taker = SynthWallet {
+            utxos: vec![utxo_l],
+            keys: vec![key_l],
+        };
+        let take = |proposal: &LiquidexProposal| {
+            let mut rng = rand::thread_rng();
+            let secp = Secp256k1::new();
+            let mut next_addr = |_slot: usize| -> Result<Address, TemplarError> {
+                Ok(synth_address(&mut rand::thread_rng(), &Secp256k1::new()))
+            };
+            let key_for = |u: &WalletTxOut| taker.key_for(u);
+            build_take_tx_core(
+                &mut rng,
+                &secp,
+                proposal,
+                &taker.utxos,
+                policy,
+                100.0,
+                &mut next_addr,
+                &key_for,
+            )
+            .unwrap()
+        };
+
+        let paid = take(&reparsed).tx.output[0]
+            .unblind(&secp, blind_sk)
+            .unwrap();
+        assert_eq!(paid.value, 700);
+        assert_eq!(paid.asset, policy);
+
+        // Without the nonce the payment is valid but unrecognisable.
+        let mut foreign = reparsed.clone();
+        foreign.outputs[0].blinding_nonce = None;
+        assert!(take(&foreign).tx.output[0]
+            .unblind(&secp, blind_sk)
+            .is_err());
+
+        // A malformed nonce, or one on the input leg, fails the structure.
+        let mut bad = reparsed.clone();
+        bad.outputs[0].blinding_nonce = Some("zz".into());
+        assert_eq!(
+            check(&verify_proposal(&bad, false).unwrap(), "structure"),
+            Some(false)
+        );
+        let mut bad = reparsed;
+        bad.inputs[0].blinding_nonce = Some(hex::encode([1u8; 32]));
+        assert_eq!(
+            check(&verify_proposal(&bad, false).unwrap(), "structure"),
+            Some(false)
+        );
     }
 
     #[test]
