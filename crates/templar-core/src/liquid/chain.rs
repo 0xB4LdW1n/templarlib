@@ -708,6 +708,78 @@ impl LiquidChain {
         Ok(())
     }
 
+    /// The federation's peg-in parameters from the chain itself: the full
+    /// dynafed header at the epoch boundary at or below `height` (the tip
+    /// when `None`). LWK checks the header's federation program commits to
+    /// its script.
+    pub fn fed_peg(&self, height: Option<u32>) -> Result<lwk_wollet::FedPeg, TemplarError> {
+        let height = match height {
+            Some(h) => h,
+            None => self.tip_height()?,
+        };
+        let network = self.network.elements();
+        let header = self.with_backend(|b| {
+            match b {
+                Backend::Rpc(rpc) => {
+                    lwk_wollet::pegin::fetch_last_full_header(&*rpc, network, height)
+                }
+                Backend::Electrum(c) => {
+                    lwk_wollet::pegin::fetch_last_full_header(&*c, network, height)
+                }
+            }
+            .map_err(|e| sync_err("federation header", e))
+        })?;
+        lwk_wollet::FedPeg::from_block_header(network, &header)
+            .map_err(|e| sync_err("federation parameters", e))
+    }
+
+    /// Confirmations of `txid`: `None` when the backend does not know it,
+    /// `Some(0)` in the mempool. On Electrum the transaction is found
+    /// through `script`, one of its outputs' scriptPubKeys.
+    pub fn tx_confirmations(
+        &self,
+        txid: &Txid,
+        script: &Script,
+    ) -> Result<Option<u32>, TemplarError> {
+        if let Some(rpc) = &self.rpc {
+            let rpc = rpc.lock().unwrap_or_else(|e| e.into_inner());
+            return match rpc.call_json("getrawtransaction", &[txid.to_string().into(), true.into()])
+            {
+                Ok(v) => Ok(Some(
+                    v.get("confirmations")
+                        .and_then(|c| c.as_u64())
+                        .map(|c| c.min(u64::from(u32::MAX)) as u32)
+                        .unwrap_or(0),
+                )),
+                Err(_) => Ok(None),
+            };
+        }
+        let mut hash = sha256::Hash::hash(script.as_bytes()).to_byte_array();
+        hash.reverse();
+        let client = self.raw_electrum()?;
+        let value = client
+            .raw_call(
+                "blockchain.scripthash.get_history",
+                vec![electrum_client::Param::String(hex::encode(hash))],
+            )
+            .map_err(|e| sync_err("get_history", e))?;
+        let wanted = txid.to_string();
+        let Some(item) = value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|i| i.get("tx_hash").and_then(|v| v.as_str()) == Some(wanted.as_str()))
+        else {
+            return Ok(None);
+        };
+        let height = item.get("height").and_then(|h| h.as_i64()).unwrap_or(0);
+        if height <= 0 {
+            return Ok(Some(0));
+        }
+        let tip = self.tip_height()?;
+        Ok(Some(tip.saturating_sub(height as u32).saturating_add(1)))
+    }
+
     /// Current tip height.
     pub fn tip_height(&self) -> Result<u32, TemplarError> {
         self.with_backend(|b| match b {

@@ -98,11 +98,12 @@ pub struct RegtestProfile {
     pub bitcoin_network: String,
     /// `tcp://host:port` or `ssl://host:port`.
     pub bitcoin_electrum_url: String,
-    /// Esplora REST base URL (stored for the peg; not used yet).
+    /// Esplora REST base URL: raw transactions and merkle proofs for
+    /// peg-in claims (checked against the Bitcoin Electrum server).
     pub bitcoin_esplora_url: String,
     /// The lab faucet (`POST`).
     pub faucet_url: String,
-    /// The lab's peg terms (stored for the peg; not used yet).
+    /// The lab's peg terms ([`crate::Endpoints::peg_provider`]).
     pub peg: PegProfile,
 }
 

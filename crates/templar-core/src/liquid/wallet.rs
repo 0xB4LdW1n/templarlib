@@ -15,14 +15,14 @@ use lwk_signer::SwSigner;
 use lwk_wollet::{
     elements::{
         encode::{Decodable, Encodable},
-        Address, AssetId,
+        Address, AssetId, Script,
     },
     FakeStore, Network as ElementsNetwork, Recipient, Wollet, WolletBuilder, WolletDescriptor,
 };
 use serde_json::json;
 use std::path::Path;
 
-use crate::error::{LiquidError, TemplarError};
+use crate::error::{LiquidError, PegError, TemplarError};
 use crate::frozen::first_frozen;
 use crate::liquid::chain::{LiquidBackend, LiquidChain};
 use crate::liquid::network::LiquidNetwork;
@@ -774,6 +774,120 @@ impl LiquidWalletManager {
             .map(|u| u.outpoint)
             .collect();
         Ok(Some(coins))
+    }
+
+    /// The peg-in address of this wallet's external key at `index` under the
+    /// federation `fed_peg`: a Bitcoin address only this wallet can claim
+    /// on Liquid. The claim script is the wallet's own `elwpkh` script at
+    /// that index.
+    pub fn pegin_address(
+        &self,
+        index: u32,
+        fed_peg: &lwk_wollet::FedPeg,
+    ) -> Result<lwk_wollet::PeginAddress, TemplarError> {
+        self.wollet
+            .pegin_address(Some(index), fed_peg)
+            .map_err(|e| PegError::Build(format!("peg-in address: {e}")).into())
+    }
+
+    /// The first external index at or above both the wallet's last unused
+    /// one and every index in `taken` + 1: a claim script no other peg-in
+    /// order of this wallet uses.
+    pub fn free_pegin_index(
+        &self,
+        taken: impl IntoIterator<Item = u32>,
+    ) -> Result<u32, TemplarError> {
+        let last_unused = self
+            .wollet
+            .address(None)
+            .map_err(|e| PegError::Build(format!("address index: {e}")))?
+            .index();
+        let next_after_taken = taken
+            .into_iter()
+            .max()
+            .map(|i| i.saturating_add(1))
+            .unwrap_or(0);
+        Ok(last_unused.max(next_after_taken))
+    }
+
+    /// The unsigned claim of a verified peg-in: the peg-in as the only
+    /// input, everything but the fee to `payout`, one fee output. No coin of
+    /// the wallet is added (an empty manual selection), so frozen coins
+    /// cannot be touched and a deposit too small for its fee fails instead
+    /// of being topped up.
+    pub fn create_pegin_claim(
+        &self,
+        input: lwk_wollet::PeginInput,
+        payout: &str,
+    ) -> Result<Pset, TemplarError> {
+        let params = self.wollet.network().address_params();
+        let address = Address::parse_with_params(payout, params)
+            .map_err(|e| PegError::Build(format!("Invalid payout address: {e}")))?;
+        let builder = self
+            .wollet
+            .tx_builder()
+            .add_pegin_input(input)
+            .map_err(|e| PegError::Build(format!("peg-in input: {e}")))?
+            .set_wallet_utxos(Vec::new());
+        let builder = if address.blinding_pubkey.is_some() {
+            builder.drain_lbtc_to(&address)
+        } else {
+            builder.drain_lbtc_to_explicit(&address)
+        }
+        .map_err(|e| PegError::Build(format!("Invalid payout address: {e}")))?;
+        let pset = builder
+            .finish()
+            .map_err(|e| PegError::Build(format!("claim: {e}")))?;
+        if pset.inputs().len() != 1 || !pset.inputs()[0].is_pegin() {
+            return Err(PegError::Build("the claim must spend the peg-in only".into()).into());
+        }
+        Ok(pset)
+    }
+
+    /// The unsigned peg-out: one explicit L-BTC output of `amount` whose
+    /// script is `pegout_script` (see [`crate::peg::pegout_script`]), the
+    /// wallet's L-BTC change and one fee output. The output is an ordinary
+    /// LWK recipient without a blinding key, so LWK balances and blinds the
+    /// rest of the transaction around it exactly as it does for a burn.
+    /// Frozen coins are left out.
+    pub fn create_pegout(
+        &self,
+        amount: u64,
+        pegout_script: Script,
+        frozen: &BTreeSet<String>,
+    ) -> Result<Pset, TemplarError> {
+        let policy_asset = self.wollet.policy_asset();
+        let mut builder = self.wollet.tx_builder().add_validated_recipient(Recipient {
+            satoshi: amount,
+            script_pubkey: pegout_script.clone(),
+            blinding_pubkey: None,
+            asset: policy_asset,
+        });
+        if let Some(coins) = self.lbtc_coins_excluding(frozen)? {
+            builder = builder.set_wallet_utxos(coins);
+        }
+        let pset = builder
+            .finish()
+            .map_err(|e| frozen_hint(LiquidError::PsetBuildFailed, "Build peg-out", e, frozen))?;
+        refuse_frozen_inputs(&pset, frozen, true)?;
+        let pegouts: Vec<_> = pset
+            .outputs()
+            .iter()
+            .filter(|o| o.script_pubkey == pegout_script)
+            .collect();
+        let explicit = pegouts.len() == 1
+            && pegouts[0].amount == Some(amount)
+            && pegouts[0].asset == Some(policy_asset)
+            && pegouts[0].blinding_key.is_none()
+            && pegouts[0].amount_comm.is_none()
+            && pegouts[0].asset_comm.is_none();
+        if !explicit {
+            return Err(PegError::Build(
+                "the peg-out output did not come out as one explicit L-BTC output".into(),
+            )
+            .into());
+        }
+        Ok(pset)
     }
 
     /// Inspects a PSET and returns structured details for display.

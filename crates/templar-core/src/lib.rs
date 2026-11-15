@@ -11,6 +11,7 @@ pub mod endpoints;
 pub mod error;
 pub mod frozen;
 pub mod liquid;
+pub mod peg;
 pub mod policy;
 pub mod qr;
 pub mod registry;
@@ -56,8 +57,9 @@ pub use derivation::{
 };
 pub use endpoints::{Endpoints, Resolved, Source};
 pub use error::{
-    BitcoinError, HardwareError, LiquidError, PolicyError, StorageError, TemplarError,
-    TemplarResult, TestServerError, VaultError,
+    BitcoinError, HardwareError, LiquidError, PegError, PolicyError, StorageError, TemplarError,
+    TemplarResult, TestServerError, VaultError, ERR_PEG_EXPIRED, ERR_PEG_NOT_READY,
+    ERR_PEG_PROOF_REJECTED, ERR_PEG_UNAVAILABLE,
 };
 pub use frozen::{canonical_outpoint, first_frozen, CoinChain, FrozenCoins};
 pub use liquid::assets::{

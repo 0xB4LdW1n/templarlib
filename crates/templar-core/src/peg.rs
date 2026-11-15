@@ -1,0 +1,626 @@
+//! The native Elements peg of a Templar test server's regtest
+//! (`templar-testlab/docs/api-config.md`): the peg-out output, the Bitcoin
+//! side the wallet watches, and the verification of a peg-in claim's
+//! evidence.
+//!
+//! **Who is trusted for what.** The wallet's own Bitcoin Electrum server
+//! (the one its Bitcoin wallet syncs through) is the chain view: it says
+//! which transaction paid a deposit address, at which height, which header
+//! sits at that height and how deep the chain is. The Esplora server named by
+//! the test server only supplies bytes the claim needs and Electrum cannot
+//! give — the raw deposit transaction and its merkle proof — and those bytes
+//! are checked against the chain view before anything is built on them
+//! ([`verify_pegin_evidence`]). An Esplora server that lies can make a claim
+//! fail; it cannot make the wallet sign one for a transaction or a block its
+//! chain view does not have.
+//!
+//! Every network client here is built inside the call that needs it, with a
+//! timeout (the engine mutex is held while it waits).
+
+use std::io::Read;
+use std::str::FromStr;
+use std::time::Duration;
+
+use electrum_client::{ConfigBuilder, ElectrumApi};
+use lwk_wollet::elements::bitcoin::{self, hashes::Hash, BlockHash, ScriptBuf, Txid};
+use lwk_wollet::elements::{self, opcodes, script::Builder};
+use lwk_wollet::{PeginAddress, PeginFunding};
+
+use crate::error::{PegError, TemplarError};
+
+/// Smallest peg-in or peg-out the wallet starts: it leaves room for the
+/// claim's or the payout's fee and stays far above any dust limit.
+pub const MIN_PEG_SATS: u64 = 10_000;
+/// 21 million BTC: the largest amount any peg-in can carry.
+pub const MAX_MONEY_SATS: u64 = 2_100_000_000_000_000;
+
+/// Socket timeout of the Bitcoin Electrum client, as the Bitcoin wallet's.
+const ELECTRUM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Esplora connect and whole-request bounds.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Largest raw transaction read from Esplora (hex characters): a standard
+/// transaction is at most 400 000 weight units, 400 kB, 800 000 hex.
+pub const MAX_TX_HEX_CHARS: u64 = 1_000_000;
+/// Largest merkle-block proof read (hex characters): 80-byte header, a
+/// count, and one 32-byte hash per tree level and sibling — a few kB.
+pub const MAX_PROOF_HEX_CHARS: u64 = 200_000;
+
+fn chain_err(ctx: &str, e: impl std::fmt::Display) -> TemplarError {
+    PegError::Chain(format!("{ctx}: {e}")).into()
+}
+
+fn rejected(msg: impl Into<String>) -> TemplarError {
+    PegError::ProofRejected(msg.into()).into()
+}
+
+// ---------------------------------------------------------------------------
+// Peg-out output
+// ---------------------------------------------------------------------------
+
+/// The scriptPubKey of a peg-out output: `OP_RETURN <parent genesis hash,
+/// internal byte order> <the Bitcoin scriptPubKey to pay>`, what
+/// `elementsd sendtomainchain` writes (no PAK proof: the lab does not
+/// enforce PAK). The output carrying it must have an explicit L-BTC value.
+pub fn pegout_script(
+    parent_genesis: &BlockHash,
+    destination: &bitcoin::Script,
+) -> elements::Script {
+    Builder::new()
+        .push_opcode(opcodes::all::OP_RETURN)
+        .push_slice(&parent_genesis.to_byte_array())
+        .push_slice(destination.as_bytes())
+        .into_script()
+}
+
+/// Parses a Bitcoin address on `network` into its scriptPubKey. Refuses an
+/// address of another network.
+pub fn bitcoin_script_for(
+    address: &str,
+    network: bitcoin::Network,
+) -> Result<ScriptBuf, TemplarError> {
+    let parsed = bitcoin::Address::from_str(address.trim())
+        .map_err(|e| PegError::Build(format!("Invalid Bitcoin address: {e}")))?
+        .require_network(network)
+        .map_err(|e| PegError::Build(format!("Bitcoin address of another network: {e}")))?;
+    Ok(parsed.script_pubkey())
+}
+
+// ---------------------------------------------------------------------------
+// The wallet's Bitcoin chain view (Electrum)
+// ---------------------------------------------------------------------------
+
+/// One transaction touching a script, as Electrum reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptHistoryItem {
+    pub txid: Txid,
+    /// Confirmation height; `None` while in the mempool.
+    pub height: Option<u32>,
+}
+
+/// The wallet's Bitcoin Electrum server, read with bitcoin 0.32 types (the
+/// ones LWK's peg-in types use). Built per call; nothing is kept open.
+pub struct BitcoinChainView {
+    client: electrum_client::Client,
+}
+
+impl BitcoinChainView {
+    /// Connects to `electrum_url` (`tcp://host:port` or `ssl://host:port`,
+    /// the format of [`crate::BitcoinBackend::electrum_url`]).
+    pub fn connect(electrum_url: &str) -> Result<Self, TemplarError> {
+        let config = ConfigBuilder::new()
+            .timeout(Some(ELECTRUM_TIMEOUT))
+            .validate_domain(true)
+            .build();
+        let client = electrum_client::Client::from_config(electrum_url, config)
+            .map_err(|e| chain_err("Bitcoin Electrum connection failed", e))?;
+        Ok(Self { client })
+    }
+
+    /// Height of the best chain's tip.
+    pub fn tip_height(&self) -> Result<u32, TemplarError> {
+        let tip = self
+            .client
+            .block_headers_subscribe()
+            .map_err(|e| chain_err("Bitcoin tip", e))?;
+        u32::try_from(tip.height).map_err(|e| chain_err("Bitcoin tip", e))
+    }
+
+    /// Hash of the best chain's block at `height`.
+    pub fn block_hash_at(&self, height: u32) -> Result<BlockHash, TemplarError> {
+        let header = self
+            .client
+            .block_header(height as usize)
+            .map_err(|e| chain_err("Bitcoin block header", e))?;
+        Ok(header.block_hash())
+    }
+
+    /// Every transaction that pays or spends `script`.
+    pub fn history(
+        &self,
+        script: &bitcoin::Script,
+    ) -> Result<Vec<ScriptHistoryItem>, TemplarError> {
+        let items = self
+            .client
+            .script_get_history(script)
+            .map_err(|e| chain_err("Bitcoin script history", e))?;
+        Ok(items
+            .into_iter()
+            .map(|i| ScriptHistoryItem {
+                txid: i.tx_hash,
+                height: u32::try_from(i.height).ok().filter(|h| *h > 0),
+            })
+            .collect())
+    }
+
+    /// A transaction by id; its bytes are checked to hash to `txid`.
+    pub fn transaction(&self, txid: &Txid) -> Result<bitcoin::Transaction, TemplarError> {
+        let raw = self
+            .client
+            .transaction_get_raw(txid)
+            .map_err(|e| chain_err("Bitcoin transaction", e))?;
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
+            .map_err(|e| chain_err("Bitcoin transaction decode", e))?;
+        if tx.compute_txid() != *txid {
+            return Err(chain_err(
+                "Bitcoin transaction",
+                format!("the server answered another transaction for {txid}"),
+            ));
+        }
+        Ok(tx)
+    }
+
+    /// Broadcasts a serialized transaction; returns its txid.
+    pub fn broadcast_raw(&self, raw: &[u8]) -> Result<Txid, TemplarError> {
+        self.client
+            .transaction_broadcast_raw(raw)
+            .map_err(|e| chain_err("Bitcoin broadcast", e))
+    }
+
+    /// Confirmations of the history item (0 in the mempool).
+    pub fn confirmations(item: &ScriptHistoryItem, tip: u32) -> u32 {
+        item.height
+            .map(|h| tip.saturating_sub(h).saturating_add(1))
+            .unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Esplora (claim evidence only)
+// ---------------------------------------------------------------------------
+
+/// Reads a hex document `GET {base}{path}` of at most `max_chars`
+/// characters and decodes it. No redirects; bounded in time and size.
+fn esplora_hex(base: &str, path: &str, max_chars: u64) -> Result<Vec<u8>, TemplarError> {
+    let url = format!("{}{path}", base.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| chain_err("Esplora client", e))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .map_err(|e| chain_err("Esplora request", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(chain_err(
+            "Esplora request",
+            format!("HTTP {} for {path}", status.as_u16()),
+        ));
+    }
+    if resp.content_length().is_some_and(|n| n > max_chars) {
+        return Err(chain_err("Esplora request", format!("{path} is too large")));
+    }
+    let mut body = Vec::new();
+    resp.take(max_chars + 1)
+        .read_to_end(&mut body)
+        .map_err(|e| chain_err("Esplora request", e))?;
+    if body.len() as u64 > max_chars {
+        return Err(chain_err("Esplora request", format!("{path} is too large")));
+    }
+    let text = std::str::from_utf8(&body)
+        .map_err(|_| chain_err("Esplora request", format!("{path} is not text")))?;
+    hex::decode(text.trim()).map_err(|_| chain_err("Esplora request", format!("{path} is not hex")))
+}
+
+/// The raw deposit transaction and its merkle-block proof (bitcoind's
+/// `gettxoutproof` format) from the Esplora server at `base`. Unverified:
+/// hand them to [`verify_pegin_evidence`].
+pub fn fetch_pegin_evidence(base: &str, txid: &Txid) -> Result<(Vec<u8>, Vec<u8>), TemplarError> {
+    let tx = esplora_hex(base, &format!("/tx/{txid}/hex"), MAX_TX_HEX_CHARS)?;
+    let proof = esplora_hex(
+        base,
+        &format!("/tx/{txid}/merkleblock-proof"),
+        MAX_PROOF_HEX_CHARS,
+    )?;
+    Ok((tx, proof))
+}
+
+// ---------------------------------------------------------------------------
+// Claim evidence
+// ---------------------------------------------------------------------------
+
+/// What the wallet's own Bitcoin chain view says about a peg-in deposit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepositFacts {
+    /// The transaction Electrum lists as paying the deposit address.
+    pub txid: Txid,
+    /// Its confirmation height.
+    pub height: u32,
+    /// The best chain's block hash at `height`.
+    pub block_hash: BlockHash,
+    /// The best chain's tip height.
+    pub tip_height: u32,
+}
+
+impl DepositFacts {
+    /// Reads the facts for `txid` (one of `script`'s history items) from the
+    /// chain view. Errors when the transaction is not confirmed.
+    pub fn read(
+        view: &BitcoinChainView,
+        script: &bitcoin::Script,
+        txid: &Txid,
+    ) -> Result<Self, TemplarError> {
+        let item = view
+            .history(script)?
+            .into_iter()
+            .find(|i| i.txid == *txid)
+            .ok_or_else(|| {
+                PegError::NotReady(format!(
+                    "the wallet's Bitcoin server does not list deposit {txid} any more"
+                ))
+            })?;
+        let height = item
+            .height
+            .ok_or_else(|| PegError::NotReady(format!("deposit {txid} is not confirmed yet")))?;
+        Ok(Self {
+            txid: *txid,
+            height,
+            block_hash: view.block_hash_at(height)?,
+            tip_height: view.tip_height()?,
+        })
+    }
+
+    /// Confirmations of the deposit (the including block counts as one).
+    pub fn confirmations(&self) -> u32 {
+        self.tip_height
+            .saturating_sub(self.height)
+            .saturating_add(1)
+    }
+}
+
+/// Checks a peg-in claim's evidence before anything is built on it, and
+/// returns it as LWK's [`PeginFunding`]:
+///
+/// 1. the transaction pays `pegin_address` exactly once and the proof's
+///    partial merkle tree is valid and includes it ([`PeginFunding::from_raw`]);
+/// 2. it is the transaction the wallet's chain view listed (`facts.txid`);
+/// 3. the proof's block is the chain view's block at the deposit's height —
+///    a proof built on any other header (a fork, a made-up block) is
+///    refused, which LWK alone does not check;
+/// 4. the deposit is at least `required_confirmations` deep in that chain.
+pub fn verify_pegin_evidence(
+    pegin_address: PeginAddress,
+    facts: &DepositFacts,
+    tx_bytes: &[u8],
+    proof_bytes: &[u8],
+    required_confirmations: u32,
+) -> Result<PeginFunding, TemplarError> {
+    let funding = PeginFunding::from_raw(pegin_address, tx_bytes, proof_bytes)
+        .map_err(|e| rejected(format!("the deposit evidence does not check out: {e}")))?;
+    let txid = funding.deposit().outpoint().txid;
+    if txid != facts.txid {
+        return Err(rejected(format!(
+            "the evidence is for transaction {txid}, not for the deposit {} the wallet's \
+             Bitcoin server lists",
+            facts.txid
+        )));
+    }
+    if funding.referenced_block() != facts.block_hash {
+        return Err(rejected(format!(
+            "the merkle proof's block {} is not the block {} the wallet's Bitcoin server has \
+             at height {}",
+            funding.referenced_block(),
+            facts.block_hash,
+            facts.height
+        )));
+    }
+    let confirmations = facts.confirmations();
+    if confirmations < required_confirmations {
+        return Err(PegError::NotReady(format!(
+            "the deposit has {confirmations} of the {required_confirmations} Bitcoin \
+             confirmations a claim needs"
+        ))
+        .into());
+    }
+    Ok(funding)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitcoin::block::{Header, Version};
+    use bitcoin::{absolute::LockTime, transaction, Amount, CompactTarget, MerkleBlock, TxOut};
+    use lwk_wollet::{FedPeg, WolletDescriptor};
+
+    /// A real peg-out output of the testlab chain, written by
+    /// `elementsd sendtomainchain bcrt1ql2elf5cduwsuea5vl33lsctrl7vyzh7uq4vv4n 0.5`
+    /// (Liquid tx 5e5fa221…36e7, output 1): the lab's documented format.
+    const LAB_PEGOUT_SCRIPT: &str = "6a2006226e46111a0b59caaf126043eb5bbf28c34f3a5e332a1fc7b2b73cf\
+                                     188910f160014fab3f4d30de3a1ccf68cfc63f86163ff98415fdc";
+    const LAB_PEGOUT_ADDRESS: &str = "bcrt1ql2elf5cduwsuea5vl33lsctrl7vyzh7uq4vv4n";
+
+    fn regtest_genesis() -> BlockHash {
+        bitcoin::constants::genesis_block(bitcoin::Network::Regtest)
+            .header
+            .block_hash()
+    }
+
+    #[test]
+    fn pegout_script_matches_the_labs_sendtomainchain_output() {
+        let dest = bitcoin_script_for(LAB_PEGOUT_ADDRESS, bitcoin::Network::Regtest).unwrap();
+        let script = pegout_script(&regtest_genesis(), &dest);
+        assert_eq!(
+            hex::encode(script.as_bytes()),
+            LAB_PEGOUT_SCRIPT.replace(' ', "")
+        );
+        // Elements reads it back as a peg-out to that script on that chain.
+        let out = elements::TxOut {
+            asset: elements::confidential::Asset::Explicit(elements::AssetId::default()),
+            value: elements::confidential::Value::Explicit(50_000_000),
+            nonce: elements::confidential::Nonce::Null,
+            script_pubkey: script,
+            witness: Default::default(),
+        };
+        let data = out.pegout_data().expect("a peg-out");
+        assert_eq!(data.genesis_hash, regtest_genesis());
+        assert_eq!(data.script_pubkey, dest);
+        assert_eq!(data.value, 50_000_000);
+        assert!(data.extra_data.is_empty());
+    }
+
+    #[test]
+    fn bitcoin_addresses_of_other_networks_are_refused() {
+        assert!(bitcoin_script_for(LAB_PEGOUT_ADDRESS, bitcoin::Network::Regtest).is_ok());
+        let err = bitcoin_script_for(LAB_PEGOUT_ADDRESS, bitcoin::Network::Testnet)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("another network"), "{err}");
+        let err = bitcoin_script_for("not an address", bitcoin::Network::Regtest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Invalid Bitcoin address"), "{err}");
+    }
+
+    // -- Claim evidence ------------------------------------------------------
+
+    /// The test server's federation: `wsh(multi(1, <lab key>))` in a
+    /// P2SH-P2WSH program, as the lab's dynafed headers carry it.
+    const LAB_FEDPEG_SCRIPT: &str =
+        "5121035a5368bd34fd0178050dc283d4b5902e69b27a1cbfd0fb57adf331aaaa3639e851ae";
+
+    fn lab_network() -> lwk_wollet::Network {
+        crate::LiquidNetwork::regtest_with_genesis(
+            "b0b2bef620ac742b2399a0085bc84e4860ae2c65b5375e3b94399debec69aa6b",
+            "d51392db10c135e2e5f7bcfeab36e859ca4e69d6f76439ec0ebcb0a8da7be248",
+        )
+        .unwrap()
+        .elements()
+    }
+
+    /// A dynafed header at height 150 carrying the lab's full parameters.
+    fn lab_fed_peg() -> FedPeg {
+        use elements::dynafed::{FullParams, Params};
+        let fedpeg_script = bitcoin::ScriptBuf::from_hex(LAB_FEDPEG_SCRIPT).unwrap();
+        let wsh = bitcoin::ScriptBuf::new_p2wsh(&fedpeg_script.wscript_hash());
+        let program = bitcoin::ScriptBuf::new_p2sh(&wsh.script_hash());
+        let full = Params::Full(FullParams::new(
+            elements::Script::new(),
+            0,
+            program,
+            fedpeg_script.to_bytes(),
+            vec![],
+        ));
+        let header = elements::BlockHeader {
+            version: 0x2000_0000,
+            prev_blockhash: elements::BlockHash::from_byte_array([0; 32]),
+            merkle_root: elements::TxMerkleNode::from_byte_array([0; 32]),
+            time: 0,
+            height: 150,
+            ext: elements::BlockExtData::Dynafed {
+                current: full.clone(),
+                proposed: Params::Null,
+                signblock_witness: vec![],
+            },
+        };
+        FedPeg::from_block_header(lab_network(), &header).unwrap()
+    }
+
+    fn pegin_address() -> PeginAddress {
+        let signer = lwk_signer::SwSigner::new_with_network(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+             abandon about",
+            lwk_wollet::Network::TestnetLiquid,
+        )
+        .unwrap();
+        let desc = lwk_common::singlesig_desc(
+            &signer,
+            lwk_common::Singlesig::Wpkh,
+            lwk_common::DescriptorBlindingKey::Slip77,
+        )
+        .unwrap();
+        let desc: WolletDescriptor = desc.parse().unwrap();
+        desc.pegin_address(3, &lab_fed_peg()).unwrap()
+    }
+
+    fn deposit_tx(address: &PeginAddress, sats: u64) -> bitcoin::Transaction {
+        bitcoin::Transaction {
+            version: transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(sats),
+                    script_pubkey: address.address().script_pubkey(),
+                },
+                TxOut {
+                    value: Amount::from_sat(1_234),
+                    script_pubkey: ScriptBuf::new_op_return([7u8; 4]),
+                },
+            ],
+        }
+    }
+
+    /// A block holding `txids` (proof for the first) and its merkle proof.
+    fn proof_for(txids: &[Txid], prev: BlockHash) -> MerkleBlock {
+        let leaves: Vec<_> = txids.iter().map(|t| t.to_raw_hash()).collect();
+        let root = bitcoin::merkle_tree::calculate_root(leaves.into_iter()).unwrap();
+        let header = Header {
+            version: Version::ONE,
+            prev_blockhash: prev,
+            merkle_root: bitcoin::TxMerkleNode::from_raw_hash(root),
+            time: 1_700_000_000,
+            bits: CompactTarget::from_consensus(0x207f_ffff),
+            nonce: 0,
+        };
+        let first = txids[0];
+        MerkleBlock::from_header_txids_with_predicate(&header, txids, |t| *t == first)
+    }
+
+    struct Case {
+        address: PeginAddress,
+        tx: Vec<u8>,
+        proof: Vec<u8>,
+        facts: DepositFacts,
+    }
+
+    fn good_case() -> Case {
+        let address = pegin_address();
+        let tx = deposit_tx(&address, 100_000);
+        let txid = tx.compute_txid();
+        let other = Txid::from_byte_array([9u8; 32]);
+        let proof = proof_for(&[txid, other], regtest_genesis());
+        Case {
+            facts: DepositFacts {
+                txid,
+                height: 240,
+                block_hash: proof.header.block_hash(),
+                tip_height: 241,
+            },
+            address,
+            tx: bitcoin::consensus::serialize(&tx),
+            proof: bitcoin::consensus::serialize(&proof),
+        }
+    }
+
+    fn verify(c: &Case) -> Result<PeginFunding, String> {
+        verify_pegin_evidence(c.address.clone(), &c.facts, &c.tx, &c.proof, 2)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn a_deposit_proven_in_the_wallets_chain_at_depth_verifies() {
+        let c = good_case();
+        let funding = verify(&c).unwrap();
+        assert_eq!(funding.deposit().amount().to_sat(), 100_000);
+        assert_eq!(funding.deposit().outpoint().vout, 0);
+        assert_eq!(funding.referenced_block(), c.facts.block_hash);
+        // It becomes an L-BTC input of the lab's chain.
+        let input = lwk_wollet::PeginInput::from(funding);
+        assert_eq!(input.parent_genesis_hash(), regtest_genesis());
+        assert_eq!(
+            input.pegged_asset(),
+            *lab_network().policy_asset(),
+            "the claim mints the lab's L-BTC"
+        );
+    }
+
+    #[test]
+    fn a_tampered_proof_is_rejected() {
+        let mut c = good_case();
+        // Flip a byte of the first hash after the header, count and flags.
+        let n = c.proof.len();
+        c.proof[n - 10] ^= 0x01;
+        let err = verify(&c).unwrap_err();
+        assert!(err.starts_with("PEG_PROOF_REJECTED:"), "{err}");
+        // A proof cut short does not even decode.
+        let mut c = good_case();
+        c.proof.truncate(90);
+        assert!(verify(&c).unwrap_err().starts_with("PEG_PROOF_REJECTED:"));
+    }
+
+    #[test]
+    fn a_proof_for_another_transaction_is_rejected() {
+        let mut c = good_case();
+        let other = Txid::from_byte_array([5u8; 32]);
+        let proof = proof_for(&[other, c.facts.txid], regtest_genesis());
+        c.proof = bitcoin::consensus::serialize(&proof);
+        c.facts.block_hash = proof.header.block_hash();
+        let err = verify(&c).unwrap_err();
+        assert!(err.starts_with("PEG_PROOF_REJECTED:"), "{err}");
+        assert!(err.contains("not included in the txout proof"), "{err}");
+    }
+
+    #[test]
+    fn a_transaction_the_chain_view_did_not_list_is_rejected() {
+        let mut c = good_case();
+        // Another transaction paying the same address, with a valid proof.
+        let tx = deposit_tx(&c.address, 99_999);
+        let proof = proof_for(&[tx.compute_txid()], regtest_genesis());
+        c.tx = bitcoin::consensus::serialize(&tx);
+        c.proof = bitcoin::consensus::serialize(&proof);
+        c.facts.block_hash = proof.header.block_hash();
+        let err = verify(&c).unwrap_err();
+        assert!(err.contains("not for the deposit"), "{err}");
+    }
+
+    #[test]
+    fn a_header_not_in_the_wallets_chain_is_rejected() {
+        let mut c = good_case();
+        // The chain view has a different block at that height.
+        c.facts.block_hash = BlockHash::from_byte_array([3u8; 32]);
+        let err = verify(&c).unwrap_err();
+        assert!(err.starts_with("PEG_PROOF_REJECTED:"), "{err}");
+        assert!(err.contains("is not the block"), "{err}");
+    }
+
+    #[test]
+    fn a_deposit_too_shallow_is_not_ready() {
+        let mut c = good_case();
+        c.facts.tip_height = c.facts.height; // one confirmation, two needed
+        let err = verify(&c).unwrap_err();
+        assert!(err.starts_with("PEG_NOT_READY:"), "{err}");
+        assert!(err.contains("1 of the 2"), "{err}");
+    }
+
+    #[test]
+    fn a_transaction_not_paying_the_address_is_rejected() {
+        let mut c = good_case();
+        let mut tx = deposit_tx(&c.address, 100_000);
+        tx.output[0].script_pubkey = ScriptBuf::new_op_return([1u8; 4]);
+        let proof = proof_for(&[tx.compute_txid()], regtest_genesis());
+        c.tx = bitcoin::consensus::serialize(&tx);
+        c.proof = bitcoin::consensus::serialize(&proof);
+        c.facts.txid = tx.compute_txid();
+        c.facts.block_hash = proof.header.block_hash();
+        let err = verify(&c).unwrap_err();
+        assert!(err.starts_with("PEG_PROOF_REJECTED:"), "{err}");
+    }
+
+    #[test]
+    fn confirmations_count_the_including_block() {
+        let item = ScriptHistoryItem {
+            txid: Txid::all_zeros(),
+            height: Some(100),
+        };
+        assert_eq!(BitcoinChainView::confirmations(&item, 100), 1);
+        assert_eq!(BitcoinChainView::confirmations(&item, 101), 2);
+        let mempool = ScriptHistoryItem {
+            txid: Txid::all_zeros(),
+            height: None,
+        };
+        assert_eq!(BitcoinChainView::confirmations(&mempool, 101), 0);
+    }
+}

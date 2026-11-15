@@ -28,6 +28,50 @@ pub enum TemplarError {
 
     #[error(transparent)]
     TestServer(#[from] TestServerError),
+
+    #[error(transparent)]
+    Peg(#[from] PegError),
+}
+
+/// Tag of [`PegError::Unavailable`]: no peg provider on the active network.
+pub const ERR_PEG_UNAVAILABLE: &str = "PEG_UNAVAILABLE";
+/// Tag of [`PegError::NotReady`]: the order is not in a state that allows the step.
+pub const ERR_PEG_NOT_READY: &str = "PEG_NOT_READY";
+/// Tag of [`PegError::Expired`]: the deposit address or order is no longer valid.
+pub const ERR_PEG_EXPIRED: &str = "PEG_EXPIRED";
+/// Tag of [`PegError::ProofRejected`]: the evidence for a peg-in claim did not verify.
+pub const ERR_PEG_PROOF_REJECTED: &str = "PEG_PROOF_REJECTED";
+
+/// A peg-in / peg-out step that cannot go ahead. The first four variants
+/// start with a stable tag hosts key on; the text after it may change.
+#[derive(Debug, Error)]
+pub enum PegError {
+    /// No peg provider serves the active network, with the reason.
+    #[error("PEG_UNAVAILABLE: {0}")]
+    Unavailable(String),
+
+    /// The order is not where the step needs it (not enough confirmations
+    /// yet, already funded, …). Retrying later may help.
+    #[error("PEG_NOT_READY: {0}")]
+    NotReady(String),
+
+    /// The deposit address (or the provider's order) is no longer valid;
+    /// nothing may be paid to it.
+    #[error("PEG_EXPIRED: {0}")]
+    Expired(String),
+
+    /// The Bitcoin transaction, merkle proof or block header behind a
+    /// peg-in claim did not verify against the wallet's own chain view.
+    #[error("PEG_PROOF_REJECTED: {0}")]
+    ProofRejected(String),
+
+    /// A chain server or the provider could not be read.
+    #[error("Peg chain access failed: {0}")]
+    Chain(String),
+
+    /// The transaction could not be built or did not come out as intended.
+    #[error("Peg transaction failed: {0}")]
+    Build(String),
 }
 
 /// A Templar test server (`GET <url>/api/config`) that cannot be used. Every
