@@ -784,6 +784,7 @@ impl WalletManager {
             receive_descriptor: Some(recv_desc),
             pub_info,
             is_multisig: false,
+            backend: crate::bitcoin::wallet::BitcoinBackend::testnet_default(),
         })
     }
 

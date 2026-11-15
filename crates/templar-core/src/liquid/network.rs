@@ -13,7 +13,7 @@
 use std::fmt;
 
 use lwk_common::ElementsParamsBuilder;
-use lwk_wollet::elements::{Address, AddressParams, AssetId};
+use lwk_wollet::elements::{Address, AddressParams, AssetId, BlockHash};
 use lwk_wollet::Network as ElementsNetwork;
 use serde::{Deserialize, Serialize};
 
@@ -47,7 +47,15 @@ pub enum LiquidNetwork {
     LiquidTestnet,
     /// A local Elements regtest chain. Its policy asset depends on the
     /// node's genesis block, so it travels with the variant.
-    LiquidRegtest { policy_asset: String },
+    LiquidRegtest {
+        policy_asset: String,
+        /// Genesis block hash (display hex) of a regtest whose genesis is
+        /// not the stock `liquidregtest` one — a Templar testlab's, read from
+        /// its `/api/config`. `None` = the stock genesis, and absent on the
+        /// wire, so the value the protocol exchanges is unchanged for it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        genesis_hash: Option<String>,
+    },
 }
 
 impl LiquidNetwork {
@@ -60,6 +68,7 @@ impl LiquidNetwork {
     pub fn regtest_default() -> Self {
         LiquidNetwork::LiquidRegtest {
             policy_asset: REGTEST_DEFAULT_POLICY_ASSET.to_string(),
+            genesis_hash: None,
         }
     }
 
@@ -74,6 +83,29 @@ impl LiquidNetwork {
         })?;
         Ok(LiquidNetwork::LiquidRegtest {
             policy_asset: policy_asset.to_string(),
+            genesis_hash: None,
+        })
+    }
+
+    /// Regtest with an explicit policy asset and genesis block hash (both
+    /// validated, display hex). A genesis equal to the stock `liquidregtest`
+    /// one is stored as `None`, so the value compares equal to the plain
+    /// [`LiquidNetwork::regtest`] of the same policy asset.
+    pub fn regtest_with_genesis(
+        policy_asset: &str,
+        genesis_hash: &str,
+    ) -> Result<Self, TemplarError> {
+        let genesis_hash = genesis_hash.trim().to_ascii_lowercase();
+        let parsed: BlockHash = genesis_hash.parse().map_err(|e| {
+            LiquidError::InvalidNetwork(format!("regtest genesis hash {genesis_hash:?}: {e}"))
+        })?;
+        let LiquidNetwork::LiquidRegtest { policy_asset, .. } = Self::regtest(policy_asset)? else {
+            unreachable!("regtest() builds a regtest");
+        };
+        let stock = ElementsNetwork::default_regtest().genesis_hash();
+        Ok(LiquidNetwork::LiquidRegtest {
+            policy_asset,
+            genesis_hash: (parsed != stock).then_some(genesis_hash),
         })
     }
 
@@ -142,16 +174,26 @@ impl LiquidNetwork {
     pub fn elements(&self) -> ElementsNetwork {
         match self {
             LiquidNetwork::LiquidTestnet => ElementsNetwork::TestnetLiquid,
-            LiquidNetwork::LiquidRegtest { policy_asset } => ElementsNetwork::CustomElements(
-                ElementsParamsBuilder::new()
-                    .with_policy_asset(
-                        policy_asset
+            LiquidNetwork::LiquidRegtest {
+                policy_asset,
+                genesis_hash,
+            } => {
+                let mut params = ElementsParamsBuilder::new().with_policy_asset(
+                    policy_asset
+                        .parse()
+                        .expect("policy asset validated at construction"),
+                );
+                if let Some(genesis) = genesis_hash {
+                    params = params.with_genesis_hash(
+                        genesis
                             .parse()
-                            .expect("policy asset validated at construction"),
-                    )
-                    .build()
-                    .expect("the builder only fills in defaults"),
-            ),
+                            .expect("genesis hash validated at construction"),
+                    );
+                }
+                ElementsNetwork::CustomElements(
+                    params.build().expect("the builder only fills in defaults"),
+                )
+            }
         }
     }
 
@@ -159,9 +201,14 @@ impl LiquidNetwork {
     pub fn from_elements(network: ElementsNetwork) -> Result<Self, TemplarError> {
         match network {
             ElementsNetwork::TestnetLiquid => Ok(Self::testnet()),
-            ElementsNetwork::CustomElements(_) => Ok(LiquidNetwork::LiquidRegtest {
-                policy_asset: network.policy_asset().to_string(),
-            }),
+            ElementsNetwork::CustomElements(_) => {
+                let genesis = network.genesis_hash();
+                Ok(LiquidNetwork::LiquidRegtest {
+                    policy_asset: network.policy_asset().to_string(),
+                    genesis_hash: (genesis != ElementsNetwork::default_regtest().genesis_hash())
+                        .then(|| genesis.to_string()),
+                })
+            }
             ElementsNetwork::Liquid => Err(LiquidError::InvalidNetwork(
                 "Liquid mainnet is not supported by this wallet".into(),
             )
@@ -178,7 +225,7 @@ impl LiquidNetwork {
     pub fn policy_asset_hex(&self) -> String {
         match self {
             LiquidNetwork::LiquidTestnet => TESTNET_POLICY_ASSET.to_string(),
-            LiquidNetwork::LiquidRegtest { policy_asset } => policy_asset.clone(),
+            LiquidNetwork::LiquidRegtest { policy_asset, .. } => policy_asset.clone(),
         }
     }
 
@@ -288,6 +335,30 @@ mod tests {
             assert_eq!(LiquidNetwork::from_elements(n.elements()).unwrap(), n);
         }
         assert!(LiquidNetwork::from_elements(ElementsNetwork::Liquid).is_err());
+    }
+
+    #[test]
+    fn a_custom_genesis_travels_with_the_network() {
+        let policy = "aa".repeat(32);
+        let genesis = "d51392db10c135e2e5f7bcfeab36e859ca4e69d6f76439ec0ebcb0a8da7be248";
+        let lab = LiquidNetwork::regtest_with_genesis(&policy, genesis).unwrap();
+        assert_eq!(lab.elements().genesis_hash().to_string(), genesis);
+        assert_eq!(lab.policy_asset_hex(), policy);
+        // Round trip through LWK keeps both parameters.
+        assert_eq!(LiquidNetwork::from_elements(lab.elements()).unwrap(), lab);
+        // The stock genesis collapses to `None`: same value as plain regtest.
+        let stock = ElementsNetwork::default_regtest()
+            .genesis_hash()
+            .to_string();
+        assert_eq!(
+            LiquidNetwork::regtest_with_genesis(&policy, &stock).unwrap(),
+            LiquidNetwork::regtest(&policy).unwrap()
+        );
+        // On the wire the genesis is an extra key only when it is custom.
+        let json = serde_json::to_string(&lab).unwrap();
+        assert!(json.contains(genesis), "{json}");
+        assert_eq!(serde_json::from_str::<LiquidNetwork>(&json).unwrap(), lab);
+        assert!(LiquidNetwork::regtest_with_genesis(&policy, "zz").is_err());
     }
 
     #[test]

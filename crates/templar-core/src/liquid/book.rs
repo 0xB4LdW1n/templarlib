@@ -17,7 +17,9 @@ use thiserror::Error;
 /// Default public order book (mainnet, read-only browsing).
 pub const DEFAULT_BOOK_URL: &str = "https://liquidex.it/api/book";
 
-/// Local Templar order book used by testnet and regtest wallet flows.
+/// Local Templar order book used by testnet and regtest wallet flows (the
+/// default of [`crate::endpoints::Endpoints::book_url`] and
+/// [`crate::endpoints::Endpoints::markets_url`]).
 pub const LOCAL_BOOK_URL: &str = "http://127.0.0.1:3210/api/book";
 pub const LOCAL_MARKETS_URL: &str = "http://127.0.0.1:3210/api/markets";
 
@@ -30,8 +32,15 @@ pub enum BookError {
     #[error("Order book returned HTTP {0}")]
     Http(u16),
 
+    /// The book answered with an error status. `message` is the book's own
+    /// `{"error": …}` text (for people; match on `status`), `retry_after`
+    /// its `Retry-After` seconds when it sent one.
     #[error("Order book rejected the request (HTTP {status}): {message}")]
-    Rejected { status: u16, message: String },
+    Rejected {
+        status: u16,
+        message: String,
+        retry_after: Option<u64>,
+    },
 
     #[error("Order book response could not be parsed: {0}")]
     Parse(String),
@@ -176,8 +185,9 @@ struct PublishResponse {
     id: u64,
 }
 
-/// Publishes an already-signed proposal to a Templar local order book.
-/// No wallet key or descriptor is sent.
+/// Publishes an already-signed proposal to a Templar order book: the public
+/// `POST /api/offers` (or, for old setups, the admin route). Returns the
+/// stored offer's id. No wallet key or descriptor is sent.
 pub fn publish_offer(
     url: &str,
     network: &str,
@@ -198,15 +208,28 @@ pub fn publish_offer(
         .send()
         .map_err(|e| BookError::Network(e.to_string()))?;
     let status = resp.status();
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
     let body = resp.text().map_err(|e| BookError::Network(e.to_string()))?;
     if !status.is_success() {
         let message = serde_json::from_str::<serde_json::Value>(&body)
             .ok()
             .and_then(|value| value["error"].as_str().map(str::to_string))
             .unwrap_or_else(|| body.trim().to_string());
+        // The book's text ends up in an error string the UI shows: printable
+        // characters only, bounded.
+        let message: String = message
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(240)
+            .collect();
         return Err(BookError::Rejected {
             status: status.as_u16(),
             message,
+            retry_after,
         });
     }
     serde_json::from_str::<PublishResponse>(&body)

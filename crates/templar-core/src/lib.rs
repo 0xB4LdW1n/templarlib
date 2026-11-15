@@ -7,12 +7,14 @@ pub mod bitcoin;
 pub mod config;
 pub mod cross_chain;
 pub mod derivation;
+pub mod endpoints;
 pub mod error;
 pub mod frozen;
 pub mod liquid;
 pub mod policy;
 pub mod qr;
 pub mod registry;
+pub mod test_server;
 pub mod types;
 pub mod vault;
 
@@ -36,7 +38,9 @@ pub use bitcoin::psbt::{
     check_input_utxos, inspect_psbt, PsbtInputInfo, PsbtInspectionResult, PsbtOutputInfo,
     PsbtSignerInfo, UtxoStatus,
 };
-pub use bitcoin::wallet::{FeeBumpCapabilities, FeeBumpPlan, TxPreviewIo, WalletManager};
+pub use bitcoin::wallet::{
+    BitcoinBackend, FeeBumpCapabilities, FeeBumpPlan, TxPreviewIo, WalletManager,
+};
 pub use bitcoin::watch_only::{liquid_descriptor_from_wpkh, normalize_watch_only_descriptors};
 pub use config::AppConfig;
 pub use cross_chain::{
@@ -50,9 +54,10 @@ pub use derivation::{
     keyorigin_xpub_bip48, master_xprv, public_descriptor, slip77_blinding_key, validate_mnemonic,
     xpub_to_vpub_testnet, LiquidDerivationInfo, WalletPubInfo,
 };
+pub use endpoints::{Endpoints, Resolved, Source};
 pub use error::{
     BitcoinError, HardwareError, LiquidError, PolicyError, StorageError, TemplarError,
-    TemplarResult, VaultError,
+    TemplarResult, TestServerError, VaultError,
 };
 pub use frozen::{canonical_outpoint, first_frozen, CoinChain, FrozenCoins};
 pub use liquid::assets::{
@@ -70,11 +75,12 @@ pub use liquid::hardware::{
     LIQUID_HW_SIGNING_SUPPORTED,
 };
 pub use liquid::liquidex::{
-    broadcast_transaction, build_cancel_tx, make_proposal, proposal_utxo_unspent,
-    spend_liquid_htlc, take_preview, take_preview_excluding, take_proposal,
-    take_proposal_excluding, verify_proposal, LiquidHtlcSpendRequest, LiquidexLeg,
-    LiquidexProposal, SwapLeg, SwapNetwork, TakePreview, TakeResult, VerifyCheck, VerifyResult,
-    LBTC_MAINNET_ASSET_ID, LBTC_TESTNET_ASSET_ID,
+    broadcast_transaction, broadcast_transaction_with, build_cancel_tx, make_proposal,
+    proposal_utxo_unspent, proposal_utxo_unspent_with, spend_liquid_htlc, take_preview,
+    take_preview_excluding, take_proposal, take_proposal_excluding, verify_proposal,
+    verify_proposal_with, LiquidHtlcSpendRequest, LiquidexLeg, LiquidexProposal, SwapLeg,
+    SwapNetwork, TakePreview, TakeResult, VerifyCheck, VerifyResult, LBTC_MAINNET_ASSET_ID,
+    LBTC_TESTNET_ASSET_ID,
 };
 pub use liquid::multisig::{BlindingKeySource, LiquidMultisigSetup};
 pub use liquid::network::{LiquidNetwork, REGTEST_DEFAULT_POLICY_ASSET, TESTNET_POLICY_ASSET};
@@ -102,5 +108,6 @@ pub use registry::{
     is_ct_descriptor, LiquidWalletConfig, ProfileStore, WalletData, WalletEntry, WalletProfile,
     WalletRegistry,
 };
+pub use test_server::{RegtestProfile, TestServerProfile};
 pub use types::{Network, SyncStatus, TxInfo};
 pub use vault::{KdfParams, SealedSecret, Vault, VaultHeader};

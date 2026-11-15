@@ -545,6 +545,30 @@ pub fn verify_proposal_on(
     deep: bool,
     local: &LiquidNetwork,
 ) -> Result<VerifyResult, TemplarError> {
+    if deep {
+        verify_proposal_with(proposal, &LiquidChain::from_env(local)?)
+    } else {
+        verify_proposal_inner(proposal, local, None)
+    }
+}
+
+/// Deep verification ([`verify_proposal_on`] with `deep == true`) through an
+/// explicit chain handle — the backend the caller resolved (a test server's
+/// Electrum, say) rather than the environment's.
+pub fn verify_proposal_with(
+    proposal: &LiquidexProposal,
+    chain: &LiquidChain,
+) -> Result<VerifyResult, TemplarError> {
+    verify_proposal_inner(proposal, chain.network(), Some(chain))
+}
+
+/// Offline checks always; the deep checks when `chain` is given.
+fn verify_proposal_inner(
+    proposal: &LiquidexProposal,
+    local: &LiquidNetwork,
+    chain: Option<&LiquidChain>,
+) -> Result<VerifyResult, TemplarError> {
+    let deep = chain.is_some();
     let secp = Secp256k1::new();
     let mut checks: Vec<VerifyCheck> = Vec::with_capacity(6);
     let here = SwapNetwork::of(local);
@@ -572,9 +596,8 @@ pub fn verify_proposal_on(
     // Deep (chain) checks.
     let mut deep_results: [Option<Result<(), String>>; 3] = [None, None, None];
     let mut deep_note: Option<String> = None;
-    if deep {
+    if let Some(chain) = chain {
         if let Some(tx) = &tx {
-            let chain = LiquidChain::from_env(local)?;
             let outpoint = tx.input[0].previous_output;
             match chain.fetch_transaction(&outpoint.txid)? {
                 Some(prev_tx) => {
@@ -792,11 +815,18 @@ pub fn proposal_utxo_unspent_on(
     proposal: &LiquidexProposal,
     local: &LiquidNetwork,
 ) -> Result<Option<bool>, TemplarError> {
+    proposal_utxo_unspent_with(proposal, &LiquidChain::from_env(local)?)
+}
+
+/// [`proposal_utxo_unspent_on`] through an explicit chain handle.
+pub fn proposal_utxo_unspent_with(
+    proposal: &LiquidexProposal,
+    chain: &LiquidChain,
+) -> Result<Option<bool>, TemplarError> {
     let tx = proposal.transaction()?;
     let outpoint = tx.input.first().map(|i| i.previous_output).ok_or_else(|| {
         TemplarError::from(LiquidError::PsetBuildFailed("proposal has no input".into()))
     })?;
-    let chain = LiquidChain::from_env(local)?;
     match chain.fetch_transaction(&outpoint.txid)? {
         None => Ok(None),
         Some(prev_tx) => match prev_tx.output.get(outpoint.vout as usize) {
@@ -819,7 +849,15 @@ pub fn broadcast_transaction_on(
     tx: &Transaction,
     local: &LiquidNetwork,
 ) -> Result<String, TemplarError> {
-    LiquidChain::from_env(local)?.broadcast(tx)?;
+    broadcast_transaction_with(tx, &LiquidChain::from_env(local)?)
+}
+
+/// Broadcasts through an explicit chain handle. Returns the txid.
+pub fn broadcast_transaction_with(
+    tx: &Transaction,
+    chain: &LiquidChain,
+) -> Result<String, TemplarError> {
+    chain.broadcast(tx)?;
     Ok(tx.txid().to_string())
 }
 
@@ -1149,7 +1187,7 @@ pub fn make_proposal(
     let outpoint = parse_outpoint(utxo)?;
     if want_asset_id == LBTC_MAINNET_ASSET_ID {
         return Err(LiquidError::PsetBuildFailed(
-            "want asset is mainnet LBTC — it cannot be received on Liquid testnet".into(),
+            "want asset is mainnet LBTC — this wallet never receives on Liquid mainnet".into(),
         )
         .into());
     }
@@ -1310,7 +1348,8 @@ pub struct TakeResult {
 /// are not takeable on the wallet's own network (testnet or regtest — read
 /// from the wallet, so a regtest wallet takes regtest offers and pays the
 /// fee in its own policy asset). Does **not** broadcast — pass the returned
-/// transaction to [`broadcast_transaction_on`].
+/// transaction to [`broadcast_transaction_with`] (the wallet's
+/// [`LiquidWalletManager::chain`]).
 pub fn take_proposal(
     manager: &LiquidWalletManager,
     proposal: &LiquidexProposal,
@@ -1327,8 +1366,9 @@ pub fn take_proposal_excluding(
     fee_rate: Option<f32>,
     frozen: &BTreeSet<String>,
 ) -> Result<TakeResult, TemplarError> {
-    let local = manager.network()?;
-    let analysis = verify_proposal_on(proposal, true, &local)?;
+    // Deep-verified through the wallet's own chain backend: the one it
+    // syncs and broadcasts with.
+    let analysis = verify_proposal_with(proposal, &manager.chain()?)?;
     if !analysis.takeable {
         let reason = analysis
             .take_block_reason

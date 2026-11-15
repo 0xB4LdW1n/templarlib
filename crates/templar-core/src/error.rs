@@ -25,6 +25,41 @@ pub enum TemplarError {
 
     #[error(transparent)]
     Vault(#[from] VaultError),
+
+    #[error(transparent)]
+    TestServer(#[from] TestServerError),
+}
+
+/// A Templar test server (`GET <url>/api/config`) that cannot be used. Every
+/// variant is a refusal at a trust boundary: the profile decides which
+/// servers the wallet talks to, so nothing of a refused answer is applied.
+#[derive(Debug, Error)]
+pub enum TestServerError {
+    #[error("Invalid test server URL: {0}")]
+    InvalidUrl(String),
+
+    #[error("Cannot reach the test server: {0}")]
+    Unreachable(String),
+
+    #[error("The test server answered HTTP {0} for /api/config")]
+    Http(u16),
+
+    #[error("The test server's /api/config is larger than {0} bytes")]
+    TooLarge(u64),
+
+    #[error(
+        "This test server needs a newer wallet (its config is version {found}; this wallet \
+         reads version {supported})"
+    )]
+    UnsupportedVersion { found: u64, supported: u32 },
+
+    #[error("The test server's config is invalid: {0}")]
+    Invalid(String),
+
+    #[error(
+        "The test server's config names a mainnet ({0}); this wallet runs on test networks only"
+    )]
+    Mainnet(String),
 }
 
 /// At-rest encryption / vault errors (C1).

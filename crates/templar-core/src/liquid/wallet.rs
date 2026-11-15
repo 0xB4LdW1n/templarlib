@@ -24,7 +24,7 @@ use std::path::Path;
 
 use crate::error::{LiquidError, TemplarError};
 use crate::frozen::first_frozen;
-use crate::liquid::chain::LiquidChain;
+use crate::liquid::chain::{LiquidBackend, LiquidChain};
 use crate::liquid::network::LiquidNetwork;
 use crate::liquid::pset::{refuse_unsafe_signing, PsetInputInfo, PsetOutputInfo};
 
@@ -100,6 +100,10 @@ pub struct LiquidWalletManager {
     pub wollet: Wollet,
     pub signer: Option<SwSigner>,
     pub descriptor: String,
+    /// The chain backend the host resolved for this wallet
+    /// ([`crate::endpoints::Endpoints::liquid_backend`]); `None` = the
+    /// environment's ([`LiquidChain::from_env`]).
+    backend: Option<LiquidBackend>,
 }
 
 /// Returns the compressed 33-byte issuer public key from a software signer.
@@ -426,6 +430,7 @@ impl LiquidWalletManager {
             wollet,
             signer: Some(signer),
             descriptor: descriptor_string,
+            backend: None,
         })
     }
 
@@ -521,6 +526,7 @@ impl LiquidWalletManager {
             wollet,
             signer: None,
             descriptor: descriptor_str.to_string(),
+            backend: None,
         })
     }
 
@@ -550,10 +556,22 @@ impl LiquidWalletManager {
         self.wollet.policy_asset().to_string()
     }
 
-    /// The chain backend for this wallet's network, as the environment
-    /// configures it (`TEMPLAR_LIQUID_BACKEND` and friends).
+    /// The chain handle for this wallet's network: the backend set with
+    /// [`Self::set_chain_backend`], else the environment's
+    /// (`TEMPLAR_LIQUID_BACKEND` and friends). Every sync, broadcast and
+    /// LiquiDEX deep check of this wallet goes through it.
     pub fn chain(&self) -> Result<LiquidChain, TemplarError> {
-        LiquidChain::from_env(&self.network()?)
+        match &self.backend {
+            Some(backend) => LiquidChain::new(self.network()?, backend.clone()),
+            None => LiquidChain::from_env(&self.network()?),
+        }
+    }
+
+    /// Pins the chain backend this wallet syncs and broadcasts through —
+    /// what the host resolved for the wallet's network. Offline: nothing is
+    /// contacted.
+    pub fn set_chain_backend(&mut self, backend: LiquidBackend) {
+        self.backend = Some(backend);
     }
 
     /// Syncs with the chain backend of this wallet's network (Electrum on

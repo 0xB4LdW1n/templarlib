@@ -200,7 +200,8 @@ pub fn inspect_psbt(
         .output
         .iter()
         .map(|out| {
-            let address = Address::from_script(&out.script_pubkey, Network::Testnet)
+            let network = wallet.map_or(Network::Testnet, |w| w.network());
+            let address = Address::from_script(&out.script_pubkey, network)
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "undecodable script".to_string());
             let amount_sats = out.value;

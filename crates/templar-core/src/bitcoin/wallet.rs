@@ -16,7 +16,7 @@ use bdk::wallet::{AddressIndex, AddressInfo};
 use bdk::KeychainKind;
 use bdk::{FeeRate, SignOptions, SyncOptions, Wallet};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use crate::bitcoin::multisig::MultisigSetupInfo;
@@ -97,19 +97,80 @@ pub struct FeeBumpPlan {
 
 /// Electrum server for Bitcoin testnet (default; override with
 /// TEMPLAR_ELECTRUM_URL for outages or self-hosted servers).
-const ELECTRUM_URL: &str = "ssl://electrum.blockstream.info:60002";
+pub const ELECTRUM_URL: &str = "ssl://electrum.blockstream.info:60002";
 
-/// The configured Bitcoin Electrum endpoint: env override or the default.
-fn electrum_endpoint() -> String {
-    std::env::var("TEMPLAR_ELECTRUM_URL")
+/// Environment override of the Bitcoin Electrum server.
+pub const ENV_ELECTRUM_URL: &str = "TEMPLAR_ELECTRUM_URL";
+
+/// The environment's Bitcoin Electrum server, if set.
+pub fn electrum_env_override() -> Option<String> {
+    std::env::var(ENV_ELECTRUM_URL)
         .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| ELECTRUM_URL.to_string())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
-fn make_electrum_blockchain() -> Result<ElectrumBlockchain, TemplarError> {
+/// The configured Bitcoin testnet Electrum endpoint: env override or the
+/// default.
+fn electrum_endpoint() -> String {
+    electrum_env_override().unwrap_or_else(|| ELECTRUM_URL.to_string())
+}
+
+/// Which Bitcoin network a [`WalletManager`] runs on and the Electrum server
+/// it reaches it through. Testnet unless a Templar test server says the
+/// Liquid regtest it runs is pegged to a Bitcoin regtest (see
+/// [`crate::endpoints::Endpoints::bitcoin_backend`]). Key derivation,
+/// descriptors, coin selection and signing are the same on both; only
+/// address encoding, the chain and the on-disk data differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitcoinBackend {
+    pub network: Network,
+    /// `ssl://host:port` or `tcp://host:port`.
+    pub electrum_url: String,
+}
+
+impl BitcoinBackend {
+    /// Bitcoin testnet through the default Electrum server
+    /// (`TEMPLAR_ELECTRUM_URL` overrides it) — what every wallet ran on
+    /// before regtest existed.
+    pub fn testnet_default() -> Self {
+        Self {
+            network: Network::Testnet,
+            electrum_url: electrum_endpoint(),
+        }
+    }
+
+    /// Bitcoin regtest through `electrum_url`.
+    pub fn regtest(electrum_url: &str) -> Self {
+        Self {
+            network: Network::Regtest,
+            electrum_url: electrum_url.to_string(),
+        }
+    }
+
+    /// `bitcoin-testnet` | `bitcoin-regtest`.
+    pub fn network_name(&self) -> &'static str {
+        match self.network {
+            Network::Regtest => "bitcoin-regtest",
+            _ => "bitcoin-testnet",
+        }
+    }
+
+    /// Where this network's BDK databases live under the data directory:
+    /// the directory itself on testnet (unchanged from before regtest), a
+    /// `bitcoin-regtest/` subdirectory on regtest, so the two never share a
+    /// database.
+    pub fn data_root(&self, data_dir: &Path) -> PathBuf {
+        match self.network {
+            Network::Testnet => data_dir.to_path_buf(),
+            _ => data_dir.join(self.network_name()),
+        }
+    }
+}
+
+fn make_electrum_blockchain(url: &str) -> Result<ElectrumBlockchain, TemplarError> {
     ElectrumBlockchain::from_config(&ElectrumBlockchainConfig {
-        url: electrum_endpoint(),
+        url: url.to_string(),
         socks5: None,
         retry: 3,
         timeout: Some(5),
@@ -185,6 +246,8 @@ pub struct WalletManager {
     pub pub_info: Option<WalletPubInfo>,
     /// True if this wallet uses a multisig descriptor.
     pub is_multisig: bool,
+    /// The network and Electrum server this wallet runs on.
+    pub(crate) backend: BitcoinBackend,
 }
 
 /// Fee rates the builder accepts, in sat/vB. 0.1 is the relay floor since
@@ -229,8 +292,8 @@ fn vsize_from_target(fee_sats: u64, fee_rate: f32) -> usize {
 /// Resolve an incoming transaction's fee from its prevouts. BDK cannot know
 /// this from a wallet-only sync because the sender's inputs are foreign. This
 /// network lookup runs only when the user opens a CPFP preview.
-fn transaction_fee_from_electrum(tx: &Transaction) -> Result<u64, TemplarError> {
-    let chain = make_electrum_blockchain()?;
+fn transaction_fee_from_electrum(tx: &Transaction, url: &str) -> Result<u64, TemplarError> {
+    let chain = make_electrum_blockchain(url)?;
     let mut input_total = 0u64;
     for input in &tx.input {
         let previous = chain
@@ -310,6 +373,17 @@ impl WalletManager {
     /// Each wallet gets a unique sled database keyed by the master fingerprint,
     /// preventing "descriptor checksum mismatch" when opening different wallets.
     pub fn new(data_dir: &Path, mnemonic_str: &str) -> Result<Self, TemplarError> {
+        Self::new_on(&BitcoinBackend::testnet_default(), data_dir, mnemonic_str)
+    }
+
+    /// [`Self::new`] on `backend`'s network. The extended key is encoded
+    /// for testnet as before (a regtest `tprv` is the same key); the wallet,
+    /// its addresses and its database follow `backend`.
+    pub fn new_on(
+        backend: &BitcoinBackend,
+        data_dir: &Path,
+        mnemonic_str: &str,
+    ) -> Result<Self, TemplarError> {
         let network = Network::Testnet;
         let mnemonic = Mnemonic::parse(mnemonic_str)
             .map_err(|e| BitcoinError::InvalidMnemonic(e.to_string()))?;
@@ -327,14 +401,19 @@ impl WalletManager {
 
         let secp = bdk::bitcoin::secp256k1::Secp256k1::new();
         let fp = format!("{}", xprv.fingerprint(&secp));
-        let db_path = data_dir.join(format!("bdk_sw_{}", fp));
+        let db_path = backend.data_root(data_dir).join(format!("bdk_sw_{}", fp));
 
         let db = sled::open(&db_path).map_err(open_db_error)?;
         let database = db
             .open_tree("main")
             .map_err(|e| BitcoinError::InvalidDescriptor(format!("Database tree failed: {e}")))?;
-        let wallet = Wallet::new(&descriptor, Some(&change_descriptor), network, database)
-            .map_err(|e| BitcoinError::InvalidDescriptor(e.to_string()))?;
+        let wallet = Wallet::new(
+            &descriptor,
+            Some(&change_descriptor),
+            backend.network,
+            database,
+        )
+        .map_err(|e| BitcoinError::InvalidDescriptor(e.to_string()))?;
 
         let pub_desc_str = wallet
             .public_descriptor(KeychainKind::External)
@@ -352,6 +431,7 @@ impl WalletManager {
             receive_descriptor: None,
             pub_info,
             is_multisig: false,
+            backend: backend.clone(),
         })
     }
 
@@ -373,6 +453,7 @@ impl WalletManager {
             receive_descriptor: Some(recv_desc.to_string()),
             pub_info,
             is_multisig: false,
+            backend: BitcoinBackend::testnet_default(),
         })
     }
 
@@ -409,6 +490,22 @@ impl WalletManager {
         profile: &WalletProfile,
         wallet_id: &str,
     ) -> Result<Self, TemplarError> {
+        Self::from_multisig_profile_on(
+            &BitcoinBackend::testnet_default(),
+            data_dir,
+            profile,
+            wallet_id,
+        )
+    }
+
+    /// [`Self::from_multisig_profile`] on `backend`'s network.
+    pub fn from_multisig_profile_on(
+        backend: &BitcoinBackend,
+        data_dir: &Path,
+        profile: &WalletProfile,
+        wallet_id: &str,
+    ) -> Result<Self, TemplarError> {
+        let data_dir = &backend.data_root(data_dir);
         let (recv_desc, change_desc, cosigner_xpubs) = match profile {
             WalletProfile::Multisig {
                 receive_descriptor,
@@ -432,10 +529,12 @@ impl WalletManager {
             if inherited { &legacy } else { &own },
             recv_desc,
             change_desc,
+            backend.network,
         ) {
             Ok(wallet) => wallet,
             Err(MultisigDbError::Foreign) if inherited => {
-                Self::open_multisig_db(&own, recv_desc, change_desc).map_err(|e| e.into_error())?
+                Self::open_multisig_db(&own, recv_desc, change_desc, backend.network)
+                    .map_err(|e| e.into_error())?
             }
             Err(e) => return Err(e.into_error()),
         };
@@ -447,6 +546,7 @@ impl WalletManager {
             receive_descriptor: Some(recv_desc.to_string()),
             pub_info,
             is_multisig: true,
+            backend: backend.clone(),
         })
     }
 
@@ -455,6 +555,7 @@ impl WalletManager {
         path: &Path,
         recv_desc: &str,
         change_desc: &str,
+        network: Network,
     ) -> Result<Wallet<sled::Tree>, MultisigDbError> {
         let db = sled::open(path).map_err(|e| {
             if is_lock_error(&e) {
@@ -468,7 +569,7 @@ impl WalletManager {
                 BitcoinError::InvalidDescriptor(format!("Database tree failed: {e}")).into(),
             )
         })?;
-        Wallet::new(recv_desc, Some(change_desc), Network::Testnet, database).map_err(|e| match e {
+        Wallet::new(recv_desc, Some(change_desc), network, database).map_err(|e| match e {
             bdk::Error::ChecksumMismatch => MultisigDbError::Foreign,
             e => MultisigDbError::Failed(BitcoinError::InvalidDescriptor(e.to_string()).into()),
         })
@@ -484,12 +585,29 @@ impl WalletManager {
         change_desc: &str,
         db_id: &str,
     ) -> Result<Self, TemplarError> {
-        let db_path = data_dir.join(format!("bdk_{}", db_id));
+        Self::from_descriptors_on(
+            &BitcoinBackend::testnet_default(),
+            data_dir,
+            recv_desc,
+            change_desc,
+            db_id,
+        )
+    }
+
+    /// [`Self::from_descriptors`] on `backend`'s network.
+    pub fn from_descriptors_on(
+        backend: &BitcoinBackend,
+        data_dir: &Path,
+        recv_desc: &str,
+        change_desc: &str,
+        db_id: &str,
+    ) -> Result<Self, TemplarError> {
+        let db_path = backend.data_root(data_dir).join(format!("bdk_{}", db_id));
         let db = sled::open(&db_path).map_err(open_db_error)?;
         let database = db
             .open_tree("policy_main")
             .map_err(|e| BitcoinError::InvalidDescriptor(format!("Database tree failed: {e}")))?;
-        let wallet = Wallet::new(recv_desc, Some(change_desc), Network::Testnet, database)
+        let wallet = Wallet::new(recv_desc, Some(change_desc), backend.network, database)
             .map_err(|e| BitcoinError::InvalidDescriptor(e.to_string()))?;
 
         let pub_info = Self::pub_info_from_descriptor(recv_desc, &[]);
@@ -499,7 +617,18 @@ impl WalletManager {
             receive_descriptor: Some(recv_desc.to_string()),
             pub_info,
             is_multisig: false,
+            backend: backend.clone(),
         })
+    }
+
+    /// The Bitcoin network this wallet runs on.
+    pub fn network(&self) -> Network {
+        self.backend.network
+    }
+
+    /// The network and Electrum server this wallet runs on.
+    pub fn backend(&self) -> &BitcoinBackend {
+        &self.backend
     }
 
     /// Creates a multisig wallet from setup info and the local signing
@@ -563,7 +692,7 @@ impl WalletManager {
         // Connect on demand: the wallet must open (and derive addresses) fully
         // offline, so the Electrum connection only exists while syncing. A
         // fresh connection per sync also survives servers dropping idle links.
-        let blockchain = make_electrum_blockchain()?;
+        let blockchain = make_electrum_blockchain(&self.backend.electrum_url)?;
         let this = std::panic::AssertUnwindSafe(self);
         catch_bdk(move || {
             this.wallet
@@ -685,7 +814,7 @@ impl WalletManager {
         for (recipient, amount, send_max) in recipients {
             let address = Address::from_str(recipient)
                 .map_err(|e| BitcoinError::TxBuildFailed(format!("Invalid address: {e}")))?
-                .require_network(Network::Testnet)
+                .require_network(self.network())
                 .map_err(|e| BitcoinError::TxBuildFailed(format!("Wrong network: {e}")))?;
             if *send_max {
                 if drain_script.is_some() {
@@ -805,7 +934,7 @@ impl WalletManager {
         recipients: &[String],
     ) -> (Vec<TxPreviewIo>, Vec<TxPreviewIo>) {
         let addr_of = |script: &bdk::bitcoin::Script| -> String {
-            Address::from_script(script, Network::Testnet)
+            Address::from_script(script, self.network())
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "(non-address script)".to_string())
         };
@@ -879,7 +1008,7 @@ impl WalletManager {
 
         let address = Address::from_str(recipient)
             .map_err(|e| BitcoinError::TxBuildFailed(format!("Invalid address: {e}")))?
-            .require_network(Network::Testnet)
+            .require_network(self.network())
             .map_err(|e| BitcoinError::TxBuildFailed(format!("Wrong network: {e}")))?;
 
         let fee_rate = checked_fee_rate(fee_rate)?;
@@ -1001,7 +1130,7 @@ impl WalletManager {
 
     /// Broadcasts a signed transaction.
     pub fn broadcast(&self, tx: Transaction) -> Result<Txid, TemplarError> {
-        make_electrum_blockchain()?
+        make_electrum_blockchain(&self.backend.electrum_url)?
             .broadcast(&tx)
             .map_err(|e| BitcoinError::BroadcastFailed(e.to_string()))?;
         Ok(tx.txid())
@@ -1011,7 +1140,7 @@ impl WalletManager {
     /// Electrum server. Cross-chain swaps use this to verify the counterparty's
     /// HTLC funding output instead of trusting localhost coordinator state.
     pub fn fetch_transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TemplarError> {
-        make_electrum_blockchain()?
+        make_electrum_blockchain(&self.backend.electrum_url)?
             .get_tx(txid)
             .map_err(|e| BitcoinError::SyncFailed(format!("Fetch transaction: {e}")).into())
     }
@@ -1247,7 +1376,7 @@ impl WalletManager {
             .ok_or_else(|| BitcoinError::TxBuildFailed("Raw transaction unavailable".into()))?;
         let parent_fee = match details.fee {
             Some(fee) => fee,
-            None => transaction_fee_from_electrum(parent)?,
+            None => transaction_fee_from_electrum(parent, &self.backend.electrum_url)?,
         };
         let old_rate = parent_fee as f32 / caps.vsize as f32;
         require_higher_fee_rate(target_fee_rate, old_rate)?;
@@ -1389,7 +1518,7 @@ impl WalletManager {
                         {
                             let addr = bdk::bitcoin::Address::from_script(
                                 &output.script_pubkey,
-                                bdk::bitcoin::Network::Testnet,
+                                this.network(),
                             )
                             .map(|a| a.to_string())
                             .unwrap_or_else(|_| format!("index-{index}"));
@@ -1645,6 +1774,7 @@ mod tests {
             receive_descriptor: None,
             pub_info: None,
             is_multisig: false,
+            backend: BitcoinBackend::testnet_default(),
         };
         (manager, txid)
     }

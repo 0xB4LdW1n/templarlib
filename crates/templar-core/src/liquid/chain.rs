@@ -39,8 +39,10 @@ use lwk_wollet::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::endpoints::Source;
 use crate::error::{LiquidError, TemplarError};
 use crate::liquid::network::{env_non_empty, LiquidNetwork};
+use crate::test_server::RegtestProfile;
 
 /// Electrum server for Liquid testnet (default; override with
 /// `TEMPLAR_LIQUID_ELECTRUM_URL` for outages or self-hosted servers).
@@ -113,21 +115,56 @@ impl LiquidBackend {
         }
     }
 
-    /// The backend for `network`: `TEMPLAR_LIQUID_BACKEND` when set, else
-    /// Electrum on testnet and `elementsd` RPC on regtest. Bad values are
-    /// reported rather than silently defaulted.
+    /// The backend for `network` from the environment alone:
+    /// [`LiquidBackend::resolve`] without a test-server profile.
     pub fn from_env(network: &LiquidNetwork) -> Result<Self, TemplarError> {
-        match env_non_empty(ENV_BACKEND).as_deref() {
-            None => Ok(Self::default_for(network)),
-            Some(v) => match v.to_ascii_lowercase().as_str() {
-                "electrum" => Ok(Self::testnet_default()),
-                "elements_rpc" | "elements-rpc" | "rpc" => Ok(Self::regtest_default()),
-                other => Err(LiquidError::InvalidNetwork(format!(
-                    "{ENV_BACKEND}={other:?} (expected electrum or elements_rpc)"
-                ))
-                .into()),
-            },
+        Self::resolve(network, None).map(|(backend, _)| backend)
+    }
+
+    /// The backend for `network` and where it came from. Precedence:
+    ///
+    /// 1. `TEMPLAR_LIQUID_BACKEND` (`electrum` | `elements_rpc`), with the
+    ///    URL variables of that backend — on either network;
+    /// 2. on regtest, `TEMPLAR_ELEMENTS_RPC_URL`: that `elementsd`;
+    /// 3. on regtest, a test server's `liquid_electrum_url` (`regtest`);
+    /// 4. the network's default: Blockstream's testnet Electrum
+    ///    (`TEMPLAR_LIQUID_ELECTRUM_URL` overrides it), the local
+    ///    `elementsd` RPC on regtest.
+    ///
+    /// A test-server profile never applies to testnet. Bad environment
+    /// values are reported rather than silently defaulted.
+    pub fn resolve(
+        network: &LiquidNetwork,
+        regtest: Option<&RegtestProfile>,
+    ) -> Result<(Self, Source), TemplarError> {
+        if let Some(v) = env_non_empty(ENV_BACKEND) {
+            let backend = match v.to_ascii_lowercase().as_str() {
+                "electrum" => Self::testnet_default(),
+                "elements_rpc" | "elements-rpc" | "rpc" => Self::regtest_default(),
+                other => {
+                    return Err(LiquidError::InvalidNetwork(format!(
+                        "{ENV_BACKEND}={other:?} (expected electrum or elements_rpc)"
+                    ))
+                    .into())
+                }
+            };
+            return Ok((backend, Source::Env));
         }
+        if network.is_regtest() {
+            if env_non_empty(ENV_RPC_URL).is_some() {
+                return Ok((Self::regtest_default(), Source::Env));
+            }
+            if let Some(profile) = regtest {
+                return Ok((profile.liquid_backend(), Source::Profile));
+            }
+            return Ok((Self::regtest_default(), Source::Default));
+        }
+        let source = if env_non_empty(ENV_ELECTRUM_URL).is_some() {
+            Source::Env
+        } else {
+            Source::Default
+        };
+        Ok((Self::testnet_default(), source))
     }
 
     /// The natural backend of a network when nothing is configured.
@@ -147,13 +184,16 @@ impl LiquidBackend {
         }
     }
 
-    /// Human description without credentials.
+    /// Human description without credentials (a `user:pass@` in an RPC URL
+    /// is masked too).
     pub fn describe(&self) -> String {
         match self {
             LiquidBackend::Electrum { url, tls, .. } => {
                 format!("electrum {}{url}", if *tls { "ssl://" } else { "tcp://" })
             }
-            LiquidBackend::ElementsRpc { url, .. } => format!("elements-rpc {url}"),
+            LiquidBackend::ElementsRpc { url, .. } => {
+                format!("elements-rpc {}", crate::endpoints::redact_userinfo(url))
+            }
         }
     }
 }
@@ -806,6 +846,38 @@ mod tests {
         }
         .describe();
         assert!(!d.contains("hunter2"));
+        let d = LiquidBackend::ElementsRpc {
+            url: "http://u:hunter2@h:1".into(),
+            user: "u".into(),
+            pass: "p".into(),
+        }
+        .describe();
+        assert!(!d.contains("hunter2"), "{d}");
+    }
+
+    /// The precedence below the environment (the gate runs without the
+    /// `TEMPLAR_LIQUID_*` variables; mutating them here would race).
+    #[test]
+    fn a_profile_applies_to_regtest_only() {
+        let profile = crate::test_server::parse_config(
+            "http://127.0.0.1:8096",
+            crate::test_server::tests_example(),
+            0,
+        )
+        .unwrap()
+        .regtest;
+        let regtest = profile.liquid_network();
+        let (backend, source) = LiquidBackend::resolve(&regtest, Some(&profile)).unwrap();
+        assert_eq!(source, Source::Profile);
+        assert_eq!(backend.describe(), "electrum tcp://127.0.0.1:19061");
+        let (backend, source) = LiquidBackend::resolve(&regtest, None).unwrap();
+        assert_eq!(source, Source::Default);
+        assert_eq!(backend.kind(), "elements_rpc");
+        // Testnet never takes anything from the profile.
+        let (backend, source) =
+            LiquidBackend::resolve(&LiquidNetwork::testnet(), Some(&profile)).unwrap();
+        assert_eq!(source, Source::Default);
+        assert_eq!(backend, LiquidBackend::testnet_default());
     }
 
     /// Construction is offline for both backends.
