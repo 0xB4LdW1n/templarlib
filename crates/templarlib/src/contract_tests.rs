@@ -2609,6 +2609,105 @@ fn sideswap_serves_testnet_only_when_the_lab_names_it() {
     assert!(net["peg_provider"].is_null());
 }
 
+/// SideSwap's real testnet endpoint (`TEMPLAR_SIDESWAP_URL` overrides it):
+/// its terms, then one order per direction opened, followed and cancelled
+/// locally. No funds move — SideSwap's deposit addresses are never paid.
+/// See docs/guides/LIVE_TESTS.md.
+#[test]
+#[ignore = "needs SideSwap's public testnet API (network)"]
+fn live_sideswap_testnet_quote_and_orders() {
+    let mut env = TestEnv::new();
+    // A lab profile whose testnet block names SideSwap, served locally.
+    let (lab, _slot) = lab_server(&"44".repeat(32));
+    env.ok("set_test_server", json!({ "url": lab }));
+    env.ok("set_liquid_network", json!({ "network": "testnet" }));
+    let words = env.ok("generate_mnemonic", json!({ "word_count": 12 }));
+    let mnemonic = words
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Live SideSwap", "mnemonic": mnemonic, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let address = |env: &mut TestEnv, asset: &str| {
+        env.ok(
+            "generate_receive_address",
+            json!({ "wallet_id": id, "asset": asset, "fresh": true }),
+        )["address"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let lbtc = address(&mut env, "LBTC");
+    let btc = address(&mut env, "BTC");
+    assert!(lbtc.starts_with("tlq1"), "{lbtc}");
+    assert!(btc.starts_with("tb1"), "{btc}");
+
+    for (dir, amount) in [("in", 100_000u64), ("out", 100_000u64)] {
+        let q = env.ok(
+            "peg_quote",
+            json!({ "direction": dir, "amount_sats": amount }),
+        );
+        eprintln!("[live] SideSwap {dir} quote: {q}");
+        assert_keys("peg_quote", &q, PEG_QUOTE_KEYS);
+        assert_eq!(q["provider"], json!("sideswap"));
+    }
+    let err = env.err(
+        "peg_quote",
+        json!({ "direction": "out", "amount_sats": 1_000 }),
+    );
+    assert!(err.contains("below the minimum"), "{err}");
+
+    for (dir, payout) in [("in", lbtc.clone()), ("out", btc.clone())] {
+        let started = env.call(
+            "peg_start",
+            json!({ "wallet_id": id, "direction": dir, "amount_sats": 100_000,
+                    "payout_address": payout }),
+        );
+        // SideSwap may refuse an order (on 2026-11-15 its testnet answered
+        // peg-out with "disabled on testnet" and peg-in with an internal
+        // error): the refusal must arrive as an error and store nothing.
+        let Some(order) = started.get("ok").cloned() else {
+            let err = started["err"].as_str().unwrap_or_default().to_string();
+            eprintln!("[live] SideSwap refused the {dir} order: {err}");
+            assert!(err.contains("SideSwap: the server refused"), "{err}");
+            let listed = env.ok("peg_list", json!({ "wallet_id": id }));
+            assert!(
+                !listed
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|o| o["direction"] == json!(dir) && o["status"] != json!("cancelled")),
+                "a refused order must not be stored: {listed}"
+            );
+            continue;
+        };
+        assert_keys("peg_start", &order, PEG_ORDER_KEYS);
+        eprintln!(
+            "[live] SideSwap {dir} order {}: deposit address {}, expires_at {}",
+            order["order_id"], order["deposit_address"], order["expires_at"]
+        );
+        assert_eq!(order["provider"], json!("sideswap"));
+        let oid = order["order_id"].as_str().unwrap().to_string();
+        let s = env.ok("peg_status", json!({ "order_id": oid }));
+        eprintln!(
+            "[live] SideSwap {dir} status: {}, error {}",
+            s["status"], s["last_error"]
+        );
+        assert_eq!(s["status"], json!("awaiting_deposit"));
+        assert!(s["last_error"].is_null(), "{s}");
+        let err = env.err("peg_claim", json!({ "order_id": oid }));
+        assert!(err.starts_with("PEG_UNAVAILABLE:"), "{err}");
+        let c = env.ok("peg_cancel", json!({ "order_id": oid }));
+        assert_eq!(c["status"], json!("cancelled"));
+    }
+}
+
 // ── Live: LiquiDEX on a Templar testlab ────────────────────────────
 
 /// One side of the live swap: an engine on its own data directory, joined

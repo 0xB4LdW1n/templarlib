@@ -1,6 +1,6 @@
 # Running the ignored tests
 
-`cargo test --workspace` is offline and is the gate. Nine tests are
+`cargo test --workspace` is offline and is the gate. Ten tests are
 `#[ignore]`d because they need something the gate does not have: a local
 Elements regtest node, a running Templar testlab, a running Templar
 Protocol site, a public Electrum server, or time. This guide says what each one needs and how to run it.
@@ -91,6 +91,25 @@ which runs every 60 s) and makes four faucet requests; the lab allows ten
 per client per hour (`[faucet] per_ip_per_hour`), so restart the lab's
 server, or wait, after the second run in an hour. Each run uses throwaway
 data directories; `templar-testlab down` stops the stack.
+
+## Against SideSwap's public testnet API
+
+| Test | Crate | What it proves |
+|---|---|---|
+| `live_sideswap_testnet_quote_and_orders` | templarlib | the SideSwap provider on Liquid testnet: a fresh wallet on testnet beside a (local, fake) test server whose config names SideSwap for testnet; `peg_quote` in both directions from SideSwap's real `server_status`; a quote below SideSwap's minimum refused; then one order per direction: opened, followed (`peg_status`), refused by `peg_claim` and cancelled — or, when SideSwap refuses to open it, the refusal surfaces as an error and nothing is stored |
+
+It needs only the network: SideSwap's testnet endpoint
+(`wss://api-testnet.sideswap.io/json-rpc-ws`; `TEMPLAR_SIDESWAP_URL`
+overrides it).
+
+```bash
+cargo test -p templarlib live_sideswap -- --ignored --nocapture
+```
+
+No funds move: SideSwap's deposit addresses are never paid. On
+2026-11-15 SideSwap's testnet answered `server_status`, but refused both
+orders: peg-out with `disabled on testnet`, peg-in with an internal error
+of its own backend; the test then checks the refusals, not an order.
 
 ## Against a running Templar Protocol site
 
