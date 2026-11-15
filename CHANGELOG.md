@@ -70,13 +70,27 @@ with 0, any release may change the method contract.
   - `inspect_pset`, and the Liquid signing routes that inspect first,
     answer with an error when an output's blind proofs do not match its
     commitments, where the output used to come back flagged `unverified`;
-    a PSET with no fee output, or several, is inspected (the fee is their
-    sum) instead of refused; a recipient paid in the clear carries its
-    address; `net_change` leaves out assets whose net change is zero.
+    `inspect_pset` describes a PSET with no fee output, or several (the
+    fee is their sum), instead of refusing it — signing it is still
+    refused, in the same words as before; a recipient paid in the clear
+    carries its address; `net_change` leaves out assets whose net change
+    is zero.
   - Transaction history and `list_received_external_addresses` also count
     outputs paid to the wallet's scripts in the clear.
   - LWK selects the L-BTC inputs of a payment instead of spending them all.
   - TLS Electrum connections on Liquid always validate the server's name.
+- Liquid signing refuses what LWK 0.9 never signed. LWK 0.20's software
+  signer and Jade sign with whatever sighash type a PSET input declares,
+  where 0.9 always produced SIGHASH_ALL; a SIGHASH_NONE, SINGLE or
+  ANYONECANPAY signature would let whoever holds the PSET change what it
+  pays. Every Liquid signer of `templar-core` now runs
+  `refuse_unsafe_signing` for its key first, and `sign_pset` /
+  `sign_pset_hw` run it before any key is unlocked: an input this wallet
+  signs may declare no sighash type or SIGHASH_ALL only (SIGHASH_DEFAULT
+  too on taproot), and the PSET must have exactly one fee output
+  (`refuse_bad_fee_outputs`, LWK 0.9's rule and words). Other parties'
+  inputs are not judged, and LiquiDEX keeps signing its maker input
+  SIGHASH_SINGLE|ANYONECANPAY with its own signer.
 - Rust API of `templar-core`: `LiquidNetwork::elements`, `from_elements`,
   `jade_network` and `LiquidWalletManager::elements_network` use LWK's
   `Network` (`TestnetLiquid`, `CustomElements`) in place of the removed

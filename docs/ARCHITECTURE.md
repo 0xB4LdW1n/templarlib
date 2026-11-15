@@ -36,6 +36,22 @@ application state (the open wallet, the vault, the registry) goes in
 | `src/types.rs` | Request and response DTOs shared with hosts. Some handler-local DTOs live in their handler module (`peg`, `swaps`, `cross_swaps`, `history`, `backup`). |
 | `src/contract_tests.rs` | Offline tests that drive `dispatch()` and assert the JSON keys hosts read. |
 
+## Liquid signing checks
+
+A Liquid PSET built elsewhere (a cosigner, a protocol site) passes these
+before a key touches it. The co-signing routes (`sign_pset`, `sign_pset_hw`)
+run them in `ensure_pset_signable`, before any key is unlocked:
+`inspect_pset` (network, mainnet derivation paths), exactly one fee output,
+SIGHASH_ALL only on the inputs this wallet signs, outputs whose amounts the
+commitments prove, then the frozen coins. Every signer in `templar-core` —
+`LiquidWalletManager::sign`, `sign_pset_with_mnemonic`, issuance, reissuance
+and burn, `LiquidMultisigSetup::sign_pset_with_mnemonics`, the Jade's
+`sign_pset` and `sign_multisig_pset` — runs the fee and sighash rules again
+for its own key (`refuse_unsafe_signing`, `liquid/pset.rs`), so no route
+reaches a key without them. LWK 0.9 enforced both rules itself; 0.20 signs
+whatever sighash type an input declares. LiquiDEX signs its own
+`SIGHASH_SINGLE|ANYONECANPAY` maker input without these signers.
+
 ## State
 
 One `AppState` per engine, created by `TemplarLib::new()` or
