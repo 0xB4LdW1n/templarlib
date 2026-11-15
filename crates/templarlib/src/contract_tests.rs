@@ -2956,6 +2956,208 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
     );
 }
 
+// ── Live: the native peg on a Templar testlab ──────────────────────
+
+impl LabWallet {
+    /// Polls `peg_status` until `pred` holds (Electrum indexes a block, and
+    /// the lab's federation bot pays, a few seconds after the fact).
+    fn wait_peg(&mut self, order_id: &str, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+        let mut last = Value::Null;
+        for _ in 0..60 {
+            last = self.env.ok("peg_status", json!({ "order_id": order_id }));
+            if pred(&last) {
+                return last;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        panic!("{what}: the order never got there: {last}");
+    }
+}
+
+/// The native peg end to end on a running Templar testlab, through nothing
+/// but the test-server profile: a fresh software wallet joins the lab and
+/// is funded through the lab's admin API; peg-in (`peg_start` → `peg_fund`
+/// pays the deposit from the wallet's own Bitcoin → mining → `claimable`,
+/// a claim before that depth refused → `peg_claim` → `completed`, L-BTC up
+/// by the deposit minus the claim fee); peg-out (`peg_start` → `peg_fund`
+/// → mining → the lab's federation bot pays → `completed`, BTC up by the
+/// amount); an over-limit peg-out and an expired peg-in address refused.
+/// See docs/guides/LIVE_TESTS.md.
+#[test]
+#[ignore = "needs a running Templar testlab (TEMPLAR_LIVE_TESTLAB_URL)"]
+fn live_testlab_native_peg_in_and_out() {
+    let lab = std::env::var("TEMPLAR_LIVE_TESTLAB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8096".to_string());
+    let lab = lab.trim_end_matches('/').to_string();
+    let config = lab_get(&format!("{lab}/api/config"));
+    let regtest = &config["networks"]["liquid-regtest"];
+    let lbtc = regtest["policy_asset"].as_str().unwrap().to_string();
+    let max = regtest["peg"]["pegout_max_sat"].as_u64().unwrap();
+    let mine = |chain: &str, n: u32| {
+        let r = lab_post(
+            &format!("{lab}/admin/api/mine"),
+            json!({ "chain": chain, "blocks": n }),
+        );
+        eprintln!("[live] mined {n} {chain} block(s), tip {}", r["height"]);
+    };
+    // The admin API, not the public faucet: the faucet's per-IP budget is
+    // shared with whoever else uses the lab. It mines a block after paying.
+    let fund = |network: &str, address: &str, amount: &str| {
+        let r = lab_post(
+            &format!("{lab}/admin/api/send"),
+            json!({ "network": network, "address": address, "amount": amount }),
+        );
+        eprintln!("[live] admin send {amount} → {address}: {}", r["txid"]);
+    };
+
+    let mut w = LabWallet::join(&lab, "Live peg");
+    let net = w.env.ok("get_liquid_network", json!({}));
+    assert_eq!(net["peg_provider"], json!("native"), "{net}");
+    let btc_addr = w.address("BTC");
+    let lbtc_addr = w.address("LBTC");
+    fund("bitcoin-regtest", &btc_addr, "0.01");
+    fund("liquid-regtest", &lbtc_addr, "0.01");
+    let btc0 = w.wait_balance("BTC", "BTC funded", |x| x == 1_000_000);
+    let lbtc0 = w.wait_balance(&lbtc, "L-BTC funded", |x| x == 1_000_000);
+
+    // ── Peg-in: 0.002 BTC ──────────────────────────────────────────────
+    const PEGIN: u64 = 200_000;
+    let quote = w.env.ok(
+        "peg_quote",
+        json!({ "direction": "in", "amount_sats": PEGIN }),
+    );
+    eprintln!("[live] peg-in quote: {quote}");
+    let payout = w.address("LBTC");
+    let order = w.ok(
+        "peg_start",
+        json!({ "direction": "in", "amount_sats": PEGIN, "payout_address": payout }),
+    );
+    let oid = order["order_id"].as_str().unwrap().to_string();
+    let deposit = order["deposit_address"].as_str().unwrap().to_string();
+    eprintln!(
+        "[live] peg-in {oid}: deposit address {deposit}, valid through Liquid height {}",
+        order["valid_until_liquid_height"]
+    );
+    assert!(deposit.starts_with('2'), "P2SH-P2WSH expected: {deposit}");
+    let err = w.env.err("peg_claim", json!({ "order_id": oid }));
+    assert!(err.starts_with("PEG_NOT_READY:"), "{err}");
+
+    // The wallet pays the deposit from its own Bitcoin.
+    let funded = w.env.ok("peg_fund", json!({ "order_id": oid }));
+    let deposit_txid = funded["txid_deposit"].as_str().unwrap().to_string();
+    eprintln!("[live] peg-in deposit txid {deposit_txid}");
+    assert_eq!(funded["status"], json!("deposit_seen"));
+    let err = w.env.err("peg_fund", json!({ "order_id": oid }));
+    assert!(err.starts_with("PEG_NOT_READY:"), "funded twice: {err}");
+
+    mine("bitcoin", 1);
+    w.wait_peg(&oid, "one confirmation", |o| o["confirmations"] == json!(1));
+    let err = w.env.err("peg_claim", json!({ "order_id": oid }));
+    eprintln!("[live] claim at depth 1 refused: {err}");
+    assert!(
+        err.starts_with("PEG_NOT_READY:") && err.contains("1 of the 2"),
+        "{err}"
+    );
+
+    mine("bitcoin", 1);
+    let ready = w.wait_peg(&oid, "claimable", |o| o["status"] == json!("claimable"));
+    assert_eq!(ready["deposit_received_sats"], json!(PEGIN));
+    let claimed = w.env.ok("peg_claim", json!({ "order_id": oid }));
+    let claim_txid = claimed["txid_claim"].as_str().unwrap().to_string();
+    let pegged = claimed["payout_expected_sats"].as_u64().unwrap();
+    eprintln!(
+        "[live] peg-in claim txid {claim_txid}: {pegged} sats L-BTC (fee {})",
+        PEGIN - pegged
+    );
+    assert_eq!(claimed["status"], json!("settling"));
+    mine("liquid", 1);
+    let done = w.wait_peg(&oid, "peg-in completed", |o| {
+        o["status"] == json!("completed")
+    });
+    assert_eq!(done["txid_payout"], json!(claim_txid));
+    let lbtc1 = w.wait_balance(&lbtc, "L-BTC pegged in", |x| x > lbtc0);
+    assert_eq!(lbtc1 - lbtc0, pegged as i64, "L-BTC up by the claim");
+    let btc1 = w.balance("BTC");
+    assert!(
+        btc1 < btc0 - PEGIN as i64,
+        "BTC down by the deposit and its fee"
+    );
+    eprintln!(
+        "[live] after the peg-in: BTC {btc0} → {btc1}, L-BTC {lbtc0} → {lbtc1} \
+         (history {})",
+        done["status_history"]
+    );
+
+    // ── Peg-out: 0.0005 L-BTC ──────────────────────────────────────────
+    const PEGOUT: u64 = 50_000;
+    let err = w.env.err(
+        "peg_quote",
+        json!({ "direction": "out", "amount_sats": max + 1 }),
+    );
+    assert!(err.contains("above the maximum"), "{err}");
+    let btc_payout = w.address("BTC");
+    let err = w.err(
+        "peg_start",
+        json!({ "direction": "out", "amount_sats": max + 1, "payout_address": btc_payout }),
+    );
+    eprintln!("[live] over-limit peg-out refused: {err}");
+    assert!(err.contains("above the maximum"), "{err}");
+    let order = w.ok(
+        "peg_start",
+        json!({ "direction": "out", "amount_sats": PEGOUT, "payout_address": btc_payout }),
+    );
+    let out_id = order["order_id"].as_str().unwrap().to_string();
+    let sent = w.env.ok("peg_fund", json!({ "order_id": out_id }));
+    let pegout_txid = sent["txid_deposit"].as_str().unwrap().to_string();
+    eprintln!("[live] peg-out {out_id} txid {pegout_txid}");
+    mine("liquid", 2);
+    let paid = w.wait_peg(&out_id, "federation payment", |o| {
+        o["status"] == json!("settling") && !o["txid_payout"].is_null()
+    });
+    let payout_txid = paid["txid_payout"].as_str().unwrap().to_string();
+    eprintln!("[live] federation payout txid {payout_txid}");
+    mine("bitcoin", 1);
+    w.wait_peg(&out_id, "peg-out completed", |o| {
+        o["status"] == json!("completed")
+    });
+    let btc2 = w.wait_balance("BTC", "BTC paid out", |x| x == btc1 + PEGOUT as i64);
+    let lbtc2 = w.balance(&lbtc);
+    assert!(
+        lbtc2 < lbtc1 - PEGOUT as i64,
+        "L-BTC down by the peg-out and its fee"
+    );
+    eprintln!(
+        "[live] after the peg-out: BTC {btc1} → {btc2}, L-BTC {lbtc1} → {lbtc2} \
+         (fee {})",
+        lbtc1 - lbtc2 - PEGOUT as i64
+    );
+
+    // ── An expired peg-in address is never paid ────────────────────────
+    // The lab's federation never changes, so a change is simulated: the
+    // stored order is made to remember another federation script and a
+    // window already past. The wallet re-reads the live federation, sees it
+    // differs, and expires the order.
+    let stale = w.ok(
+        "peg_start",
+        json!({ "direction": "in", "amount_sats": PEGIN, "payout_address": payout }),
+    );
+    let stale_id = stale["order_id"].as_str().unwrap().to_string();
+    let path = w.env.dir.join("peg_orders.json");
+    let mut store: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for o in store["orders"].as_array_mut().unwrap() {
+        if o["order_id"] == json!(stale_id) {
+            o["valid_until_liquid_height"] = json!(0);
+            o["native"]["fedpeg_script_hex"] = json!("51");
+        }
+    }
+    std::fs::write(&path, store.to_string()).unwrap();
+    let s = w.env.ok("peg_status", json!({ "order_id": stale_id }));
+    assert_eq!(s["status"], json!("expired"), "{s}");
+    let err = w.env.err("peg_fund", json!({ "order_id": stale_id }));
+    eprintln!("[live] expired address refused: {err}");
+    assert!(err.starts_with("PEG_EXPIRED:"), "{err}");
+}
+
 // ── Liquid co-signing guard ────────────────────────────────────────
 
 /// A testnet PSET for the test mnemonic's `m/2121'/1'/0'/0/0` key (a loan

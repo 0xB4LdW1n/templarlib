@@ -1,6 +1,6 @@
 # Running the ignored tests
 
-`cargo test --workspace` is offline and is the gate. Eight tests are
+`cargo test --workspace` is offline and is the gate. Nine tests are
 `#[ignore]`d because they need something the gate does not have: a local
 Elements regtest node, a running Templar testlab, a running Templar
 Protocol site, a public Electrum server, or time. This guide says what each one needs and how to run it.
@@ -47,9 +47,10 @@ chain.
 | Test | Crate | What it proves |
 |---|---|---|
 | `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC, an issued asset and regtest BTC from its public faucet; A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
+| `live_testlab_native_peg_in_and_out` | templarlib | the native Elements peg with nothing but the test-server profile: a fresh software wallet joins the lab, gets regtest BTC and L-BTC from the lab's admin API; peg-in: `peg_start` → `peg_fund` (the wallet pays the deposit from its own Bitcoin) → a claim at one confirmation is `PEG_NOT_READY` → mined to depth → `claimable` → `peg_claim` → `completed`, the L-BTC balance up by exactly the claim's output; peg-out: an over-limit peg-out refused, `peg_start` → `peg_fund` → mined → the lab's federation bot pays → `completed`, the BTC balance up by exactly the amount; an expired peg-in address (a federation change, simulated in the stored order) refused with `PEG_EXPIRED` |
 
-It needs the Templar testlab (the `templar-testlab` repository) running
-with its order book, on loopback with no admin password (the test mines
+The LiquiDEX test needs the Templar testlab (the `templar-testlab`
+repository) running with its order book, on loopback with no admin password (the test mines
 through the lab's admin API, `POST /admin/api/mine`), and one asset issued
 by the lab:
 
@@ -67,6 +68,18 @@ Then, here:
 ```bash
 cargo test -p templarlib live_testlab -- --ignored --nocapture
 ```
+
+The peg test needs only the stack (`up`), not the order book or an
+issued asset; it runs alone with
+
+```bash
+cargo test -p templarlib live_testlab_native_peg -- --ignored --nocapture
+```
+
+It funds its wallet through the lab's admin API (`POST /admin/api/send`,
+open on loopback without a password), not the public faucet, and mines
+both chains (`POST /admin/api/mine`). One run takes about 40 seconds,
+moves 0.002 BTC in and 0.0005 L-BTC out, and prints every txid.
 
 | Variable | Effect |
 |---|---|
