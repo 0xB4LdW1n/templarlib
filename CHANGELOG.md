@@ -81,6 +81,12 @@ with 0, any release may change the method contract.
   `confirmations_required`, `network_fee_included`; `get_liquid_network`
   names the `peg_provider` or why there is none. Stable tags
   `PEG_UNAVAILABLE`, `PEG_NOT_READY`, `PEG_EXPIRED`, `PEG_PROOF_REJECTED`.
+- SideSwap on Liquid testnet, when the joined test server's config names
+  it for testnet: the same peg methods open SideSwap swap orders (a
+  custodial third-party service on Bitcoin testnet3, not a peg; provider
+  `sideswap`, no `peg_claim`). Endpoint `TEMPLAR_SIDESWAP_URL`, default
+  SideSwap's testnet. New status `failed`, new order key `expires_at`.
+  New dependency: `tungstenite` (WebSocket).
 - `swap_publish` refusals carry a tag per HTTP status of the order book:
   `BOOK_RATE_LIMITED`, `BOOK_CHAIN_UNREACHABLE`, `BOOK_DUPLICATE`,
   `BOOK_PUBLISH_DISABLED`, `BOOK_REJECTED`, `BOOK_UNAVAILABLE`,

@@ -136,8 +136,8 @@ amount_sats: int, display_amount}]`.
 `backend_description` (no credentials), `env_locked: bool`,
 `regtest_default_policy_asset`, `backend_source` (`env` | `profile` |
 `default`: where the backend came from), `test_server: string?` (base URL
-of the joined test server), `peg_provider: string?` (`native`, or null
-when no peg serves this network), `peg_unavailable_reason: string?` (the
+of the joined test server), `peg_provider: string?` (`native` |
+`sideswap`, or null when no peg serves this network), `peg_unavailable_reason: string?` (the
 `PEG_UNAVAILABLE: …` message when `peg_provider` is null).
 
 **TestServer** (`TestServerDto`), the answer of the three test-server
@@ -182,13 +182,16 @@ u64` (after a claim: the claim's actual output), `created_at: u64`,
 Bitcoin deposit; peg-out: the Liquid peg-out), `txid_payout?` (peg-in: the
 claim; peg-out: the federation's Bitcoin payment), `simulated: bool`
 (false for real orders), `status_history: [{status, at: u64}]`, and since
-the native peg: `provider` (`native` | `simulated`), `confirmations: u32`
+the native peg: `provider` (`native` | `sideswap` | `simulated`),
+`confirmations: u32`
 (of the deposit: Bitcoin for a peg-in, Liquid for a peg-out),
 `confirmations_required: u32`, `deposit_received_sats: u64?`,
 `txid_claim?`, `valid_until_liquid_height: u32?` (native peg-in: the
 deposit address is guaranteed valid through this Liquid height; renewed
 while the federation is unchanged), `last_error: string?` (why the last
-status check could not read the chains; null when it could).
+status check could not read the chains; null when it could), `expires_at:
+u64?` (SideSwap: Unix seconds after which it no longer takes the deposit;
+null when the order does not expire).
 
 **SwapLeg** (`SwapLegDto`): `asset_id`, `ticker`, `amount_sats: u64`,
 `display_amount`.
@@ -1244,9 +1247,19 @@ Pegs go through the **provider** of the active network
   `pegout_max_sat`: the Elements peg between the lab's Bitcoin regtest and
   its Liquid regtest. Real coins, a real claim, a real federation payment.
   Needs a software wallet with Liquid (it signs with this app's keys).
-- none elsewhere: Liquid testnet has no parent chain, and a plain regtest
-  without a test server has no peg. `peg_quote`, `peg_start`, `peg_fund`
-  and `peg_claim` then answer `PEG_UNAVAILABLE: <why>`.
+- **sideswap**, on Liquid testnet when the joined test server's config
+  names `"sideswap"` for testnet: SideSwap's service at
+  `wss://api-testnet.sideswap.io/json-rpc-ws` (`TEMPLAR_SIDESWAP_URL`
+  overrides it; `wss://` only, `ws://` on loopback). **Not a peg**: a
+  custodial swap by a third party (testnet has no parent chain), on
+  Bitcoin testnet3 — the chain the wallet's testnet Electrum serves.
+  SideSwap gives a deposit address per order and pays out by itself; there
+  is no `peg_claim`. Only the receive address, the direction and a fee
+  rate are sent to SideSwap. Hosts should label these orders as SideSwap
+  swaps.
+- none elsewhere: Liquid testnet without such a test server, and a plain
+  regtest without a test server, have no peg. `peg_quote`, `peg_start`,
+  `peg_fund` and `peg_claim` then answer `PEG_UNAVAILABLE: <why>`.
 
 Orders are kept in `peg_orders.json` and survive network switches;
 `peg_status`, `peg_list` and `peg_cancel` work without a provider (an order
@@ -1276,8 +1289,19 @@ retry of the same call rebroadcasts those bytes rather than paying twice.
 | `completed` | the claim is in a block | the payment is in a block |
 | `cancelled` | `peg_cancel` before any deposit | `peg_cancel` before `peg_fund` |
 | `expired` | the federation changed before a deposit: never pay this address; or the test server reset its chains | the test server reset its chains |
+| `failed` | — | — |
 
-`completed`, `cancelled` and `expired` are final. A status can step back
+SideSwap orders use the same statuses: `awaiting_deposit` (no deposit
+reported), `deposit_seen` / `confirming` (SideSwap's `Detected`, with its
+`detected_confs` / `total_confs` as `confirmations` /
+`confirmations_required`), `settling` (`Processing`, or `Done` while the
+payout is not yet in a block paying the receive address on the wallet's
+own chain view), `completed` (paid, and seen so), `cancelled` (locally;
+SideSwap has no cancel), `expired` (past `expires_at` with no deposit),
+`failed` (`InsufficientAmount`: the deposit does not cover SideSwap's
+fees and is not paid out; `last_error` quotes SideSwap).
+
+`completed`, `cancelled`, `expired` and `failed` are final. A status can step back
 (`claimable` → `confirming`) if a Bitcoin reorg makes the deposit shallower.
 
 **Peg tags.** `PEG_UNAVAILABLE` (no provider here, or the order belongs to
@@ -1308,8 +1332,15 @@ Bitcoin fee of a deposit is paid on top by whoever sends it. `min_sats`
 10 000; `max_sats` 21 million BTC for a peg-in, the lab's
 `pegout_max_sat` for a peg-out. `eta_minutes` assumes nominal block
 intervals (10 min Bitcoin, 1 min Liquid) over `confirmations_required`.
-Reads no chain. Errors: `Unknown peg direction …`; the limits;
-`PEG_UNAVAILABLE`.
+Reads no chain. SideSwap (*network*): its `server_status` terms —
+`service_fee_sats` its percentage of the amount, `network_fee_sats` 0 for
+a peg-in and, for a peg-out, the Bitcoin fee of its payout
+(`peg_out_bitcoin_tx_vsize` × its fastest quoted fee rate), both taken out
+(`network_fee_included: true`); `min_sats` its minimum per direction, no
+maximum; `confirmations_required` 2 (nominal: each deposit's real count
+comes with the order). Errors: `Unknown peg direction …`; the limits;
+`PEG_UNAVAILABLE`; for SideSwap, `Peg chain access failed: SideSwap: …`
+when it cannot be reached or answers out of contract.
 
 ### `peg_start`
 
@@ -1324,9 +1355,14 @@ Reads no chain. Errors: `Unknown peg direction …`; the limits;
 
 Returns: **PegOrder** in `awaiting_deposit`. A native peg-in reads the
 federation from the Liquid chain and returns the deposit address with
-`valid_until_liquid_height`; a native peg-out reads no chain. Errors: as
-`peg_quote`; wallet not found or not a software wallet; `Payout address …`
-/ `Bitcoin address of another network`; the Liquid chain unreachable.
+`valid_until_liquid_height`; a native peg-out reads no chain. SideSwap
+(*network*): the order is opened at SideSwap (payout: a Liquid testnet
+address for a peg-in, a Bitcoin testnet address for a peg-out) and its
+deposit address must be an address of the chain the deposit is paid on.
+Errors: as `peg_quote`; wallet not found or not a software wallet;
+`Payout address …` / `Bitcoin address of another network`; the Liquid
+chain unreachable; SideSwap's refusal, e.g. `Peg chain access failed:
+SideSwap: the server refused: disabled on testnet` (nothing is stored).
 
 ### `peg_fund`
 
@@ -1347,9 +1383,14 @@ deposit from its own wallet.
   checked against the wallet's Bitcoin server first, and the signed
   transaction is checked to carry exactly that output.
 
+- SideSwap: a plain payment of `deposit_expected_sats` to SideSwap's
+  deposit address — BTC for a peg-in, L-BTC for a peg-out — after the
+  order is re-read at SideSwap.
+
 Returns: **PegOrder** in `deposit_seen` with `txid_deposit`. Errors:
 `PEG_NOT_READY` (already funded, cancelled), `PEG_EXPIRED`,
-`PEG_UNAVAILABLE` (no provider, a simulated order, another chain), the
+`PEG_UNAVAILABLE` (no provider, a simulated order, another chain or
+provider), the
 limits, builder errors (insufficient funds, frozen coins), signing and
 broadcast errors, `Vault is locked …`.
 
@@ -1376,8 +1417,8 @@ Returns: **PegOrder** in `settling` with `txid_claim`. Errors:
 `PEG_NOT_READY` (no deposit, too few confirmations — e.g. `PEG_NOT_READY:
 the deposit has 1 of the 2 Bitcoin confirmations a claim needs.` —, a
 peg-out, already claimed), `PEG_PROOF_REJECTED`, `PEG_EXPIRED` (the
-federation changed), `PEG_UNAVAILABLE`, signing and broadcast errors,
-`Vault is locked …`.
+federation changed), `PEG_UNAVAILABLE` (also for a SideSwap order: SideSwap
+pays out by itself), signing and broadcast errors, `Vault is locked …`.
 
 ### `peg_status`
 

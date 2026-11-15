@@ -163,7 +163,10 @@ hand) > **default**.
   BitBox through the `hwi` binary (`TEMPLAR_HWI_BIN` overrides the lookup).
 - Peg provider (`Endpoints::peg_provider`): the lab's native Elements peg
   on its own regtest, when its config names `"native"` with complete
-  terms; none on Liquid testnet (no parent chain) or a plain regtest. See
+  terms; on Liquid testnet, SideSwap's swap service when the joined lab's
+  config names `"sideswap"` for testnet (the endpoint:
+  `TEMPLAR_SIDESWAP_URL` > SideSwap's testnet default); none otherwise
+  (testnet has no parent chain; a plain regtest has no peg). See
   [Peg](#peg).
 
 ## Peg
@@ -205,6 +208,17 @@ Bitcoin chain view, claim-evidence checks), `LiquidChain::fed_peg` and
   empty-script outputs as fees, so the `OP_RETURN` output is not one.
   The Bitcoin genesis is read from the wallet's Bitcoin server and must be
   the one the Liquid chain is pegged to.
+- **SideSwap** (`handlers/peg/sideswap.rs`, `templar_core::sideswap`) on
+  Liquid testnet: a custodial swap by a third party over JSON-RPC on a
+  WebSocket (tungstenite, rustls with ring). One socket per engine call,
+  8 s connect and 15 s I/O timeouts, 64 KiB messages. Only the receive
+  address, the direction and a fee rate are sent. Answers are parsed
+  strictly; a server whose policy asset is not Liquid testnet L-BTC is
+  refused; a deposit address must belong to the chain it is paid on; a
+  status must name the order's own addresses; a payout counts only once
+  the wallet's own chain view has it in a block, paying the receive
+  address. SideSwap's testnet runs on Bitcoin testnet3, the chain of the
+  wallet's default testnet Electrum.
 - **Signing only on request.** `peg_status` / `peg_list` read chains and
   never sign. `peg_fund` and `peg_claim` sign; each signed transaction is
   written to the order before its broadcast and rebroadcast as is on a
