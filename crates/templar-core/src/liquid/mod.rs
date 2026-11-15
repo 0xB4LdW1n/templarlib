@@ -1,4 +1,4 @@
-//! Liquid Network wallet engine — LWK 0.9 singlesig, multisig, PSET inspection, and assets.
+//! Liquid Network wallet engine — LWK 0.20 singlesig, multisig, PSET inspection, and assets.
 
 pub mod assets;
 pub mod book;

@@ -69,7 +69,7 @@ impl JadeBitcoin {
     /// blind PIN server, so it needs the network — the same requirement the
     /// Liquid path already has.
     pub fn open(port: &str) -> Result<Self, DeviceError> {
-        let jade = lwk_jade::Jade::from_serial(lwk_jade::Network::TestnetLiquid, port, None)
+        let jade = lwk_jade::Jade::from_serial(lwk_common::Network::TestnetLiquid, port, None)
             .map_err(|e| DeviceError::NotReady {
                 device: "Jade".into(),
                 detail: format!("serial port {port}: {e}"),
@@ -136,12 +136,12 @@ impl JadeBitcoin {
     /// see the module docs in `liquid::hardware` for why an ELIP151 key here
     /// would build a wallet the Jade cannot spend from.
     pub fn ct_descriptor(&self) -> Result<String, DeviceError> {
+        // Testnet: coin type 1, from the network the Jade was opened on in
+        // `open` — a mainnet Jade would build an m/84h/1776h/0h descriptor.
         lwk_common::singlesig_desc(
             &self.jade,
             lwk_common::Singlesig::Wpkh,
             lwk_common::DescriptorBlindingKey::Slip77,
-            // Testnet: coin type 1. `true` would build a mainnet descriptor.
-            false,
         )
         .map_err(|detail| DeviceError::NotReady {
             device: "Jade".into(),

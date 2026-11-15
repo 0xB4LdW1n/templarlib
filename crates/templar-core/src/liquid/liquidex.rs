@@ -39,13 +39,11 @@ use lwk_wollet::{
         confidential::{Asset, AssetBlindingFactor, Nonce, Value, ValueBlindingFactor},
         encode::serialize_hex,
         script::Instruction,
-        secp256k1_zkp::{
-            self, ecdsa, All, Generator, Message, Secp256k1, SecretKey, SurjectionProof,
-        },
+        secp256k1_zkp::{self, ecdsa, All, Generator, Message, Secp256k1, SecretKey},
         sighash::SighashCache,
         Address, AddressParams, AssetId, EcdsaSighashType, LockTime, OutPoint, RangeProofMessage,
-        Script, Sequence, SurjectionInput, Transaction, TxIn, TxInWitness, TxOut, TxOutSecrets,
-        TxOutWitness, Txid,
+        Script, Sequence, SurjectionInput, SurjectionProof, Transaction, TxIn, TxInWitness, TxOut,
+        TxOutSecrets, TxOutWitness, Txid, Witness,
     },
     Chain, WalletTxOut,
 };
@@ -497,7 +495,8 @@ fn verify_maker_signature(
         prevout.value,
         EcdsaSighashType::SinglePlusAnyoneCanPay,
     );
-    let msg = Message::from_digest_slice(&sighash[..]).map_err(|e| format!("sighash msg: {e}"))?;
+    let msg = Message::from_digest_slice(sighash.as_byte_array())
+        .map_err(|e| format!("sighash msg: {e}"))?;
     secp.verify_ecdsa(&msg, &sig, &pk.inner)
         .map_err(|e| format!("signature verification failed: {e}"))
 }
@@ -850,7 +849,7 @@ pub fn spend_liquid_htlc(
     request: &LiquidHtlcSpendRequest,
     swap_secret_key: &[u8; 32],
 ) -> Result<Transaction, TemplarError> {
-    use lwk_wollet::elements::hashes::{sha256, Hash};
+    use lwk_wollet::elements::hashes::sha256;
 
     if request.amount_sats == 0 || request.fee_sats == 0 {
         return Err(
@@ -940,7 +939,7 @@ pub fn spend_liquid_htlc(
             &mut rng,
             &secp,
             *amount,
-            address.clone(),
+            address,
             *out_asset,
             &in_secrets,
         )
@@ -1010,7 +1009,7 @@ pub fn spend_liquid_htlc(
             Value::Explicit(request.amount_sats),
             EcdsaSighashType::All,
         );
-        let msg = Message::from_digest_slice(&sighash[..])
+        let msg = Message::from_digest_slice(sighash.as_byte_array())
             .map_err(|e| LiquidError::SigningFailed(format!("HTLC sighash: {e}")))?;
         let mut sig = secp.sign_ecdsa(&msg, &swap_sk).serialize_der().to_vec();
         sig.push(EcdsaSighashType::All as u8);
@@ -1042,7 +1041,7 @@ pub fn spend_liquid_htlc(
                 value,
                 EcdsaSighashType::All,
             );
-            let msg = Message::from_digest_slice(&sighash[..])
+            let msg = Message::from_digest_slice(sighash.as_byte_array())
                 .map_err(|e| LiquidError::SigningFailed(format!("fee input sighash: {e}")))?;
             let mut sig = secp.sign_ecdsa(&msg, &sk).serialize_der().to_vec();
             sig.push(EcdsaSighashType::All as u8);
@@ -1050,7 +1049,7 @@ pub fn spend_liquid_htlc(
         }
     }
     for (index, witness) in witnesses {
-        tx.input[index].witness.script_witness = witness;
+        tx.input[index].witness.script_witness = Witness::from(witness);
     }
     Ok(tx)
 }
@@ -1259,11 +1258,11 @@ fn make_proposal_core<R: RngCore + CryptoRng>(
         prevout_value,
         EcdsaSighashType::SinglePlusAnyoneCanPay,
     );
-    let msg = Message::from_digest_slice(&sighash[..])
+    let msg = Message::from_digest_slice(sighash.as_byte_array())
         .map_err(|e| LiquidError::SigningFailed(format!("sighash message: {e}")))?;
     let mut sig = secp.sign_ecdsa(&msg, sk).serialize_der().to_vec();
     sig.push(0x83);
-    tx.input[0].witness.script_witness = vec![sig, pk.to_bytes()];
+    tx.input[0].witness.script_witness = Witness::from(vec![sig, pk.to_bytes()]);
 
     Ok(LiquidexProposal {
         version: 0,
@@ -1639,15 +1638,9 @@ fn build_take_once<R: RngCore + CryptoRng>(
     let mut nonlast_secrets: Vec<TxOutSecrets> = Vec::new();
     let last = blinded_specs.len() - 1;
     for (amount, asset, address) in blinded_specs.iter().take(last) {
-        let (txout, abf, vbf, _eph) = TxOut::new_not_last_confidential(
-            rng,
-            secp,
-            *amount,
-            address.clone(),
-            *asset,
-            &in_secrets,
-        )
-        .map_err(|e| LiquidError::PsetBuildFailed(format!("blind output: {e}")))?;
+        let (txout, abf, vbf, _eph) =
+            TxOut::new_not_last_confidential(rng, secp, *amount, address, *asset, &in_secrets)
+                .map_err(|e| LiquidError::PsetBuildFailed(format!("blind output: {e}")))?;
         nonlast_secrets.push(TxOutSecrets::new(*asset, abf, *amount, vbf));
         blinded_outs.push(txout);
     }
@@ -1688,18 +1681,17 @@ fn build_take_once<R: RngCore + CryptoRng>(
                 .map_err(|e| LiquidError::PsetBuildFailed(format!("surjection input: {e}")))
         })
         .collect::<Result<_, _>>()?;
+    // elements' wrapper: tags the asset and unwraps the blinder exactly as
+    // the bare secp256k1-zkp call did.
     let surjection_proof = SurjectionProof::new(
         secp,
         rng,
-        wanted_asset.into_tag(),
-        maker_out_secrets.asset_bf.into_inner(),
+        wanted_asset,
+        maker_out_secrets.asset_bf,
         &targets,
     )
     .map_err(|e| LiquidError::PsetBuildFailed(format!("maker surjection proof: {e}")))?;
-    let msg = RangeProofMessage {
-        asset: wanted_asset,
-        bf: maker_out_secrets.asset_bf,
-    };
+    let msg = RangeProofMessage::new(wanted_asset, maker_out_secrets.asset_bf);
     let (value_commitment, rangeproof) = Value::Explicit(wanted_amount)
         .blind_with_shared_secret(
             secp,
@@ -1716,8 +1708,8 @@ fn build_take_once<R: RngCore + CryptoRng>(
         .into());
     }
     maker_out.witness = TxOutWitness {
-        surjection_proof: Some(Box::new(surjection_proof)),
-        rangeproof: Some(Box::new(rangeproof)),
+        surjection_proof,
+        rangeproof,
     };
 
     // --- assemble ---------------------------------------------------------
@@ -1763,7 +1755,7 @@ fn build_take_once<R: RngCore + CryptoRng>(
                 value,
                 EcdsaSighashType::All,
             );
-            let msg = Message::from_digest_slice(&sighash[..])
+            let msg = Message::from_digest_slice(sighash.as_byte_array())
                 .map_err(|e| LiquidError::SigningFailed(format!("sighash message: {e}")))?;
             let mut sig = secp.sign_ecdsa(&msg, &sk).serialize_der().to_vec();
             sig.push(EcdsaSighashType::All as u8);
@@ -1771,7 +1763,7 @@ fn build_take_once<R: RngCore + CryptoRng>(
         }
     }
     for (index, witness) in witnesses {
-        tx.input[index].witness.script_witness = witness;
+        tx.input[index].witness.script_witness = Witness::from(witness);
     }
 
     Ok(TakeSingleBuild {
@@ -1843,7 +1835,8 @@ pub fn build_cancel_tx(
         builder = builder
             .set_wallet_utxos(vec![outpoint])
             .drain_lbtc_wallet()
-            .drain_lbtc_to(self_address);
+            .drain_lbtc_to(&self_address)
+            .map_err(|e| LiquidError::PsetBuildFailed(format!("cancel tx build: {e}")))?;
     } else {
         // Spend the offered token UTXO fully to ourselves; allow LBTC
         // UTXOs to fund the fee.
@@ -1879,7 +1872,7 @@ pub fn build_cancel_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lwk_wollet::elements::hashes::{sha256d, Hash};
+    use lwk_wollet::elements::hashes::sha256d;
 
     /// Real mainnet proposal, id 9 from the liquidex.it book
     /// (DBEER 1000 sats → 1000 sats LBTC).
@@ -2120,11 +2113,11 @@ mod tests {
     }
 
     fn synth_txid(tag: &[u8]) -> Txid {
-        Txid::from_raw_hash(sha256d::Hash::hash(tag))
+        Txid::from_byte_array(sha256d::Hash::hash(tag).to_byte_array())
     }
 
     fn synth_asset(tag: &[u8]) -> AssetId {
-        AssetId::from_slice(sha256d::Hash::hash(tag).as_byte_array()).unwrap()
+        AssetId::from_byte_array(sha256d::Hash::hash(tag).to_byte_array())
     }
 
     fn synth_address<R: RngCore + CryptoRng>(rng: &mut R, secp: &Secp256k1<All>) -> Address {
@@ -2295,8 +2288,8 @@ mod tests {
         build.tx.verify_tx_amt_proofs(&secp, &spent).unwrap();
 
         // Maker output witness was rebuilt.
-        assert!(build.tx.output[0].witness.rangeproof.is_some());
-        assert!(build.tx.output[0].witness.surjection_proof.is_some());
+        assert!(!build.tx.output[0].witness.rangeproof.is_empty());
+        assert!(!build.tx.output[0].witness.surjection_proof.is_empty());
     }
 
     #[test]
@@ -2422,6 +2415,6 @@ mod tests {
         assert_eq!(tx.output.len(), 2);
         assert_eq!(tx.output[1].value.explicit(), Some(500));
         assert!(tx.output[0].value.explicit().is_none());
-        assert!(tx.output[0].witness.rangeproof.is_some());
+        assert!(!tx.output[0].witness.rangeproof.is_empty());
     }
 }

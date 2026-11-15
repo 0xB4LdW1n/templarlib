@@ -37,11 +37,13 @@ use lwk_common::{singlesig_desc, Bip, DescriptorBlindingKey, Signer, Singlesig};
 #[cfg(feature = "hardware")]
 use lwk_jade::register_multisig::{JadeDescriptor, RegisterMultisigParams};
 #[cfg(feature = "hardware")]
-use lwk_jade::{Jade, Network as JadeNetwork};
+use lwk_jade::Jade;
 #[cfg(feature = "hardware")]
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 #[cfg(feature = "hardware")]
 use lwk_wollet::elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
+#[cfg(feature = "hardware")]
+use lwk_wollet::Network as JadeNetwork;
 
 #[cfg(feature = "hardware")]
 use crate::bitcoin::hardware::{ERR_DEVICE_NOT_FOUND, ERR_DEVICE_NOT_READY, ERR_SIGNING};
@@ -66,7 +68,7 @@ fn tagged(kind: &str, msg: impl std::fmt::Display) -> TemplarError {
 pub struct JadeLiquidSigner {
     jade: Jade,
     port: String,
-    /// Test networks only (`TestnetLiquid` / `LocaltestLiquid`), matching
+    /// Test networks only (`TestnetLiquid` / `CustomElements`), matching
     /// the rest of the app. Sending mainnet here would make Jade derive
     /// mainnet keys and sign mainnet transactions.
     network: JadeNetwork,
@@ -173,15 +175,11 @@ impl JadeLiquidSigner {
     /// docs on why an ELIP151 blinding key here would create a wallet Jade
     /// cannot spend from.
     pub fn ct_descriptor(&self) -> Result<String, TemplarError> {
-        singlesig_desc(
-            &self.jade,
-            Singlesig::Wpkh,
-            DescriptorBlindingKey::Slip77,
-            // Testnet: coin type 1. `true` here would build an m/84h/1776h/0h
-            // mainnet descriptor.
-            false,
-        )
-        .map_err(|e| tagged(ERR_DEVICE_NOT_READY, format!("descriptor from device: {e}")))
+        // Testnet: coin type 1, from the test network the Jade was opened
+        // on (`self.network`) — a mainnet one would build an m/84h/1776h/0h
+        // mainnet descriptor.
+        singlesig_desc(&self.jade, Singlesig::Wpkh, DescriptorBlindingKey::Slip77)
+            .map_err(|e| tagged(ERR_DEVICE_NOT_READY, format!("descriptor from device: {e}")))
     }
 
     /// Ask the device to sign a PSET. Returns the number of signatures added.

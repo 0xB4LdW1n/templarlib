@@ -15,7 +15,7 @@ fs2 = "0.4"
 zeroize = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 bdk = { version = "0.30", features = ["all-keys"] }
-lwk_wollet = "0.9"
+lwk_wollet = { version = "0.20", default-features = false, features = ["esplora", "electrum", "elements_rpc", "amp2"] }
 hex = "0.4"
 
 [dev-dependencies]

@@ -86,7 +86,7 @@ pub enum BitcoinError {
     FrozenCoin(String),
 }
 
-/// Liquid wallet errors (LWK 0.9).
+/// Liquid wallet errors (LWK 0.20).
 #[derive(Debug, Error)]
 pub enum LiquidError {
     #[error("Invalid descriptor: {0}")]
@@ -143,9 +143,9 @@ pub enum LiquidError {
     #[error("Coin {0} is frozen. Unfreeze it on the UTXOs screen to spend it.")]
     FrozenCoin(String),
 
-    /// LWK 0.9 picks the inputs itself whenever a payment moves an asset
-    /// other than LBTC, so there a frozen coin cannot be left out — only
-    /// refused.
+    /// LWK picks the inputs itself whenever a payment moves an asset other
+    /// than LBTC (the builders pass it a coin list only for LBTC-only
+    /// payments), so there a frozen coin cannot be left out — only refused.
     #[error(
         "This transaction would spend frozen coin {0}. A Liquid transaction that moves \
          an asset other than LBTC cannot leave coins out yet: unfreeze it on the \

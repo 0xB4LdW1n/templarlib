@@ -5,7 +5,7 @@
 //!
 //! ## Why an RPC block indexer
 //!
-//! LWK 0.9 ships an `ElementsRpcClient`, but it only knows `scantxoutset`
+//! LWK ships an `ElementsRpcClient`, but it only knows `scantxoutset`
 //! (confirmed UTXOs, no history, no mempool) and does not implement
 //! [`BlockchainBackend`]. A regtest chain is tiny, so [`ElementsRpcBackend`]
 //! simply walks every block once (`getblock <hash> 0`), keeps an in-memory
@@ -25,17 +25,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use electrum_client::ElectrumApi;
 use lwk_wollet::bitcoincore_rpc::{Auth, Client, RpcApi};
 use lwk_wollet::clients::blocking::BlockchainBackend;
-use lwk_wollet::elements::hashes::{sha256, Hash};
-use lwk_wollet::elements::hex::{FromHex, ToHex};
+use lwk_wollet::elements::hashes::sha256;
 use lwk_wollet::elements::{
     encode, Block, BlockHash, BlockHeader, OutPoint, Script, Transaction, Txid,
 };
 use lwk_wollet::{
-    ElectrumClient, ElectrumOptions, ElectrumUrl, Error as LwkError, History, Wollet,
+    ElectrumClient, ElectrumClientBuilder, ElectrumUrl, Error as LwkError, History, Wollet,
 };
 use serde::{Deserialize, Serialize};
 
@@ -66,7 +66,7 @@ pub const ENV_RPC_PASS: &str = "TEMPLAR_ELEMENTS_RPC_PASS";
 /// Socket timeout for Electrum. LWK's `ElectrumClient::new` defaults to
 /// `timeout: None` — a stalled server then blocks forever, and since every
 /// FFI call serializes on one mutex, the whole app wedges until force-quit.
-const ELECTRUM_TIMEOUT_SECS: u8 = 8;
+const ELECTRUM_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Where the wallet reads and writes the Liquid chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,7 +281,7 @@ impl ElementsRpcBackend {
 
     fn block(&self, hash: &BlockHash) -> Result<Block, LwkError> {
         let hex: String = self.call("getblock", &[hash.to_string().into(), 0.into()])?;
-        let bytes = Vec::<u8>::from_hex(&hex).map_err(|e| generic("getblock hex", e))?;
+        let bytes = hex::decode(&hex).map_err(|e| generic("getblock hex", e))?;
         encode::deserialize(&bytes).map_err(|e| generic("getblock decode", e))
     }
 
@@ -292,7 +292,7 @@ impl ElementsRpcBackend {
                 &[txid.to_string().into(), false.into()],
             )
             .map_err(|e| generic(&format!("tx {txid}"), e))?;
-        let bytes = Vec::<u8>::from_hex(&hex).map_err(|e| generic("getrawtransaction hex", e))?;
+        let bytes = hex::decode(&hex).map_err(|e| generic("getrawtransaction hex", e))?;
         encode::deserialize(&bytes).map_err(|e| generic("getrawtransaction decode", e))
     }
 
@@ -446,7 +446,7 @@ impl BlockchainBackend for ElementsRpcBackend {
     }
 
     fn broadcast(&self, tx: &Transaction) -> Result<Txid, LwkError> {
-        let hex = encode::serialize(tx).to_hex();
+        let hex = hex::encode(encode::serialize(tx));
         let txid: String = self.call("sendrawtransaction", &[hex.into()])?;
         txid.parse().map_err(|e| generic("sendrawtransaction", e))
     }
@@ -504,6 +504,8 @@ impl BlockchainBackend for ElementsRpcBackend {
                         height: height as i32,
                         block_hash,
                         block_timestamp,
+                        // Output index, filled only by utxo-only scans.
+                        v: 0,
                     });
                 }
             }
@@ -603,13 +605,12 @@ impl LiquidChain {
 
     fn electrum(&self) -> Result<ElectrumClient, TemplarError> {
         let url = self.electrum_url()?;
-        ElectrumClient::with_options(
-            &url,
-            ElectrumOptions {
-                timeout: Some(ELECTRUM_TIMEOUT_SECS),
-            },
-        )
-        .map_err(|e| sync_err("Electrum connection failed", e))
+        // What the deprecated `ElectrumClient::with_options` does. The
+        // builder re-parses the URL, so TLS always validates the domain.
+        ElectrumClientBuilder::new(&url.to_string())
+            .timeout(ELECTRUM_TIMEOUT)
+            .build()
+            .map_err(|e| sync_err("Electrum connection failed", e))
     }
 
     /// Raw Electrum client for the JSON-RPC calls LWK's wrapper does not
@@ -631,7 +632,7 @@ impl LiquidChain {
             format!("tcp://{url}")
         };
         let config = electrum_client::ConfigBuilder::new()
-            .timeout(Some(ELECTRUM_TIMEOUT_SECS))
+            .timeout(Some(ELECTRUM_TIMEOUT))
             .validate_domain(*validate_domain)
             .build();
         electrum_client::Client::from_config(&url, config)
@@ -829,8 +830,12 @@ mod tests {
     #[test]
     fn sync_refuses_a_wallet_from_another_network() {
         let desc: lwk_wollet::WolletDescriptor = "ct(slip77(addfe14f6d96eb091712439190737b901b6b5558d7039ed1d0dd19a7305cb747),elwpkh([f0b68896/84'/1'/0']tpubDCVwWj4hEpeWNFcWe3Eo1DrkLnPC4c2iitjw5wAuTkSZgofJbRMD4KESh1uhsqLCCjcjR36JooEFwfWf1ezwmAfjcPCxc7KNtnfBCrMPdtT/<0;1>/*))".parse().unwrap();
-        let mut wollet =
-            Wollet::without_persist(lwk_wollet::ElementsNetwork::LiquidTestnet, desc).unwrap();
+        let mut wollet = Wollet::new(
+            lwk_wollet::Network::TestnetLiquid,
+            Arc::new(lwk_wollet::FakeStore::new()),
+            desc,
+        )
+        .unwrap();
         let chain = LiquidChain::new(
             LiquidNetwork::regtest_default(),
             LiquidBackend::ElementsRpc {

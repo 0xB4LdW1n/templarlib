@@ -12,8 +12,9 @@
 
 use std::fmt;
 
+use lwk_common::ElementsParamsBuilder;
 use lwk_wollet::elements::{Address, AddressParams, AssetId};
-use lwk_wollet::ElementsNetwork;
+use lwk_wollet::Network as ElementsNetwork;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LiquidError, TemplarError};
@@ -136,24 +137,30 @@ impl LiquidNetwork {
         matches!(self, LiquidNetwork::LiquidRegtest { .. })
     }
 
-    /// The LWK network value.
+    /// The LWK network value. A regtest carries its policy asset; the other
+    /// custom parameters keep LWK's `liquidregtest` defaults.
     pub fn elements(&self) -> ElementsNetwork {
         match self {
-            LiquidNetwork::LiquidTestnet => ElementsNetwork::LiquidTestnet,
-            LiquidNetwork::LiquidRegtest { policy_asset } => ElementsNetwork::ElementsRegtest {
-                policy_asset: policy_asset
-                    .parse()
-                    .expect("policy asset validated at construction"),
-            },
+            LiquidNetwork::LiquidTestnet => ElementsNetwork::TestnetLiquid,
+            LiquidNetwork::LiquidRegtest { policy_asset } => ElementsNetwork::CustomElements(
+                ElementsParamsBuilder::new()
+                    .with_policy_asset(
+                        policy_asset
+                            .parse()
+                            .expect("policy asset validated at construction"),
+                    )
+                    .build()
+                    .expect("the builder only fills in defaults"),
+            ),
         }
     }
 
     /// Maps an LWK network back. Mainnet has no counterpart here.
     pub fn from_elements(network: ElementsNetwork) -> Result<Self, TemplarError> {
         match network {
-            ElementsNetwork::LiquidTestnet => Ok(Self::testnet()),
-            ElementsNetwork::ElementsRegtest { policy_asset } => Ok(LiquidNetwork::LiquidRegtest {
-                policy_asset: policy_asset.to_string(),
+            ElementsNetwork::TestnetLiquid => Ok(Self::testnet()),
+            ElementsNetwork::CustomElements(_) => Ok(LiquidNetwork::LiquidRegtest {
+                policy_asset: network.policy_asset().to_string(),
             }),
             ElementsNetwork::Liquid => Err(LiquidError::InvalidNetwork(
                 "Liquid mainnet is not supported by this wallet".into(),
@@ -164,7 +171,7 @@ impl LiquidNetwork {
 
     /// LBTC asset id of this network.
     pub fn policy_asset(&self) -> AssetId {
-        self.elements().policy_asset()
+        *self.elements().policy_asset()
     }
 
     /// LBTC asset id, hex.
@@ -200,13 +207,11 @@ impl LiquidNetwork {
         "LBTC"
     }
 
-    /// The Jade firmware's name for this network.
+    /// The network a Jade is opened on. `lwk_jade` names it to the firmware
+    /// as `testnet-liquid` / `localtest-liquid`.
     #[cfg(feature = "hardware")]
-    pub fn jade_network(&self) -> lwk_jade::Network {
-        match self {
-            LiquidNetwork::LiquidTestnet => lwk_jade::Network::TestnetLiquid,
-            LiquidNetwork::LiquidRegtest { .. } => lwk_jade::Network::LocaltestLiquid,
-        }
+    pub fn jade_network(&self) -> ElementsNetwork {
+        self.elements()
     }
 }
 
@@ -257,7 +262,7 @@ mod tests {
         assert_eq!(t.policy_asset().to_string(), TESTNET_POLICY_ASSET);
         assert!(t.is_policy_asset(&TESTNET_POLICY_ASSET.to_uppercase()));
         assert!(!t.is_regtest());
-        assert_eq!(t.elements(), ElementsNetwork::LiquidTestnet);
+        assert_eq!(t.elements(), ElementsNetwork::TestnetLiquid);
         assert_eq!(t.elements().as_str(), "liquid-testnet");
         assert!(t
             .parse_address("tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn")
@@ -274,7 +279,7 @@ mod tests {
             .parse_address("tlq1qq2xvpcvfup5j8zscjq05u2wxxjcyewk7979f3mmz5l7uw5pqmx6xf5xy50hsn6vhkm5euwt72x878eq6zxx2z58hd7zrsg9qn")
             .is_err());
         #[cfg(feature = "hardware")]
-        assert_eq!(r.jade_network(), lwk_jade::Network::LocaltestLiquid);
+        assert_eq!(r.jade_network().to_string(), "localtest-liquid");
     }
 
     #[test]

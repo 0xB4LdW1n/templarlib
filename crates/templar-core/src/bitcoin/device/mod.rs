@@ -202,6 +202,9 @@ impl From<DeviceError> for TemplarError {
 
 /// An open, drivable device. The variants differ in transport and dialect;
 /// everything above this enum works in descriptors, PSBTs and fingerprints.
+// lwk_jade 0.20's `Jade` carries its own caches (~300 bytes); one device is
+// open at a time, so the size gap costs nothing worth a Box.
+#[allow(clippy::large_enum_variant)]
 pub enum Device {
     Ledger(ledger::Ledger),
     Jade(jade_btc::JadeBitcoin),

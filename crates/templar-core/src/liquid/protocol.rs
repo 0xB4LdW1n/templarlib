@@ -25,8 +25,11 @@ use std::str::FromStr;
 use lwk_common::Signer;
 use lwk_signer::SwSigner;
 use lwk_wollet::bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
+// `WPubkeyHash` / `PubkeyHash` are rust-bitcoin's types: their `hash`
+// comes from rust-bitcoin's hashes crate, no longer the one elements uses.
+use lwk_wollet::bitcoin::hashes::Hash as _;
 use lwk_wollet::bitcoin::PublicKey;
-use lwk_wollet::elements::hashes::{sha256, Hash};
+use lwk_wollet::elements::hashes::sha256;
 use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction, PsbtSighashType};
 use lwk_wollet::elements::secp256k1_zkp::{ecdsa::Signature, Message};
 use lwk_wollet::elements::sighash::SighashCache;
@@ -66,7 +69,7 @@ pub fn escrow_account_xpub(signer: &SwSigner) -> Result<String, TemplarError> {
 /// [`escrow_account_xpub`] straight from a BIP39 mnemonic (the registry
 /// stores the phrase, not a signer).
 pub fn escrow_xpub_from_mnemonic(mnemonic: &str) -> Result<String, TemplarError> {
-    let signer = SwSigner::new(mnemonic, false)
+    let signer = SwSigner::new_with_network(mnemonic, lwk_wollet::Network::TestnetLiquid)
         .map_err(|e| LiquidError::InvalidDescriptor(format!("SwSigner: {e}")))?;
     escrow_account_xpub(&signer)
 }
@@ -675,7 +678,9 @@ pub(crate) mod tests {
 
     #[test]
     fn loan_key_at_zero_reads_both_accounts_and_refuses_the_rest() {
-        let signer = SwSigner::new(MNEMONIC_BORROWER, false).unwrap();
+        let signer =
+            SwSigner::new_with_network(MNEMONIC_BORROWER, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
         let k2121 = escrow_account_xpub(&signer).unwrap();
         let (pk, fp, path) = loan_key_at_zero(&k2121).unwrap();
         assert_eq!(fp, signer.fingerprint());
@@ -789,7 +794,9 @@ pub(crate) mod tests {
         assert_eq!(stranger.sign(&mut untouched).unwrap(), 0);
 
         // The 87h account is a loan key too.
-        let signer = SwSigner::new(MNEMONIC_BORROWER, false).unwrap();
+        let signer =
+            SwSigner::new_with_network(MNEMONIC_BORROWER, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
         let k87 = Signer::keyorigin_xpub(&signer, lwk_common::Bip::Bip87, false).unwrap();
         let mut c87 = check_pset(CHALLENGE, &k87, &network).unwrap();
         assert!(

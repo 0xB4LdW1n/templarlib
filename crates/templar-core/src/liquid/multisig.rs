@@ -162,7 +162,7 @@ impl LiquidMultisigSetup {
     /// Liquid multisig setup wizard. Used by singlesig software wallets to
     /// export their BIP87 xpub for a future Liquid multisig.
     pub fn derive_xpub_from_mnemonic(mnemonic: &str) -> Result<String, TemplarError> {
-        let signer = SwSigner::new(mnemonic, false)
+        let signer = SwSigner::new_with_network(mnemonic, lwk_wollet::Network::TestnetLiquid)
             .map_err(|e| LiquidError::InvalidDescriptor(format!("SwSigner: {e}")))?;
         Self::derive_xpub(&signer)
     }
@@ -182,7 +182,7 @@ impl LiquidMultisigSetup {
     ) -> Result<u32, TemplarError> {
         let mut added = 0;
         for mnemonic in mnemonics {
-            let signer = SwSigner::new(mnemonic, false)
+            let signer = SwSigner::new_with_network(mnemonic, lwk_wollet::Network::TestnetLiquid)
                 .map_err(|e| LiquidError::SigningFailed(format!("SwSigner: {e}")))?;
             added += signer
                 .sign(pset)
@@ -223,7 +223,7 @@ impl LiquidMultisigSetup {
     ) -> Result<String, TemplarError> {
         let mut xpubs = Vec::new();
         for mnemonic in mnemonics {
-            let signer = SwSigner::new(mnemonic, false)
+            let signer = SwSigner::new_with_network(mnemonic, lwk_wollet::Network::TestnetLiquid)
                 .map_err(|e| LiquidError::InvalidDescriptor(format!("SwSigner: {e}")))?;
             xpubs.push(Self::derive_xpub(&signer)?);
         }
@@ -241,7 +241,9 @@ mod tests {
 
     #[test]
     fn derive_xpub_bip87() {
-        let signer = SwSigner::new(TEST_MNEMONIC_A, false).unwrap();
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC_A, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
         let xpub = LiquidMultisigSetup::derive_xpub(&signer).unwrap();
         assert!(xpub.contains("/87h/1h/0h]"));
         assert!(xpub.starts_with('['));
@@ -250,8 +252,12 @@ mod tests {
 
     #[test]
     fn build_2of2_random_blinding() {
-        let signer_a = SwSigner::new(TEST_MNEMONIC_A, false).unwrap();
-        let signer_b = SwSigner::new(TEST_MNEMONIC_B, false).unwrap();
+        let signer_a =
+            SwSigner::new_with_network(TEST_MNEMONIC_A, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
+        let signer_b =
+            SwSigner::new_with_network(TEST_MNEMONIC_B, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
         let xpub_a = LiquidMultisigSetup::derive_xpub(&signer_a).unwrap();
         let xpub_b = LiquidMultisigSetup::derive_xpub(&signer_b).unwrap();
 
@@ -317,7 +323,9 @@ mod tests {
 
     #[test]
     fn invalid_threshold_zero() {
-        let signer = SwSigner::new(TEST_MNEMONIC_A, false).unwrap();
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC_A, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
         let xpub = LiquidMultisigSetup::derive_xpub(&signer).unwrap();
         let result =
             LiquidMultisigSetup::build_descriptor(0, &[xpub], &BlindingKeySource::RandomSlip77);
@@ -326,7 +334,9 @@ mod tests {
 
     #[test]
     fn invalid_threshold_exceeds() {
-        let signer = SwSigner::new(TEST_MNEMONIC_A, false).unwrap();
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC_A, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
         let xpub = LiquidMultisigSetup::derive_xpub(&signer).unwrap();
         let result =
             LiquidMultisigSetup::build_descriptor(3, &[xpub], &BlindingKeySource::RandomSlip77);

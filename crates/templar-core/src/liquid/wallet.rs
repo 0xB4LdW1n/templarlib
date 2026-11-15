@@ -1,6 +1,6 @@
-//! Liquid wallet manager using LWK (Liquid Wallet Kit) 0.9.
+//! Liquid wallet manager using LWK (Liquid Wallet Kit) 0.20.
 //!
-//! Uses `Wollet::without_persist()` for in-memory wallets,
+//! Uses an in-memory `Wollet` when there is no data directory,
 //! `Wollet::get_details()` for PSET inspection,
 //! `Wollet::finalize()` for transaction finalization, and
 //! `Wollet::combine()` for parallel signing assembly.
@@ -17,7 +17,7 @@ use lwk_wollet::{
         encode::{Decodable, Encodable},
         Address, AssetId,
     },
-    ElementsNetwork, Recipient, Wollet, WolletDescriptor,
+    FakeStore, Network as ElementsNetwork, Recipient, Wollet, WolletBuilder, WolletDescriptor,
 };
 use serde_json::json;
 use std::path::Path;
@@ -91,7 +91,7 @@ pub struct LiquidTx {
     pub timestamp: Option<u64>,
 }
 
-/// Liquid wallet engine backed by LWK 0.9.
+/// Liquid wallet engine backed by LWK 0.20.
 ///
 /// Supports singlesig and multisig with CT descriptors.
 /// Signer is optional — `None` for watch-only wallets.
@@ -139,7 +139,10 @@ fn register_asset_contract(asset_id: &str, contract: &lwk_wollet::Contract) -> b
     let url = "https://assets-testnet.blockstream.info/";
     eprintln!(
         "[Registry] POST {} — asset_id={} name={} ticker={}",
-        url, asset_id, contract.name, contract.ticker
+        url,
+        asset_id,
+        contract.name(),
+        contract.ticker()
     );
     eprintln!(
         "[Registry] Contract JSON: {}",
@@ -237,7 +240,7 @@ fn frozen_hint(
     e: lwk_wollet::Error,
     frozen: &BTreeSet<String>,
 ) -> TemplarError {
-    if !frozen.is_empty() && matches!(e, lwk_wollet::Error::InsufficientFunds) {
+    if !frozen.is_empty() && matches!(e, lwk_wollet::Error::InsufficientFunds { .. }) {
         return variant(format!(
             "{what}: {e} — frozen coins are left out; unfreeze some on the UTXOs \
              screen to spend them"
@@ -315,13 +318,34 @@ impl LiquidWalletManager {
         view
     }
 
+    /// LWK's on-disk wallet cache under `dir` (`<dir>/<network>/enc_cache/…`),
+    /// what the deprecated `Wollet::with_fs_persist` builds.
+    fn fs_persisted_wollet(
+        network: ElementsNetwork,
+        descriptor: WolletDescriptor,
+        dir: &Path,
+    ) -> Result<Wollet, lwk_wollet::Error> {
+        WolletBuilder::new(network, descriptor)
+            .with_legacy_fs_store(dir)?
+            .build()
+    }
+
+    /// An in-memory wallet, what the deprecated `Wollet::without_persist`
+    /// builds.
+    fn unpersisted_wollet(
+        network: ElementsNetwork,
+        descriptor: WolletDescriptor,
+    ) -> Result<Wollet, lwk_wollet::Error> {
+        Wollet::new(network, std::sync::Arc::new(FakeStore::new()), descriptor)
+    }
+
     fn make_wollet(
         network: ElementsNetwork,
         descriptor: WolletDescriptor,
         data_dir: Option<&Path>,
     ) -> Result<Wollet, TemplarError> {
         match data_dir {
-            Some(dir) => match Wollet::with_fs_persist(network, descriptor.clone(), dir) {
+            Some(dir) => match Self::fs_persisted_wollet(network, descriptor.clone(), dir) {
                 Ok(w) => Ok(w),
                 // The on-disk LWK cache can become inconsistent with the descriptor
                 // (e.g. "Update created on a wallet with status X while current has Y"),
@@ -332,14 +356,14 @@ impl LiquidWalletManager {
                     eprintln!("[liquid] fs-persist load failed ({e}); clearing cache and retrying");
                     let cache = dir.join(network.as_str()).join("enc_cache");
                     let _ = std::fs::remove_dir_all(&cache);
-                    match Wollet::with_fs_persist(network, descriptor.clone(), dir) {
+                    match Self::fs_persisted_wollet(network, descriptor.clone(), dir) {
                         Ok(w) => Ok(w),
                         Err(e2) => {
                             eprintln!(
                                 "[liquid] fs-persist retry failed ({e2}); falling back to \
                                  in-memory (the wallet will re-scan)"
                             );
-                            Wollet::without_persist(network, descriptor).map_err(|e| {
+                            Self::unpersisted_wollet(network, descriptor).map_err(|e| {
                                 LiquidError::InvalidDescriptor(format!(
                                     "Wollet::without_persist: {e}"
                                 ))
@@ -349,7 +373,7 @@ impl LiquidWalletManager {
                     }
                 }
             },
-            None => Wollet::without_persist(network, descriptor).map_err(|e| {
+            None => Self::unpersisted_wollet(network, descriptor).map_err(|e| {
                 LiquidError::InvalidDescriptor(format!("Wollet::without_persist: {e}")).into()
             }),
         }
@@ -393,7 +417,7 @@ impl LiquidWalletManager {
             .map_err(|e| LiquidError::InvalidDescriptor(format!("Parse descriptor: {e}")))?;
         let descriptor_string = descriptor.to_string();
 
-        let signer = SwSigner::new(mnemonic_str, false)
+        let signer = SwSigner::new_with_network(mnemonic_str, ElementsNetwork::TestnetLiquid)
             .map_err(|e| LiquidError::InvalidDescriptor(format!("SwSigner: {e}")))?;
 
         let wollet = Self::make_wollet(network, descriptor, data_dir)?;
@@ -435,15 +459,11 @@ impl LiquidWalletManager {
     /// `ct(slip77(<seed key>),elwpkh([fp/84h/1h/0h]tpub…/<0;1>/*))`.
     pub fn default_ct_descriptor(mnemonic_str: &str) -> Result<String, TemplarError> {
         use lwk_common::{DescriptorBlindingKey, Singlesig};
-        let signer = SwSigner::new(mnemonic_str, false)
+        let signer = SwSigner::new_with_network(mnemonic_str, ElementsNetwork::TestnetLiquid)
             .map_err(|e| LiquidError::InvalidDescriptor(format!("SwSigner: {e}")))?;
-        lwk_common::singlesig_desc(
-            &signer,
-            Singlesig::Wpkh,
-            DescriptorBlindingKey::Slip77,
-            false,
-        )
-        .map_err(|e| LiquidError::InvalidDescriptor(format!("singlesig_desc: {e}")).into())
+        // The coin type (1, test networks) now follows the signer's network.
+        lwk_common::singlesig_desc(&signer, Singlesig::Wpkh, DescriptorBlindingKey::Slip77)
+            .map_err(|e| LiquidError::InvalidDescriptor(format!("singlesig_desc: {e}")).into())
     }
 
     /// Creates a Liquid wallet from a saved CT descriptor (wallet reopen).
@@ -558,8 +578,8 @@ impl LiquidWalletManager {
             policy_asset: self.policy_asset_hex(),
             ..LiquidBalance::default()
         };
-        for (asset_id, amount) in raw {
-            bal.assets.insert(asset_id.to_string(), amount);
+        for (asset_id, amount) in raw.iter() {
+            bal.assets.insert(asset_id.to_string(), *amount);
         }
         Ok(bal)
     }
@@ -663,9 +683,8 @@ impl LiquidWalletManager {
     /// lands at that address (LWK `drain_lbtc_wallet` + `drain_lbtc_to`).
     ///
     /// `frozen` coins are left out when the payment moves only LBTC. When
-    /// it moves another asset, LWK 0.9 picks every input itself (and takes
-    /// all LBTC coins for the fee), so a PSET that would spend a frozen
-    /// coin is refused instead.
+    /// it moves another asset, LWK picks every input itself, so a PSET that
+    /// would spend a frozen coin is refused instead.
     pub fn create_tx_multi(
         &self,
         recipients: &[(String, u64, String)],
@@ -696,7 +715,13 @@ impl LiquidWalletManager {
         if let Some(drain_addr) = drain_lbtc_to {
             let address = Address::parse_with_params(drain_addr, params)
                 .map_err(|e| LiquidError::PsetBuildFailed(format!("Invalid drain address: {e}")))?;
-            builder = builder.drain_lbtc_wallet().drain_lbtc_to(address);
+            // LWK 0.20 splits the drain by address kind; 0.9 took either.
+            builder = if address.blinding_pubkey.is_some() {
+                builder.drain_lbtc_wallet().drain_lbtc_to(&address)
+            } else {
+                builder.drain_lbtc_wallet().drain_lbtc_to_explicit(&address)
+            }
+            .map_err(|e| LiquidError::PsetBuildFailed(format!("Invalid drain address: {e}")))?;
         }
         if only_lbtc {
             if let Some(coins) = self.lbtc_coins_excluding(frozen)? {
@@ -880,13 +905,10 @@ impl LiquidWalletManager {
         if known.contains(script) {
             return true;
         }
-        let Ok(singles) = self
-            .wollet
-            .descriptor()
-            .descriptor
-            .clone()
-            .into_single_descriptors()
-        else {
+        let Ok(descriptor) = self.wollet.descriptor() else {
+            return false;
+        };
+        let Ok(singles) = descriptor.descriptor.clone().into_single_descriptors() else {
             return false;
         };
         for (_, path) in bip32_derivation.values() {
@@ -1095,8 +1117,6 @@ impl LiquidWalletManager {
     /// Finalizes a PSET and broadcasts the resulting transaction.
     ///
     /// After broadcast, call `sync()` to update the wallet state.
-    /// LWK 0.9 does not expose a single-tx `apply_tx()` — the `Update` struct
-    /// requires fields only available via full Electrum scan.
     pub fn broadcast(
         &self,
         pset: &mut lwk_wollet::elements::pset::PartiallySignedTransaction,
@@ -1159,14 +1179,15 @@ impl LiquidWalletManager {
 
         let domain = domain.trim_end_matches('/');
 
-        let contract = lwk_wollet::Contract {
-            entity: lwk_wollet::Entity::Domain(domain.to_string()),
-            issuer_pubkey,
-            name: name.to_string(),
-            precision,
-            ticker: ticker.to_string(),
-            version: 0,
-        };
+        let contract = lwk_wollet::Contract::builder()
+            .entity(lwk_wollet::Entity::Domain(domain.to_string()))
+            .issuer_pubkey(issuer_pubkey)
+            .name(name.to_string())
+            .precision(precision)
+            .ticker(ticker.to_string())
+            .version(0)
+            .build()
+            .map_err(|e| LiquidError::IssuanceFailed(format!("Invalid asset contract: {e}")))?;
 
         // Invalid metadata would be permanently committed into the asset id and
         // rejected by the registry forever — refuse before syncing or signing.
@@ -1176,7 +1197,10 @@ impl LiquidWalletManager {
 
         eprintln!(
             "[Issuance] Built contract: name={} ticker={} precision={} domain={}",
-            contract.name, contract.ticker, contract.precision, domain
+            contract.name(),
+            contract.ticker(),
+            contract.precision(),
+            domain
         );
 
         self.sync()?;
@@ -1438,7 +1462,7 @@ impl LiquidWalletManager {
                 return false;
             }
         };
-        if self.wollet.network() != ElementsNetwork::LiquidTestnet {
+        if self.wollet.network() != ElementsNetwork::TestnetLiquid {
             eprintln!(
                 "[Registry] reregister_asset: no asset registry on {}",
                 self.wollet.network().as_str()
@@ -1447,13 +1471,20 @@ impl LiquidWalletManager {
         }
         let issuer_pubkey = issuer_pubkey_bytes(signer);
         let domain = domain.trim_end_matches('/');
-        let contract = lwk_wollet::Contract {
-            entity: lwk_wollet::Entity::Domain(domain.to_string()),
-            issuer_pubkey,
-            name: name.to_string(),
-            precision,
-            ticker: ticker.to_string(),
-            version: 0,
+        let contract = match lwk_wollet::Contract::builder()
+            .entity(lwk_wollet::Entity::Domain(domain.to_string()))
+            .issuer_pubkey(issuer_pubkey)
+            .name(name.to_string())
+            .precision(precision)
+            .ticker(ticker.to_string())
+            .version(0)
+            .build()
+        {
+            Ok(contract) => contract,
+            Err(e) => {
+                eprintln!("[Registry] reregister_asset: invalid contract: {e}");
+                return false;
+            }
         };
         if let Err(e) = contract.validate() {
             eprintln!("[Registry] reregister_asset: invalid contract: {e}");
@@ -1467,7 +1498,7 @@ impl LiquidWalletManager {
         pset: &mut lwk_wollet::elements::pset::PartiallySignedTransaction,
         mnemonic: &str,
     ) -> Result<u32, TemplarError> {
-        let signer = SwSigner::new(mnemonic, false)
+        let signer = SwSigner::new_with_network(mnemonic, ElementsNetwork::TestnetLiquid)
             .map_err(|e| LiquidError::SigningFailed(format!("SwSigner: {e}")))?;
         let sigs = signer
             .sign(pset)
@@ -1638,7 +1669,8 @@ mod tests {
 
     #[test]
     fn issuer_pubkey_is_33_bytes() {
-        let signer = SwSigner::new(TEST_MNEMONIC, false).unwrap();
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC, ElementsNetwork::TestnetLiquid).unwrap();
         let pubkey = issuer_pubkey_bytes(&signer);
         assert_eq!(pubkey.len(), 33, "compressed pubkey must be 33 bytes");
         // Must start with 02 or 03 (compressed point prefix)

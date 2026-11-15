@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use lwk_wollet::elements::confidential::{Asset, Value};
 use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction};
 use lwk_wollet::elements::secp256k1_zkp::{All, Secp256k1};
-use lwk_wollet::elements::{AssetId, BlindAssetProofs, BlindValueProofs};
+use lwk_wollet::elements::AssetId;
 
 use crate::error::{LiquidError, TemplarError};
 
@@ -301,10 +301,14 @@ impl PsetDetails {
     /// The script view (`network`, `inputs`, `outputs`) stays empty here;
     /// [`crate::LiquidWalletManager::inspect_pset`] fills it in.
     pub fn from_lwk(lwk: lwk_common::PsetDetails) -> Self {
-        let fee = lwk.balance.fee;
+        // LWK reports the fee outputs per asset; LWK 0.9 required exactly
+        // one, whose amount this was.
+        let fee = lwk
+            .fees()
+            .values()
+            .fold(0u64, |total, fee| total.saturating_add(*fee));
         let net_change: BTreeMap<String, i64> = lwk
-            .balance
-            .balances
+            .balances()
             .iter()
             .map(|(asset, delta)| (asset.to_string(), *delta))
             .collect();
@@ -313,14 +317,13 @@ impl PsetDetails {
         // wallet's own — unchecked. `inspect_pset` clears the ones whose
         // proofs fail once the script view is built.
         let recipients: Vec<PsetRecipient> = lwk
-            .balance
-            .recipients
+            .recipients()
             .iter()
             .map(|r| PsetRecipient {
-                vout: r.vout,
-                address: r.address.as_ref().map(|a| a.to_string()),
-                asset: r.asset.map(|a| a.to_string()),
-                amount: r.value,
+                vout: r.vout(),
+                address: r.address().map(|a| a.to_string()),
+                asset: r.asset().map(|a| a.to_string()),
+                amount: r.value(),
                 unverified: false,
             })
             .collect();
@@ -340,15 +343,15 @@ impl PsetDetails {
         let is_complete = signers_missing.is_empty();
 
         let sigs_present_min = lwk
-            .sig_details
+            .sig_details()
             .iter()
-            .map(|s| s.has_signature.len() as u32)
+            .map(|s| s.has_signature().len() as u32)
             .min()
             .unwrap_or(0);
         let signer_slots = lwk
-            .sig_details
+            .sig_details()
             .iter()
-            .map(|s| (s.has_signature.len() + s.missing_signature.len()) as u32)
+            .map(|s| (s.has_signature().len() + s.missing_signature().len()) as u32)
             .max()
             .unwrap_or(0);
 
@@ -504,10 +507,9 @@ mod tests {
     // -- blind proof verification -------------------------------------------
 
     use lwk_wollet::elements::confidential::{AssetBlindingFactor, Nonce, ValueBlindingFactor};
-    use lwk_wollet::elements::secp256k1_zkp::{
-        Generator, PedersenCommitment, RangeProof, SurjectionProof,
-    };
+    use lwk_wollet::elements::secp256k1_zkp::{Generator, PedersenCommitment};
     use lwk_wollet::elements::{OutPoint, Script, TxOut, Txid};
+    use lwk_wollet::elements::{RangeProof, SurjectionProof};
 
     struct Blinded {
         asset: AssetId,
@@ -521,7 +523,7 @@ mod tests {
     /// honest blinder attaches (what LWK's `blind_last` / `add_input` do).
     fn blinded(secp: &Secp256k1<All>, amount: u64) -> Blinded {
         let mut rng = rand::thread_rng();
-        let asset = AssetId::from_slice(&[7u8; 32]).unwrap();
+        let asset = AssetId::from_byte_array([7u8; 32]);
         let abf = AssetBlindingFactor::new(&mut rng);
         let vbf = ValueBlindingFactor::new(&mut rng);
         let asset_comm = Generator::new_blinded(secp, asset.into_tag(), abf.into_inner());
@@ -550,8 +552,8 @@ mod tests {
             amount_comm: Some(b.amount_comm),
             asset: Some(b.asset),
             asset_comm: Some(b.asset_comm),
-            blind_value_proof: Some(Box::new(b.value_proof.clone())),
-            blind_asset_proof: Some(Box::new(b.asset_proof.clone())),
+            blind_value_proof: Some(b.value_proof.clone()),
+            blind_asset_proof: Some(b.asset_proof.clone()),
             ..Default::default()
         }
     }
@@ -581,14 +583,14 @@ mod tests {
 
         // A wrong asset with the right amount fails the asset proof.
         let mut wrong_asset = blinded_output(&b, 1_000);
-        wrong_asset.asset = Some(AssetId::from_slice(&[9u8; 32]).unwrap());
+        wrong_asset.asset = Some(AssetId::from_byte_array([9u8; 32]));
         assert_eq!(verified_output_claims(&secp, &wrong_asset), None);
     }
 
     #[test]
     fn explicit_outputs_verify_only_without_commitments() {
         let secp = Secp256k1::new();
-        let asset = AssetId::from_slice(&[7u8; 32]).unwrap();
+        let asset = AssetId::from_byte_array([7u8; 32]);
         let explicit = Output::new_explicit(Script::from(vec![0u8, 20, 1]), 500, asset, None);
         assert_eq!(verified_output_claims(&secp, &explicit), Some((asset, 500)));
 
@@ -631,8 +633,8 @@ mod tests {
         let mut input = input_with(utxo.clone());
         input.asset = Some(b.asset);
         input.amount = Some(2_000);
-        input.blind_asset_proof = Some(Box::new(b.asset_proof.clone()));
-        input.blind_value_proof = Some(Box::new(b.value_proof.clone()));
+        input.blind_asset_proof = Some(b.asset_proof.clone());
+        input.blind_value_proof = Some(b.value_proof.clone());
         assert_eq!(verified_input_claims(&secp, &input), Some((b.asset, 2_000)));
 
         input.amount = Some(1_500);
@@ -652,7 +654,7 @@ mod tests {
     #[test]
     fn explicit_prevouts_speak_for_themselves_but_must_agree() {
         let secp = Secp256k1::new();
-        let asset = AssetId::from_slice(&[7u8; 32]).unwrap();
+        let asset = AssetId::from_byte_array([7u8; 32]);
         let utxo = TxOut {
             asset: Asset::Explicit(asset),
             value: Value::Explicit(3_000),
