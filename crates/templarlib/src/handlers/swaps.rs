@@ -1,8 +1,11 @@
 //! LiquiDEX swap and order-book commands over the templar-core
 //! engine (`liquid::liquidex`) and book client (`liquid::book`).
 //!
-//! The local book is browsed read-only by the wallet. The make/take engine
-//! signs and broadcasts on the active Liquid testnet or regtest chain.
+//! The book is browsed read-only by the wallet; offers are published to its
+//! public `POST /api/offers`. Its URLs come from `AppState::endpoints` (env,
+//! then the test server, then the local `127.0.0.1:3210`). The make/take
+//! engine signs and broadcasts on the active Liquid testnet or regtest chain,
+//! through the backend the same resolver picks.
 //!
 //! My-offers persist to `<data_dir>/swap_offers.json` (plain JSON, keyed per
 //! wallet, no secrets) with the same atomic temp+fsync+rename pattern as the
@@ -15,12 +18,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use templar_core::liquid::book::{
-    fetch_book, fetch_markets, publish_offer, BookEntry, BookLeg, MarketBookEntry, MarketBookLeg,
-    LOCAL_BOOK_URL, LOCAL_MARKETS_URL,
+    fetch_book, fetch_markets, publish_offer, BookEntry, BookError, BookLeg, MarketBookEntry,
+    MarketBookLeg,
 };
-use templar_core::liquid::liquidex::{
-    broadcast_transaction_on, proposal_utxo_unspent_on, verify_proposal_on,
-};
+#[cfg(test)]
+use templar_core::liquid::book::{LOCAL_BOOK_URL, LOCAL_MARKETS_URL};
+use templar_core::liquid::liquidex::verify_proposal_on;
+use templar_core::{broadcast_transaction_with, proposal_utxo_unspent_with, verify_proposal_with};
 use templar_core::{
     build_cancel_tx, first_frozen, make_proposal, take_preview_excluding, take_proposal_excluding,
     AssetRegistry, CoinChain, LiquidError, LiquidexLeg, LiquidexProposal, SwapLeg, SwapNetwork,
@@ -30,7 +34,6 @@ use templar_core::{
 use crate::state::AppState;
 
 const STORE_FILE: &str = "swap_offers.json";
-const LOCAL_ADMIN_URL: &str = "http://127.0.0.1:3210/api/admin/offers";
 
 // ── DTOs (wire shapes fixed by the host contract) ────────────────────────────
 
@@ -209,12 +212,18 @@ pub struct SwapPublishParams {
 
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
-/// Fetches the local order book and maps each entry to a display row.
-/// URL: `TEMPLAR_SWAP_BOOK_URL` env override or the localhost service.
-/// The active Liquid network is always sent so testnet and regtest stay apart.
+/// Fetches the order book and maps each entry to a display row.
+/// URL: `TEMPLAR_SWAP_BOOK_URL`, else the test server's order book, else the
+/// localhost service. The active Liquid network is always sent so testnet
+/// and regtest stay apart.
 pub fn list_swaps(state: &AppState, include_unavailable: bool) -> Result<Vec<SwapRowDto>, String> {
-    let entries = fetch_book(&book_url(include_unavailable, state.liquid_network.name()))
-        .map_err(|e| e.to_string())?;
+    let base = state.endpoints().book_url().value;
+    let entries = fetch_book(&feed_url(
+        &base,
+        include_unavailable,
+        state.liquid_network.name(),
+    ))
+    .map_err(|e| e.to_string())?;
     Ok(rows_from_entries(&entries, &state.liquid_network))
 }
 
@@ -224,7 +233,9 @@ pub fn list_markets(
     state: &AppState,
     include_unavailable: bool,
 ) -> Result<Vec<MarketRowDto>, String> {
-    let entries = fetch_markets(&market_url(
+    let base = state.endpoints().markets_url().value;
+    let entries = fetch_markets(&feed_url(
+        &base,
         include_unavailable,
         state.liquid_network.name(),
     ))
@@ -243,8 +254,12 @@ pub fn verify(
     deep: bool,
 ) -> Result<SwapAnalysisDto, String> {
     let proposal = LiquidexProposal::from_json(proposal_json).map_err(|e| e.to_string())?;
-    let result =
-        verify_proposal_on(&proposal, deep, &state.liquid_network).map_err(|e| e.to_string())?;
+    let result = if deep {
+        verify_proposal_with(&proposal, &state.liquid_chain()?)
+    } else {
+        verify_proposal_on(&proposal, false, &state.liquid_network)
+    }
+    .map_err(|e| e.to_string())?;
     Ok(analysis_dto(&state.asset_registry, &result))
 }
 
@@ -265,7 +280,8 @@ pub fn take_preview(
 
 /// Takes a proposal: the engine deep-verifies internally and refuses
 /// non-takeable orders (mainnet, failed checks) with the block reason as the
-/// error; on success the signed transaction is broadcast to Liquid testnet.
+/// error; on success the signed transaction is broadcast on the active
+/// Liquid network, through the wallet's own chain backend.
 pub fn take(
     state: &AppState,
     proposal_json: &str,
@@ -286,7 +302,8 @@ pub fn take(
     if let Some(op) = first_frozen(spent, &frozen) {
         return Err(LiquidError::FrozenCoin(op).to_string());
     }
-    broadcast_transaction_on(&result.tx, &state.liquid_network).map_err(|e| e.to_string())
+    let chain = liq.chain().map_err(|e| e.to_string())?;
+    broadcast_transaction_with(&result.tx, &chain).map_err(|e| e.to_string())
 }
 
 /// Builds and signs a proposal offering one wallet UTXO's full amount, then
@@ -330,14 +347,17 @@ pub fn make(
     };
     store.offers.push(StoredOffer {
         wallet_id: wallet_id.to_string(),
+        network: Some(state.liquid_network.name().to_string()),
         offer: offer.clone(),
     });
     save_store(&state.data_dir, &store)?;
     Ok(offer)
 }
 
-/// Publishes an already-signed proposal to the local admin order book.
-/// Only the proposal and optional public note leave the wallet process.
+/// Publishes an already-signed proposal to the order book's public
+/// `POST /api/offers` (or the route `TEMPLAR_SWAP_ADMIN_URL` names). Only
+/// the proposal and optional public note leave the wallet process. Refusals
+/// map to tagged errors ([`publish_error`]).
 pub fn publish(state: &AppState, proposal_json: &str, note: &str) -> Result<u64, String> {
     let proposal = LiquidexProposal::from_json(proposal_json).map_err(|e| e.to_string())?;
     let analysis =
@@ -349,18 +369,57 @@ pub fn publish(state: &AppState, proposal_json: &str, note: &str) -> Result<u64,
     if analysis.network == SwapNetwork::Mainnet {
         return Err("Liquid mainnet proposals cannot be published".to_string());
     }
-    let url = std::env::var("TEMPLAR_SWAP_ADMIN_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| LOCAL_ADMIN_URL.to_string());
-    publish_offer(
-        &url,
-        state.liquid_network.name(),
-        proposal_json,
-        note.trim(),
-    )
-    .map_err(|e| e.to_string())
+    let url = state.endpoints().publish_url().value;
+    let network = state.liquid_network.name();
+    publish_offer(&url, network, proposal_json, note.trim())
+        .map_err(|e| publish_error(e, &url, network))
+}
+
+/// An order-book publish refusal as a tagged engine error. The tag follows
+/// the HTTP status (the order book's contract: match on the status, not the
+/// text); the book's own message is appended for people.
+pub(crate) fn publish_error(e: BookError, url: &str, network: &str) -> String {
+    let (status, message, retry_after) = match e {
+        BookError::Rejected {
+            status,
+            message,
+            retry_after,
+        } => (status, message, retry_after),
+        BookError::Network(msg) => {
+            return format!("BOOK_UNREACHABLE: Cannot reach the order book at {url}: {msg}")
+        }
+        other => return format!("BOOK_UNAVAILABLE: {other}"),
+    };
+    let retry = retry_after
+        .map(|s| format!(" Try again in {s} seconds."))
+        .unwrap_or_else(|| " Try again later.".to_string());
+    match status {
+        400 => format!("BOOK_REJECTED: The order book refused the offer: {message}"),
+        401 => format!(
+            "BOOK_REJECTED: {url} wants an admin login. TEMPLAR_SWAP_ADMIN_URL points at the \
+             admin route of a protected order book; unset it to publish through the public \
+             POST /api/offers."
+        ),
+        403 => format!(
+            "BOOK_PUBLISH_DISABLED: This order book does not take public offers for {network}: \
+             {message}"
+        ),
+        404 | 405 => format!(
+            "BOOK_UNAVAILABLE: {url} has no publish route (HTTP {status}); the order book needs \
+             an update to take offers from wallets"
+        ),
+        409 => "BOOK_DUPLICATE: This offer is already in the order book".to_string(),
+        413 => "BOOK_REJECTED: The offer is too large for the order book".to_string(),
+        415 | 422 => format!(
+            "BOOK_REJECTED: The order book could not read the request (HTTP {status}): {message}"
+        ),
+        429 => format!("BOOK_RATE_LIMITED: Too many offers published from here.{retry}"),
+        503 => format!(
+            "BOOK_CHAIN_UNREACHABLE: The order book cannot verify offers on {network} right \
+             now, so nothing was stored.{retry} ({message})"
+        ),
+        _ => format!("BOOK_UNAVAILABLE: The order book answered HTTP {status}: {message}"),
+    }
 }
 
 /// Exact-amount self-send: creates a UTXO of exactly `amount_sats` of
@@ -389,13 +448,21 @@ pub fn make_prepare(
     liq.broadcast(&mut pset).map_err(|e| e.to_string())
 }
 
-/// This wallet's offers, newest first. Open offers get a best-effort status
-/// refresh: an offered UTXO seen spent on testnet closes the offer (persisted);
-/// network errors and foreign-network prevouts keep the stored status.
+/// This wallet's offers on the active Liquid network, newest first (offers
+/// stored before the network was recorded show on both). Open offers get a
+/// best-effort status refresh: an offered UTXO seen spent on the active
+/// chain closes the offer (persisted); network errors and foreign-network
+/// prevouts keep the stored status.
 pub fn list_my_offers(state: &AppState, wallet_id: &str) -> Result<Vec<MyOfferDto>, String> {
     let mut store = load_store(&state.data_dir)?;
     let mut changed = false;
-    for stored in store.offers.iter_mut().filter(|o| o.wallet_id == wallet_id) {
+    let network = state.liquid_network.name();
+    let chain = state.liquid_chain().ok();
+    for stored in store
+        .offers
+        .iter_mut()
+        .filter(|o| o.wallet_id == wallet_id && o.is_on(network))
+    {
         if stored.offer.status != "open" {
             continue;
         }
@@ -405,7 +472,8 @@ pub fn list_my_offers(state: &AppState, wallet_id: &str) -> Result<Vec<MyOfferDt
         // Some(false) = spent → closed. Some(true) = still open.
         // None (prevout unknown to this chain) and Err (network) keep the
         // stored status — never guess an offer's fate offline.
-        if let Ok(Some(false)) = proposal_utxo_unspent_on(&proposal, &state.liquid_network) {
+        let Some(chain) = &chain else { continue };
+        if let Ok(Some(false)) = proposal_utxo_unspent_with(&proposal, chain) {
             stored.offer.status = "closed".to_string();
             changed = true;
         }
@@ -416,7 +484,7 @@ pub fn list_my_offers(state: &AppState, wallet_id: &str) -> Result<Vec<MyOfferDt
     let mut out: Vec<MyOfferDto> = store
         .offers
         .into_iter()
-        .filter(|o| o.wallet_id == wallet_id)
+        .filter(|o| o.wallet_id == wallet_id && o.is_on(network))
         .map(|o| o.offer)
         .collect();
     out.sort_by_key(|o| std::cmp::Reverse(o.created_at));
@@ -444,7 +512,8 @@ pub fn cancel(state: &AppState, wallet_id: &str, offer_id: &str) -> Result<Strin
         ));
     }
     let tx = build_cancel_tx(liq, &stored.offer.utxo).map_err(|e| e.to_string())?;
-    let txid = broadcast_transaction_on(&tx, &state.liquid_network).map_err(|e| e.to_string())?;
+    let chain = liq.chain().map_err(|e| e.to_string())?;
+    let txid = broadcast_transaction_with(&tx, &chain).map_err(|e| e.to_string())?;
     stored.offer.status = "cancelled".to_string();
     save_store(&state.data_dir, &store)?;
     Ok(txid)
@@ -452,26 +521,9 @@ pub fn cancel(state: &AppState, wallet_id: &str, offer_id: &str) -> Result<Strin
 
 // ── Row / leg mapping ────────────────────────────────────────────────────────
 
-fn book_url(include_unavailable: bool, network: &str) -> String {
-    let base = std::env::var("TEMPLAR_SWAP_BOOK_URL")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| LOCAL_BOOK_URL.to_string());
-    let separator = if base.contains('?') { '&' } else { '?' };
-    let mut url = format!("{base}{separator}network={network}");
-    if include_unavailable {
-        url.push_str("&all=1");
-    }
-    url
-}
-
-fn market_url(include_unavailable: bool, network: &str) -> String {
-    let base = std::env::var("TEMPLAR_SWAP_MARKETS_URL")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| LOCAL_MARKETS_URL.to_string());
+/// A book or markets feed URL for one network, with `all` for unavailable
+/// rows too.
+fn feed_url(base: &str, include_unavailable: bool, network: &str) -> String {
     let separator = if base.contains('?') { '&' } else { '?' };
     let mut url = format!("{base}{separator}network={network}");
     if include_unavailable {
@@ -695,13 +747,42 @@ fn preview_dto(registry: &AssetRegistry, preview: &TakePreview) -> TakePreviewDt
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 
-/// One stored offer: the wire DTO plus the owning wallet (kept out of the
-/// wire shape via flatten).
+/// One stored offer: the wire DTO plus the owning wallet and the Liquid
+/// network it was made on (kept out of the wire shape via flatten).
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct StoredOffer {
     wallet_id: String,
+    /// `liquid-testnet` | `liquid-regtest`; absent on offers stored before
+    /// the network was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    network: Option<String>,
     #[serde(flatten)]
     offer: MyOfferDto,
+}
+
+impl StoredOffer {
+    /// Whether the offer belongs on `network` (unknown = shown everywhere).
+    fn is_on(&self, network: &str) -> bool {
+        self.network.as_deref().is_none_or(|n| n == network)
+    }
+}
+
+/// Forgets every stored offer made on `network` — a reset regtest chain
+/// takes its offers with it. Returns how many were dropped.
+pub(crate) fn drop_offers_on(data_dir: &Path, network: &str) -> Result<usize, String> {
+    if !store_path(data_dir).exists() {
+        return Ok(0);
+    }
+    let mut store = load_store(data_dir)?;
+    let before = store.offers.len();
+    store
+        .offers
+        .retain(|o| o.network.as_deref() != Some(network));
+    let dropped = before - store.offers.len();
+    if dropped > 0 {
+        save_store(data_dir, &store)?;
+    }
+    Ok(dropped)
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -1054,10 +1135,12 @@ mod tests {
         let mut store = SwapOfferStore::default();
         store.offers.push(StoredOffer {
             wallet_id: "w1".to_string(),
+            network: None,
             offer: sample_offer("of_00000001", 100),
         });
         store.offers.push(StoredOffer {
             wallet_id: "w2".to_string(),
+            network: None,
             offer: sample_offer("of_00000002", 200),
         });
         save_store(&dir, &store).unwrap();
@@ -1115,6 +1198,7 @@ mod tests {
         assert!(id1[3..].chars().all(|c| c.is_ascii_hexdigit()));
         store.offers.push(StoredOffer {
             wallet_id: "w".to_string(),
+            network: None,
             offer: sample_offer(&id1, 1),
         });
         let id2 = new_offer_id(&store);
@@ -1122,20 +1206,79 @@ mod tests {
     }
 
     #[test]
-    fn book_url_honors_env_and_all_suffix() {
-        // Only the default path is asserted — mutating the process env in a
-        // parallel test runner would race other tests.
+    fn feed_urls_carry_the_network_and_all_suffix() {
         assert_eq!(
-            book_url(false, "liquid-testnet"),
+            feed_url(LOCAL_BOOK_URL, false, "liquid-testnet"),
             format!("{LOCAL_BOOK_URL}?network=liquid-testnet")
         );
         assert_eq!(
-            book_url(true, "liquid-regtest"),
+            feed_url(LOCAL_BOOK_URL, true, "liquid-regtest"),
             format!("{LOCAL_BOOK_URL}?network=liquid-regtest&all=1")
         );
         assert_eq!(
-            market_url(false, "liquid-testnet"),
-            format!("{LOCAL_MARKETS_URL}?network=liquid-testnet")
+            feed_url(&format!("{LOCAL_MARKETS_URL}?x=1"), false, "liquid-testnet"),
+            format!("{LOCAL_MARKETS_URL}?x=1&network=liquid-testnet")
         );
+    }
+
+    #[test]
+    fn publish_refusals_map_to_tags_by_status() {
+        let refusal = |status, retry_after| BookError::Rejected {
+            status,
+            message: "server text".into(),
+            retry_after,
+        };
+        let url = "http://127.0.0.1:3210/api/offers";
+        for (status, retry, tag) in [
+            (400, None, "BOOK_REJECTED:"),
+            (401, None, "BOOK_REJECTED:"),
+            (403, None, "BOOK_PUBLISH_DISABLED:"),
+            (404, None, "BOOK_UNAVAILABLE:"),
+            (409, None, "BOOK_DUPLICATE:"),
+            (413, None, "BOOK_REJECTED:"),
+            (415, None, "BOOK_REJECTED:"),
+            (429, Some(42), "BOOK_RATE_LIMITED:"),
+            (503, Some(30), "BOOK_CHAIN_UNREACHABLE:"),
+            (500, None, "BOOK_UNAVAILABLE:"),
+        ] {
+            let msg = publish_error(refusal(status, retry), url, "liquid-regtest");
+            assert!(msg.starts_with(tag), "{status}: {msg}");
+            if let Some(s) = retry {
+                assert!(msg.contains(&format!("{s} seconds")), "{msg}");
+            }
+        }
+        let msg = publish_error(BookError::Network("refused".into()), url, "liquid-testnet");
+        assert!(msg.starts_with("BOOK_UNREACHABLE:"), "{msg}");
+    }
+
+    #[test]
+    fn offers_are_kept_per_network_and_dropped_with_a_reset_chain() {
+        let dir = test_dir("per_network");
+        let mut store = SwapOfferStore::default();
+        for (id, network) in [
+            ("of_00000001", Some("liquid-testnet")),
+            ("of_00000002", Some("liquid-regtest")),
+            ("of_00000003", None),
+        ] {
+            store.offers.push(StoredOffer {
+                wallet_id: "w".into(),
+                network: network.map(str::to_string),
+                offer: sample_offer(id, 1),
+            });
+        }
+        save_store(&dir, &store).unwrap();
+        let loaded = load_store(&dir).unwrap();
+        assert!(loaded.offers[0].is_on("liquid-testnet"));
+        assert!(!loaded.offers[0].is_on("liquid-regtest"));
+        assert!(loaded.offers[2].is_on("liquid-regtest"));
+        assert_eq!(drop_offers_on(&dir, "liquid-regtest").unwrap(), 1);
+        let ids: Vec<String> = load_store(&dir)
+            .unwrap()
+            .offers
+            .into_iter()
+            .map(|o| o.offer.offer_id)
+            .collect();
+        assert_eq!(ids, ["of_00000001", "of_00000003"]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

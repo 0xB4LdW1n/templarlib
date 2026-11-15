@@ -7,7 +7,7 @@ use templar_core::liquid::wallet::refuse_frozen_inputs;
 use templar_core::registry::{LiquidWalletConfig, WalletProfile};
 use templar_core::{CoinChain, LiquidMultisigSetup, LiquidWalletManager};
 
-use templar_core::{LiquidBackend, LiquidNetwork, REGTEST_DEFAULT_POLICY_ASSET};
+use templar_core::{LiquidBackend, LiquidNetwork, Source, REGTEST_DEFAULT_POLICY_ASSET};
 
 use crate::state::AppState;
 use crate::types::{
@@ -151,8 +151,10 @@ pub fn network_info(state: &AppState) -> LiquidNetworkDto {
     let network = &state.liquid_network;
     // A bad `TEMPLAR_LIQUID_BACKEND` value is reported by sync; here it only
     // needs a description, so fall back to the network's natural backend.
-    let backend =
-        LiquidBackend::from_env(network).unwrap_or_else(|_| LiquidBackend::default_for(network));
+    let (backend, source) = match state.liquid_backend() {
+        Ok(r) => (r.value, r.source),
+        Err(_) => (LiquidBackend::default_for(network), Source::Default),
+    };
     LiquidNetworkDto {
         network: network.name().to_string(),
         short_name: network.short_name().to_string(),
@@ -161,6 +163,8 @@ pub fn network_info(state: &AppState) -> LiquidNetworkDto {
         backend_description: backend.describe(),
         env_locked: state.liquid_network_env_locked,
         regtest_default_policy_asset: REGTEST_DEFAULT_POLICY_ASSET.to_string(),
+        backend_source: source.as_str().to_string(),
+        test_server: state.test_server.as_ref().map(|p| p.base_url.clone()),
     }
 }
 
@@ -171,7 +175,23 @@ pub fn set_network(
     network: &str,
     policy_asset: Option<&str>,
 ) -> Result<(), String> {
-    let network = LiquidNetwork::parse(network, policy_asset).map_err(|e| e.to_string())?;
+    let parsed = LiquidNetwork::parse(network, policy_asset).map_err(|e| e.to_string())?;
+    let network = if parsed.is_regtest() {
+        // With a test server joined, regtest means the lab's regtest.
+        if let Some(lab) = &state.test_server {
+            let asked = policy_asset.map(str::trim).filter(|a| !a.is_empty());
+            if asked.is_some_and(|a| !a.eq_ignore_ascii_case(&lab.regtest.policy_asset)) {
+                return Err(format!(
+                    "Liquid regtest is the test server's ({}), whose policy asset is {}. \
+                     Clear the test server to use another regtest.",
+                    lab.base_url, lab.regtest.policy_asset
+                ));
+            }
+        }
+        state.endpoints().regtest_network(Some(&parsed)).value
+    } else {
+        parsed
+    };
     state.set_liquid_network(network)
 }
 

@@ -7,5 +7,6 @@ pub mod liquid;
 pub mod peg;
 pub mod registry;
 pub mod swaps;
+pub mod test_server;
 pub mod vault;
 pub mod wallet_ops;

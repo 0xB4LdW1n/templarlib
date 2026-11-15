@@ -1389,7 +1389,8 @@ pub fn sign_psbt_handler(
                 }
                 _ => {
                     let mgr =
-                        WalletManager::new(&state.data_dir, mnemonic).map_err(|e| e.to_string())?;
+                        WalletManager::new_on(&state.bitcoin_backend(), &state.data_dir, mnemonic)
+                            .map_err(|e| e.to_string())?;
                     mgr.sign_no_finalize(&mut psbt).map_err(|e| e.to_string())?;
                 }
             }
@@ -1431,7 +1432,8 @@ pub fn sign_psbt_handler(
                     mgr.sign_no_finalize(&mut psbt).map_err(|e| e.to_string())?;
                 }
                 _ => {
-                    let mgr = WalletManager::from_multisig_profile(
+                    let mgr = WalletManager::from_multisig_profile_on(
+                        &state.bitcoin_backend(),
                         &state.data_dir,
                         &entry.profile,
                         wallet_id,
@@ -1459,7 +1461,8 @@ pub fn sign_psbt_handler(
                     mgr.sign_no_finalize(&mut psbt).map_err(|e| e.to_string())?;
                 }
                 _ => {
-                    let mgr = WalletManager::from_multisig_profile(
+                    let mgr = WalletManager::from_multisig_profile_on(
+                        &state.bitcoin_backend(),
                         &state.data_dir,
                         &entry.profile,
                         wallet_id,

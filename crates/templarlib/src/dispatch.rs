@@ -11,6 +11,7 @@ use crate::handlers::liquid;
 use crate::handlers::peg;
 use crate::handlers::registry as reg;
 use crate::handlers::swaps;
+use crate::handlers::test_server;
 use crate::handlers::vault;
 use crate::handlers::wallet_ops;
 use crate::state::AppState;
@@ -18,13 +19,13 @@ use crate::types::{
     BroadcastSignedPsbtParams, BuildUnsignedPsbtParams, BurnAssetParams, CombinePsbtsParams,
     CombinePsetsParams, ConsolidateUtxosParams, CreateMultisigParams, CreateWalletParams,
     CreateWatchOnlyParams, DeleteWalletParams, DeriveCosignerXpubParams,
-    DeriveLiquidDescriptorParams, GenerateAddressParams, GenerateMnemonicParams, InspectPsbtParams,
-    IssueAssetParams, ListActivityParams, ListUtxosParams, OpenWalletParams, PreviewFeeBumpParams,
-    PreviewTxParams, PsetParams, ReissueAssetParams, RenameWalletParams, ReregisterAssetParams,
-    SendTxParams, SetLiquidNetworkParams, SetUtxosFrozenParams, SignPsbtParams, SyncOutcomeDto,
-    TxOutputSpec, UrDecodePartsParams, UrPsbtEncodeParams, UrPsetEncodeParams,
-    ValidateCosignerKeyParams, VaultKeyParams, VaultPassphraseParams, VerifyBackupParams,
-    WalletIdParams,
+    DeriveLiquidDescriptorParams, GenerateAddressParams, GenerateMnemonicParams,
+    GetTestServerParams, InspectPsbtParams, IssueAssetParams, ListActivityParams, ListUtxosParams,
+    OpenWalletParams, PreviewFeeBumpParams, PreviewTxParams, PsetParams, ReissueAssetParams,
+    RenameWalletParams, ReregisterAssetParams, SendTxParams, SetLiquidNetworkParams,
+    SetTestServerParams, SetUtxosFrozenParams, SignPsbtParams, SyncOutcomeDto, TxOutputSpec,
+    UrDecodePartsParams, UrPsbtEncodeParams, UrPsetEncodeParams, ValidateCosignerKeyParams,
+    VaultKeyParams, VaultPassphraseParams, VerifyBackupParams, WalletIdParams,
 };
 #[cfg(feature = "hardware")]
 use crate::types::{
@@ -65,6 +66,24 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
             liquid::set_network(state, &p.network, p.policy_asset.as_deref())?;
             Ok(serde_json::to_value(liquid::network_info(state)).unwrap())
         }
+
+        // ── Test server (Templar testlab profile) ────────────────────────────
+        "get_test_server" => {
+            let p: GetTestServerParams = if params.is_null() {
+                GetTestServerParams::default()
+            } else {
+                serde_json::from_value(params.clone()).map_err(|e| e.to_string())?
+            };
+            Ok(serde_json::to_value(test_server::get(state, p.check)).unwrap())
+        }
+
+        "set_test_server" => {
+            let p: SetTestServerParams =
+                serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            test_server::set(state, &p.url).map(|v| serde_json::to_value(v).unwrap())
+        }
+
+        "clear_test_server" => test_server::clear(state).map(|v| serde_json::to_value(v).unwrap()),
 
         // ── Vault (at-rest encryption, C1) ───────────────────────────────────
         "vault_status" => Ok(vault::status(state)),

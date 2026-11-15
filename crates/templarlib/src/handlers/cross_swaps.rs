@@ -22,7 +22,6 @@ use templar_core::{
 use crate::state::AppState;
 
 const STORE_FILE: &str = "atomic_swaps.json";
-const API: &str = "http://127.0.0.1:3210/api/atomic-swaps";
 const NETWORK: &str = "liquid-testnet";
 const DEFAULT_BTC_FEE_RATE: f32 = 2.0;
 const CLAIM_FEE_SATS: u64 = 500;
@@ -160,7 +159,7 @@ pub fn create(state: &AppState, p: CreateParams) -> Result<MyAtomicSwap, String>
         p.note,
     );
     let row: AtomicSwapRow = post_json(
-        API,
+        &api(state),
         &serde_json::json!({
             "network": NETWORK,
             "state": state_public,
@@ -179,7 +178,7 @@ pub fn create(state: &AppState, p: CreateParams) -> Result<MyAtomicSwap, String>
 pub fn join(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
     let mnemonic = mnemonic(state, &p.wallet_id)?;
-    let mut row = fetch(p.offer_id)?;
+    let mut row = fetch(state, p.offer_id)?;
     if row.status != "open" {
         return Err("Offer is no longer open".into());
     }
@@ -214,7 +213,7 @@ pub fn join(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     row.state.maker_contract_script = Some(maker_contract.script_hex);
     row.state.taker_contract_address = Some(taker_contract.address);
     row.state.taker_contract_script = Some(taker_contract.script_hex);
-    row = transition(&row, "reserved")?;
+    row = transition(state, &row, "reserved")?;
     store.swaps.push(StoredAtomicSwap {
         offer_id: row.id,
         wallet_id: p.wallet_id.clone(),
@@ -231,14 +230,14 @@ pub fn list_mine(state: &AppState, wallet_id: &str) -> Result<Vec<MyAtomicSwap>,
         .swaps
         .iter()
         .filter(|s| s.wallet_id == wallet_id)
-        .map(|s| fetch(s.offer_id).map(|row| enrich(row, wallet_id, &s.role, s.key_index)))
+        .map(|s| fetch(state, s.offer_id).map(|row| enrich(row, wallet_id, &s.role, s.key_index)))
         .collect()
 }
 
 pub fn fund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
     let local = owned(state, &p.wallet_id, p.offer_id)?;
-    let mut row = fetch(p.offer_id)?;
+    let mut row = fetch(state, p.offer_id)?;
     let maker = local.role == "maker";
     if (maker && row.status != "reserved") || (!maker && row.status != "maker_funded") {
         return Err(format!(
@@ -286,12 +285,12 @@ pub fn fund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
         row.state.maker_funding_txid = Some(funded.txid);
         row.state.maker_funding_tx_hex = Some(funded.tx_hex);
         row.state.maker_funding_vout = Some(funded.vout);
-        row = transition(&row, "maker_funded")?;
+        row = transition(state, &row, "maker_funded")?;
     } else {
         row.state.taker_funding_txid = Some(funded.txid);
         row.state.taker_funding_tx_hex = Some(funded.tx_hex);
         row.state.taker_funding_vout = Some(funded.vout);
-        row = transition(&row, "taker_funded")?;
+        row = transition(state, &row, "taker_funded")?;
     }
     Ok(enrich(row, &p.wallet_id, &local.role, local.key_index))
 }
@@ -299,7 +298,7 @@ pub fn fund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
 pub fn claim(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
     let local = owned(state, &p.wallet_id, p.offer_id)?;
-    let mut row = fetch(p.offer_id)?;
+    let mut row = fetch(state, p.offer_id)?;
     let maker = local.role == "maker";
     if (maker && row.status != "taker_funded") || (!maker && row.status != "maker_claimed") {
         return Err(format!(
@@ -394,10 +393,10 @@ pub fn claim(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     if maker {
         row.state.preimage_hex = Some(hex::encode(preimage));
         row.state.maker_claim_txid = Some(spend_txid);
-        row = transition(&row, "maker_claimed")?;
+        row = transition(state, &row, "maker_claimed")?;
     } else {
         row.state.taker_claim_txid = Some(spend_txid);
-        row = transition(&row, "completed")?;
+        row = transition(state, &row, "completed")?;
     }
     Ok(enrich(row, &p.wallet_id, &local.role, local.key_index))
 }
@@ -405,7 +404,7 @@ pub fn claim(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
 pub fn refund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
     let local = owned(state, &p.wallet_id, p.offer_id)?;
-    let mut row = fetch(p.offer_id)?;
+    let mut row = fetch(state, p.offer_id)?;
     let maker = local.role == "maker";
     let timeout = if maker {
         row.state.maker_timeout
@@ -493,7 +492,7 @@ pub fn refund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
         row.state.taker_refund_txid = Some(refund_txid);
         "taker_refunded"
     };
-    row = transition(&row, next)?;
+    row = transition(state, &row, next)?;
     Ok(enrich(row, &p.wallet_id, &local.role, local.key_index))
 }
 
@@ -844,14 +843,22 @@ fn enrich(row: AtomicSwapRow, wallet_id: &str, role: &str, key_index: u32) -> My
     }
 }
 
-fn transition(row: &AtomicSwapRow, status: &str) -> Result<AtomicSwapRow, String> {
+/// The HTLC coordinator on the active order book (`AppState::endpoints`).
+fn api(state: &AppState) -> String {
+    state.endpoints().atomic_swaps_url().value
+}
+fn transition(
+    state: &AppState,
+    row: &AtomicSwapRow,
+    status: &str,
+) -> Result<AtomicSwapRow, String> {
     put_json(
-        &format!("{API}/{}", row.id),
+        &format!("{}/{}", api(state), row.id),
         &serde_json::json!({ "status": status, "state": row.state }),
     )
 }
-fn fetch(id: u64) -> Result<AtomicSwapRow, String> {
-    get_json(&format!("{API}/{id}"))
+fn fetch(state: &AppState, id: u64) -> Result<AtomicSwapRow, String> {
+    get_json(&format!("{}/{id}", api(state)))
 }
 
 fn client() -> Result<reqwest::blocking::Client, String> {

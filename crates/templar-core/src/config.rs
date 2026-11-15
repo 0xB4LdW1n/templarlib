@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::error::{StorageError, TemplarError};
 use crate::liquid::network::LiquidNetwork;
+use crate::test_server::TestServerProfile;
 
 /// Global application config, stored separately from wallet data.
 ///
@@ -22,6 +23,10 @@ pub struct AppConfig {
     /// `TEMPLAR_LIQUID_NETWORK` overrides it at runtime without touching it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liquid_network: Option<LiquidNetwork>,
+    /// The Templar test server the wallet joined (`set_test_server`), as
+    /// last fetched and validated. Absent = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_server: Option<TestServerProfile>,
 }
 
 impl AppConfig {
@@ -76,6 +81,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/templar_test"),
             last_wallet_id: Some("wallet-123".into()),
             liquid_network: None,
+            test_server: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
@@ -89,6 +95,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/test"),
             last_wallet_id: None,
             liquid_network: None,
+            test_server: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
@@ -110,6 +117,7 @@ mod tests {
             data_dir: PathBuf::from("/tmp/x"),
             last_wallet_id: None,
             liquid_network: Some(LiquidNetwork::regtest_default()),
+            test_server: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("liquid-regtest"), "{json}");
@@ -134,6 +142,7 @@ mod tests {
             data_dir: tmpdir.clone(),
             last_wallet_id: Some("test-id".into()),
             liquid_network: None,
+            test_server: None,
         };
         // We can't override config_path easily, but we can test serialization
         let json = serde_json::to_string_pretty(&config).unwrap();

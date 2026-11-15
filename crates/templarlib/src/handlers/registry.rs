@@ -794,11 +794,20 @@ pub fn delete_wallet(state: &mut AppState, wallet_id: &str) -> Result<(), String
                 // opened yet) — deleting it would destroy a live cache.
                 eprintln!("[delete_wallet] keeping shared BDK db dir {dir}");
             } else {
-                let path = state.data_dir.join(&dir);
-                match std::fs::remove_dir_all(&path) {
-                    Ok(()) => eprintln!("[delete_wallet] removed {}", path.display()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => eprintln!("[delete_wallet] could not remove {}: {e}", path.display()),
+                // The testnet database and its Bitcoin regtest twin
+                // (`BitcoinBackend::data_root`).
+                for root in [
+                    state.data_dir.clone(),
+                    templar_core::BitcoinBackend::regtest("").data_root(&state.data_dir),
+                ] {
+                    let path = root.join(&dir);
+                    match std::fs::remove_dir_all(&path) {
+                        Ok(()) => eprintln!("[delete_wallet] removed {}", path.display()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => {
+                            eprintln!("[delete_wallet] could not remove {}: {e}", path.display())
+                        }
+                    }
                 }
             }
         }

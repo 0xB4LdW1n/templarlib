@@ -280,6 +280,123 @@ pub struct LiquidNetworkDto {
     pub env_locked: bool,
     /// Stock regtest policy asset, for the settings form's default.
     pub regtest_default_policy_asset: String,
+    /// Where the backend came from: `env` | `profile` | `default`.
+    #[serde(default)]
+    pub backend_source: String,
+    /// Base URL of the joined test server, null when none.
+    #[serde(default)]
+    pub test_server: Option<String>,
+}
+
+/// `get_test_server` / `set_test_server` / `clear_test_server`: the joined
+/// test server and every server the engine talks to right now.
+#[derive(Serialize, Debug)]
+pub struct TestServerDto {
+    /// True when a test server is joined (`profile` is then non-null).
+    pub configured: bool,
+    /// The stored, validated `/api/config` of the joined server.
+    pub profile: Option<templar_core::TestServerProfile>,
+    /// A live look at the server: `set_test_server` always, and
+    /// `get_test_server` with `check: true`; null otherwise.
+    pub check: Option<TestServerCheckDto>,
+    /// What `set_test_server` / `clear_test_server` changed; null on `get`.
+    pub applied: Option<TestServerAppliedDto>,
+    /// The servers in use after the call.
+    pub active: ActiveEndpointsDto,
+}
+
+#[derive(Serialize, Debug)]
+pub struct TestServerCheckDto {
+    /// The server answered `/api/config` with a config this wallet accepts.
+    pub reachable: bool,
+    /// Why not, when `reachable` is false.
+    pub error: Option<String>,
+    /// The server's current `instance_id`, when it answered.
+    pub server_instance_id: Option<String>,
+    /// The server's config differs from the stored profile (typically: the
+    /// lab's chains were reset). Call `set_test_server` again to apply it.
+    pub stale: bool,
+}
+
+#[derive(Serialize, Debug)]
+pub struct TestServerAppliedDto {
+    /// The active Liquid network after the call.
+    pub liquid_network: String,
+    pub network_switched: bool,
+    /// The open wallet was closed; the host reopens it (`open_wallet`).
+    pub wallet_closed: bool,
+    /// Regtest chain caches were dropped (the lab's chain changed); the next
+    /// sync rescans. Keys and the wallet list are never touched.
+    pub regtest_cache_reset: bool,
+}
+
+/// A URL and where it came from: `env` | `profile` | `setting` | `default`.
+#[derive(Serialize, Debug)]
+pub struct SourcedUrlDto {
+    pub url: String,
+    pub source: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct OrderbookEndpointsDto {
+    /// The order book's origin.
+    pub origin: SourcedUrlDto,
+    /// `GET` book feed.
+    pub book: SourcedUrlDto,
+    /// `GET` unified markets feed.
+    pub markets: SourcedUrlDto,
+    /// Where `swap_publish` posts.
+    pub publish: SourcedUrlDto,
+    /// The HTLC v1 coordinator.
+    pub atomic_swaps: SourcedUrlDto,
+}
+
+#[derive(Serialize, Debug)]
+pub struct LiquidEndpointDto {
+    /// `liquid-testnet` | `liquid-regtest`.
+    pub network: String,
+    pub policy_asset: String,
+    /// A regtest's genesis hash when it is not the stock one; else null.
+    pub genesis_hash: Option<String>,
+    /// Where the network's parameters came from.
+    pub params_source: String,
+    /// `electrum` | `elements_rpc`.
+    pub backend: String,
+    /// Without credentials.
+    pub backend_description: String,
+    pub backend_source: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct BitcoinEndpointDto {
+    /// `bitcoin-testnet` | `bitcoin-regtest`.
+    pub network: String,
+    pub electrum_url: String,
+    pub source: String,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ActiveEndpointsDto {
+    /// `liquid-testnet` | `liquid-regtest`.
+    pub liquid_network: String,
+    /// `TEMPLAR_LIQUID_NETWORK` fixes the network for this run.
+    pub env_locked: bool,
+    pub orderbook: OrderbookEndpointsDto,
+    pub liquid: LiquidEndpointDto,
+    pub bitcoin: BitcoinEndpointDto,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct SetTestServerParams {
+    /// The test server's base URL, e.g. `http://127.0.0.1:8096`.
+    pub url: String,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct GetTestServerParams {
+    /// Also fetch the server's `/api/config` now (bounded to 10 s).
+    #[serde(default)]
+    pub check: bool,
 }
 
 #[derive(Deserialize, Debug)]

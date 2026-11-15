@@ -181,7 +181,7 @@ fn normalize_http_url(raw: &str, what: &str) -> Result<String, String> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(format!("{what} must not carry a user name or password"));
     }
-    if url.host_str().map_or(true, str::is_empty) {
+    if url.host_str().is_none_or(str::is_empty) {
         return Err(format!("{what} has no host"));
     }
     if url.query().is_some() || url.fragment().is_some() {
@@ -659,7 +659,8 @@ mod tests {
 
     #[test]
     fn malformed_fields_are_named_in_the_error() {
-        let cases: Vec<(Box<dyn FnOnce(&mut Value)>, &str)> = vec![
+        type Mutation = Box<dyn FnOnce(&mut Value)>;
+        let cases: Vec<(Mutation, &str)> = vec![
             (
                 Box::new(|v| reg(v)["instance_id"] = "abc".into()),
                 "instance_id",

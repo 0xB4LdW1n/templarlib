@@ -32,6 +32,11 @@ pub fn open_wallet(state: &mut AppState, wallet_id: &str) -> Result<(), String> 
 
     let liq_data_dir = Some(data_dir.as_path());
     let liq_network = state.liquid_network.clone();
+    // The backends this wallet runs on, from the one resolver: the Bitcoin
+    // network + Electrum, and the Liquid chain backend (a bad environment
+    // value is left for sync to report, as before).
+    let btc_backend = state.bitcoin_backend();
+    let liq_backend = state.liquid_backend().ok().map(|r| r.value);
 
     // A hardware-wallet profile can hold either a Bitcoin descriptor (wpkh/pkh/...)
     // or a Liquid CT descriptor (ct(...)) — a Liquid-only entry. The CT case has no
@@ -51,16 +56,17 @@ pub fn open_wallet(state: &mut AppState, wallet_id: &str) -> Result<(), String> 
     // Build Bitcoin WalletManager from profile. `None` = this profile has no BTC
     // wallet (e.g. a Liquid-only HW entry); only `Some(Err)` is a real failure.
     let btc_result: Option<Result<WalletManager, String>> = match &entry.profile {
-        WalletProfile::Software { mnemonic } => {
-            Some(WalletManager::new(&data_dir, mnemonic).map_err(|e| e.to_string()))
-        }
+        WalletProfile::Software { mnemonic } => Some(
+            WalletManager::new_on(&btc_backend, &data_dir, mnemonic).map_err(|e| e.to_string()),
+        ),
         WalletProfile::HardwareWallet { .. } if hw_liquid_desc.is_some() => None,
         WalletProfile::HardwareWallet {
             receive_descriptor,
             change_descriptor,
             ..
         } => Some(
-            WalletManager::from_descriptors(
+            WalletManager::from_descriptors_on(
+                &btc_backend,
                 &data_dir,
                 receive_descriptor,
                 change_descriptor,
@@ -73,8 +79,13 @@ pub fn open_wallet(state: &mut AppState, wallet_id: &str) -> Result<(), String> 
             .map_err(|e| e.to_string()),
         ),
         WalletProfile::Multisig { .. } | WalletProfile::Policy { .. } => Some(
-            WalletManager::from_multisig_profile(&data_dir, &entry.profile, wallet_id)
-                .map_err(|e| e.to_string()),
+            WalletManager::from_multisig_profile_on(
+                &btc_backend,
+                &data_dir,
+                &entry.profile,
+                wallet_id,
+            )
+            .map_err(|e| e.to_string()),
         ),
     };
 
@@ -176,6 +187,10 @@ pub fn open_wallet(state: &mut AppState, wallet_id: &str) -> Result<(), String> 
         if let Some(e) = btc_init_err {
             return Err(format!("Failed to open Bitcoin wallet: {e}"));
         }
+    }
+
+    if let (Some(liq), Some(backend)) = (state.liquid.as_mut(), liq_backend) {
+        liq.set_chain_backend(backend);
     }
 
     state.active_wallet_id = Some(wallet_id.to_string());

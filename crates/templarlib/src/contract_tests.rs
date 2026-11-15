@@ -2061,6 +2061,313 @@ fn regtest_node_sync_and_send_end_to_end() {
     );
 }
 
+// ── Test server (Templar testlab profile) ──────────────────────────
+
+const LAB_POLICY: &str = "b0b2bef620ac742b2399a0085bc84e4860ae2c65b5375e3b94399debec69aa6b";
+const LAB_GENESIS: &str = "d51392db10c135e2e5f7bcfeab36e859ca4e69d6f76439ec0ebcb0a8da7be248";
+
+/// A version-1 `/api/config` like a local testlab's.
+fn lab_config(instance: &str) -> Value {
+    json!({
+        "version": 1,
+        "name": "Contract lab",
+        "orderbook_url": "http://127.0.0.1:3210",
+        "networks": {
+            "liquid-regtest": {
+                "instance_id": instance,
+                "policy_asset": LAB_POLICY,
+                "genesis_hash": LAB_GENESIS,
+                "liquid_electrum_url": "tcp://127.0.0.1:19061",
+                "bitcoin_network": "regtest",
+                "bitcoin_electrum_url": "tcp://127.0.0.1:19060",
+                "bitcoin_esplora_url": "http://127.0.0.1:19070",
+                "faucet_url": "http://127.0.0.1:8096/api/faucet",
+                "peg": {"provider": "native", "pegin_confirmations": 2,
+                        "pegout_confirmations": 2, "pegout_max_sat": 100000000}
+            },
+            "liquid-testnet": {"faucet_url": "https://liquidtestnet.com",
+                               "peg": {"provider": "sideswap"}}
+        }
+    })
+}
+
+/// A loopback HTTP server answering every request with `(status, body)`
+/// from the shared slot — offline, no external host. Returns its base URL.
+fn serve(answer: std::sync::Arc<std::sync::Mutex<(u16, String)>>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 4096];
+            let mut req = Vec::new();
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let (status, body) = answer.lock().unwrap().clone();
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    url
+}
+
+fn lab_server(instance: &str) -> (String, std::sync::Arc<std::sync::Mutex<(u16, String)>>) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new((
+        200,
+        lab_config(instance).to_string(),
+    )));
+    (serve(slot.clone()), slot)
+}
+
+fn assert_test_server_shape(context: &str, v: &Value) {
+    assert_keys(
+        context,
+        v,
+        &["configured", "profile", "check", "applied", "active"],
+    );
+    let active = &v["active"];
+    assert_keys(
+        context,
+        active,
+        &[
+            "liquid_network",
+            "env_locked",
+            "orderbook",
+            "liquid",
+            "bitcoin",
+        ],
+    );
+    for route in ["origin", "book", "markets", "publish", "atomic_swaps"] {
+        assert_keys(context, &active["orderbook"][route], &["url", "source"]);
+    }
+    assert_keys(
+        context,
+        &active["liquid"],
+        &[
+            "network",
+            "policy_asset",
+            "genesis_hash",
+            "params_source",
+            "backend",
+            "backend_description",
+            "backend_source",
+        ],
+    );
+    assert_keys(
+        context,
+        &active["bitcoin"],
+        &["network", "electrum_url", "source"],
+    );
+}
+
+#[test]
+fn get_test_server_without_a_lab_reports_the_defaults() {
+    let mut env = TestEnv::new();
+    let v = env.ok("get_test_server", json!({}));
+    assert_test_server_shape("get_test_server", &v);
+    assert_eq!(v["configured"], json!(false));
+    assert!(v["profile"].is_null() && v["check"].is_null() && v["applied"].is_null());
+    let a = &v["active"];
+    assert_eq!(a["liquid_network"], json!("liquid-testnet"));
+    assert_eq!(
+        a["orderbook"]["publish"]["url"],
+        json!("http://127.0.0.1:3210/api/offers")
+    );
+    assert_eq!(a["orderbook"]["book"]["source"], json!("default"));
+    assert_eq!(a["bitcoin"]["network"], json!("bitcoin-testnet"));
+    assert_eq!(a["liquid"]["backend"], json!("electrum"));
+    // `check` without a lab asks nothing.
+    let v = env.ok("get_test_server", json!({ "check": true }));
+    assert!(v["check"].is_null());
+    let net = env.ok("get_liquid_network", json!({}));
+    assert!(net["test_server"].is_null());
+    assert_eq!(net["backend_source"], json!("default"));
+}
+
+#[test]
+fn joining_a_lab_applies_its_regtest_and_order_book_only() {
+    let mut env = TestEnv::new();
+    let (url, slot) = lab_server(&"11".repeat(32));
+
+    let v = env.ok("set_test_server", json!({ "url": format!("{url}/") }));
+    assert_test_server_shape("set_test_server", &v);
+    assert_eq!(v["configured"], json!(true));
+    let p = &v["profile"];
+    assert_keys(
+        "profile",
+        p,
+        &[
+            "base_url",
+            "name",
+            "version",
+            "fetched_at",
+            "orderbook_url",
+            "regtest",
+            "testnet",
+        ],
+    );
+    assert_eq!(p["base_url"], json!(url));
+    assert_keys(
+        "profile.regtest",
+        &p["regtest"],
+        &[
+            "instance_id",
+            "policy_asset",
+            "genesis_hash",
+            "liquid_electrum_url",
+            "bitcoin_network",
+            "bitcoin_electrum_url",
+            "bitcoin_esplora_url",
+            "faucet_url",
+            "peg",
+        ],
+    );
+    assert_eq!(v["check"]["reachable"], json!(true));
+    assert_eq!(v["applied"]["network_switched"], json!(true));
+    assert_eq!(v["applied"]["liquid_network"], json!("liquid-regtest"));
+
+    let a = &v["active"];
+    assert_eq!(a["liquid"]["policy_asset"], json!(LAB_POLICY));
+    assert_eq!(a["liquid"]["genesis_hash"], json!(LAB_GENESIS));
+    assert_eq!(a["liquid"]["params_source"], json!("profile"));
+    assert_eq!(
+        a["liquid"]["backend_description"],
+        json!("electrum tcp://127.0.0.1:19061")
+    );
+    assert_eq!(a["liquid"]["backend_source"], json!("profile"));
+    assert_eq!(a["bitcoin"]["network"], json!("bitcoin-regtest"));
+    assert_eq!(a["bitcoin"]["electrum_url"], json!("tcp://127.0.0.1:19060"));
+    assert_eq!(a["orderbook"]["markets"]["source"], json!("profile"));
+    let net = env.ok("get_liquid_network", json!({}));
+    assert_eq!(net["network"], json!("liquid-regtest"));
+    assert_eq!(net["test_server"], json!(url));
+    assert_eq!(net["backend_source"], json!("profile"));
+
+    // Persisted for the next launch.
+    let cfg = std::fs::read_to_string(env.dir.join("templar_wallet.json")).unwrap();
+    assert!(
+        cfg.contains("test_server") && cfg.contains(LAB_POLICY),
+        "{cfg}"
+    );
+
+    // A wallet opened now runs Bitcoin regtest (offline: just an address).
+    let id = env.create_test_wallet();
+    let addr = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "BTC" }),
+    );
+    let addr = addr["address"].as_str().unwrap();
+    assert!(addr.starts_with("bcrt1"), "{addr}");
+    // ...with its database apart from testnet's.
+    assert!(env.dir.join("bitcoin-regtest").is_dir());
+
+    // With a lab joined, regtest means the lab's regtest.
+    let err = env.err(
+        "set_liquid_network",
+        json!({ "network": "regtest", "policy_asset": "aa".repeat(32) }),
+    );
+    assert!(err.contains("Clear the test server"), "{err}");
+    // Testnet stays reachable, and stays exactly testnet.
+    let t = env.ok("set_liquid_network", json!({ "network": "testnet" }));
+    assert_eq!(t["backend"], json!("electrum"));
+    assert_eq!(t["backend_source"], json!("default"));
+    let v = env.ok("get_test_server", json!({}));
+    assert_eq!(v["active"]["bitcoin"]["network"], json!("bitcoin-testnet"));
+    assert_eq!(v["active"]["orderbook"]["book"]["source"], json!("profile"));
+    env.ok("set_liquid_network", json!({ "network": "regtest" }));
+
+    // The lab resets its chains: `check` sees it, `set` applies it and
+    // drops the regtest caches (never testnet data).
+    std::fs::create_dir_all(env.dir.join("liquid-regtest/enc_cache")).unwrap();
+    std::fs::create_dir_all(env.dir.join("liquid-testnet/enc_cache")).unwrap();
+    slot.lock().unwrap().1 = lab_config(&"22".repeat(32)).to_string();
+    let v = env.ok("get_test_server", json!({ "check": true }));
+    assert_eq!(v["check"]["stale"], json!(true));
+    assert_eq!(v["check"]["server_instance_id"], json!("22".repeat(32)));
+    let v = env.ok("set_test_server", json!({ "url": url }));
+    assert_eq!(v["applied"]["regtest_cache_reset"], json!(true));
+    assert_eq!(v["applied"]["network_switched"], json!(false));
+    assert!(!env.dir.join("liquid-regtest").exists());
+    assert!(!env.dir.join("bitcoin-regtest").exists());
+    assert!(env.dir.join("liquid-testnet").exists());
+    let v = env.ok("get_test_server", json!({ "check": true }));
+    assert_eq!(v["check"]["stale"], json!(false));
+
+    // An unreachable lab: the stored profile stays in use.
+    *slot.lock().unwrap() = (503, "{}".to_string());
+    let v = env.ok("get_test_server", json!({ "check": true }));
+    assert_eq!(v["check"]["reachable"], json!(false));
+    assert!(v["check"]["error"].as_str().unwrap().contains("HTTP 503"));
+    assert_eq!(v["configured"], json!(true));
+
+    // Leaving the lab returns to testnet and drops its regtest caches.
+    let v = env.ok("clear_test_server", json!({}));
+    assert_test_server_shape("clear_test_server", &v);
+    assert_eq!(v["configured"], json!(false));
+    assert_eq!(v["applied"]["liquid_network"], json!("liquid-testnet"));
+    let cfg = std::fs::read_to_string(env.dir.join("templar_wallet.json")).unwrap();
+    assert!(!cfg.contains("test_server"), "{cfg}");
+}
+
+#[test]
+fn set_test_server_refuses_bad_servers_and_applies_nothing() {
+    let mut env = TestEnv::new();
+    let cases: Vec<(Value, &str)> = vec![
+        (
+            json!({ "url": "ftp://127.0.0.1:1" }),
+            "Invalid test server URL",
+        ),
+        (
+            json!({ "url": "http://u:secret@127.0.0.1:1" }),
+            "Invalid test server URL",
+        ),
+    ];
+    for (params, want) in cases {
+        let err = env.err("set_test_server", params);
+        assert!(err.contains(want), "{err}");
+        assert!(!err.contains("secret"), "{err}");
+    }
+    let mut bad = lab_config(&"11".repeat(32));
+    bad["version"] = json!(2);
+    let (url, slot) = lab_server(&"11".repeat(32));
+    slot.lock().unwrap().1 = bad.to_string();
+    let err = env.err("set_test_server", json!({ "url": url }));
+    assert!(err.contains("needs a newer wallet"), "{err}");
+
+    let mut mainnet = lab_config(&"11".repeat(32));
+    mainnet["networks"]["liquid-regtest"]["policy_asset"] =
+        json!(templar_core::LBTC_MAINNET_ASSET_ID);
+    slot.lock().unwrap().1 = mainnet.to_string();
+    let err = env.err("set_test_server", json!({ "url": url }));
+    assert!(err.contains("mainnet"), "{err}");
+
+    *slot.lock().unwrap() = (200, "x".repeat(70 * 1024));
+    let err = env.err("set_test_server", json!({ "url": url }));
+    assert!(err.contains("larger than"), "{err}");
+
+    // Nothing listens on a port just freed.
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let err = env.err("set_test_server", json!({ "url": closed }));
+    assert!(err.contains("Cannot reach the test server"), "{err}");
+
+    let v = env.ok("get_test_server", json!({}));
+    assert_eq!(v["configured"], json!(false));
+    assert_eq!(v["active"]["liquid_network"], json!("liquid-testnet"));
+    assert!(!env.dir.join("templar_wallet.json").exists());
+}
+
 // ── Liquid co-signing guard ────────────────────────────────────────
 
 /// A testnet PSET for the test mnemonic's `m/2121'/1'/0'/0/0` key (a loan

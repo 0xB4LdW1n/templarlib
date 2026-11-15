@@ -12,11 +12,30 @@ const CURRENT_DATA_DIR: &str = "templar_wallet";
 /// lines, `#` comments; only `data_dir` is read.
 const INSTALL_CONF_FILE: &str = "install.conf";
 
+/// The test server's `instance_id` the regtest chain data under the data
+/// directory was synced against (one line of hex). Absent = none.
+const REGTEST_INSTANCE_FILE: &str = "regtest_instance";
+
+/// Chain caches of the regtest side under the data directory: LWK's
+/// (`<data_dir>/liquid-regtest/enc_cache/…`) and BDK's
+/// (`BitcoinBackend::data_root`). Caches only — keys and the wallet registry
+/// live elsewhere and are never touched.
+const REGTEST_CACHE_DIRS: &[&str] = &["liquid-regtest", "bitcoin-regtest"];
+
 use templar_core::registry::vault_is_initialized;
 use templar_core::{
-    AppConfig, AssetInfo, AssetRegistry, CoinChain, LiquidNetwork, LiquidWalletManager, Vault,
+    AppConfig, AssetInfo, AssetRegistry, BitcoinBackend, CoinChain, Endpoints, LiquidBackend,
+    LiquidChain, LiquidNetwork, LiquidWalletManager, Resolved, TestServerProfile, Vault,
     WalletManager, WalletRegistry,
 };
+
+/// What applying (or clearing) a test-server profile changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TestServerApplied {
+    pub network_switched: bool,
+    pub wallet_closed: bool,
+    pub regtest_cache_reset: bool,
+}
 
 /// Outcome of the last sync attempt for one chain. The UI must never claim
 /// "synced" when it isn't, so the truth is recorded per chain instead of one
@@ -61,6 +80,10 @@ pub struct AppState {
     /// True when the network came from the environment and the setting
     /// screen must not offer to change it.
     pub liquid_network_env_locked: bool,
+    /// The Templar test server the wallet joined, persisted in `AppConfig`.
+    /// Applied through [`AppState::endpoints`]: the order book, and the
+    /// regtest side (parameters, Liquid Electrum, Bitcoin regtest) only.
+    pub test_server: Option<TestServerProfile>,
     /// Where the app config (`AppConfig`) is persisted. The real `~/.config`
     /// path in a normal run; a file inside the data dir under a
     /// `TEMPLAR_DATA_DIR` override or in the contract tests, so an ephemeral
@@ -236,6 +259,7 @@ impl AppState {
                     }),
                     last_wallet_id: None,
                     liquid_network: None,
+                    test_server: None,
                 });
                 // Written back on the first run of an install that named its
                 // own folder — after which the app no longer depends on the
@@ -250,18 +274,27 @@ impl AppState {
         // Liquid network: the environment wins (a dev running against a
         // regtest node), then the setting saved in *this session's* config
         // (the override dir's own under a scratch run), then testnet.
-        let saved_network = AppConfig::load_from(&config_path).and_then(|c| c.liquid_network);
-        let (liquid_network, liquid_network_env_locked) = match LiquidNetwork::from_env_override() {
+        // A regtest's parameters then come from `Endpoints::regtest_network`
+        // (env policy asset, then the test server, then the saved setting).
+        let saved_cfg = AppConfig::load_from(&config_path);
+        let saved_network = saved_cfg.as_ref().and_then(|c| c.liquid_network.clone());
+        let test_server = saved_cfg.and_then(|c| c.test_server);
+        let env_network = match LiquidNetwork::from_env_override() {
             Ok(Some(n)) => {
                 eprintln!("[templarlib] TEMPLAR_LIQUID_NETWORK override → {n}");
-                (n, true)
+                Some(n)
             }
-            Ok(None) => (saved_network.unwrap_or_default(), false),
+            Ok(None) => None,
             Err(e) => {
                 eprintln!("[templarlib] {e}; using the saved Liquid network");
-                (saved_network.unwrap_or_default(), false)
+                None
             }
         };
+        let liquid_network_env_locked = env_network.is_some();
+        let liquid_network = Self::resolve_liquid_network(
+            env_network.or(saved_network).as_ref(),
+            test_server.as_ref(),
+        );
         // HWI needs the venv's `hwi` binary (and, for the Linux pyenv setup, its
         // shared libs) findable. When launched from Flutter the process inherits
         // no venv activation, so resolve per-platform once and hand the result
@@ -309,19 +342,24 @@ impl AppState {
         let asset_registry = Self::asset_registry_for(&liquid_network);
 
         eprintln!(
-            "[templarlib] Initialized. data_dir={:?}, wallets={}, liquid={}",
+            "[templarlib] Initialized. data_dir={:?}, wallets={}, liquid={}, test server={}",
             data_dir,
             registry.len(),
-            liquid_network
+            liquid_network,
+            test_server
+                .as_ref()
+                .map(|p| p.base_url.as_str())
+                .unwrap_or("none")
         );
 
-        Self {
+        let mut state = Self {
             data_dir,
             persisted_data_dir,
             registry,
             asset_registry,
             liquid_network,
             liquid_network_env_locked,
+            test_server,
             config_path,
             active_wallet_id: None,
             bitcoin: None,
@@ -334,7 +372,182 @@ impl AppState {
             verify_failures: 0,
             verify_lockout_until: None,
             _instance_lock: instance_lock,
+        };
+        // A profile refreshed by a run that crashed before dropping the old
+        // chain's caches: finish the job. Never with another instance's data.
+        if state.startup_error.is_none() {
+            state.reconcile_regtest_cache();
         }
+        state
+    }
+
+    /// The Liquid network for a chosen one (`chosen`: the environment's, else
+    /// the saved setting; `None` = testnet): a regtest takes its parameters
+    /// from [`Endpoints::regtest_network`].
+    fn resolve_liquid_network(
+        chosen: Option<&LiquidNetwork>,
+        profile: Option<&TestServerProfile>,
+    ) -> LiquidNetwork {
+        match chosen {
+            Some(n) if n.is_regtest() => Endpoints::new(profile).regtest_network(Some(n)).value,
+            Some(n) => n.clone(),
+            None => LiquidNetwork::testnet(),
+        }
+    }
+
+    /// The resolver over this session's test-server profile: every URL and
+    /// backend the engine talks to comes from here.
+    pub fn endpoints(&self) -> Endpoints<'_> {
+        Endpoints::new(self.test_server.as_ref())
+    }
+
+    /// The chain backend of the active Liquid network, and its source.
+    pub fn liquid_backend(&self) -> Result<Resolved<LiquidBackend>, String> {
+        self.endpoints()
+            .liquid_backend(&self.liquid_network)
+            .map_err(|e| e.to_string())
+    }
+
+    /// A chain handle on the active Liquid network (offline to build).
+    pub fn liquid_chain(&self) -> Result<LiquidChain, String> {
+        LiquidChain::new(self.liquid_network.clone(), self.liquid_backend()?.value)
+            .map_err(|e| e.to_string())
+    }
+
+    /// The Bitcoin network and Electrum server that go with the active
+    /// Liquid network.
+    pub fn bitcoin_backend(&self) -> BitcoinBackend {
+        self.endpoints().bitcoin_backend(&self.liquid_network).value
+    }
+
+    /// Loads this session's config (or seeds one), applies `change` and
+    /// saves it. Seeds with the folder the config *should* name, never a
+    /// `TEMPLAR_DATA_DIR` scratch folder.
+    fn update_config(&self, change: impl FnOnce(&mut AppConfig)) -> Result<(), String> {
+        let mut cfg = AppConfig::load_from(&self.config_path).unwrap_or_else(|| AppConfig {
+            data_dir: self.persisted_data_dir.clone(),
+            last_wallet_id: None,
+            liquid_network: None,
+            test_server: None,
+        });
+        change(&mut cfg);
+        cfg.save_to(&self.config_path)
+            .map_err(|e| format!("Could not save the settings: {e}"))
+    }
+
+    /// Stores (`Some`) or forgets (`None`) the test-server profile and
+    /// applies it. Joining switches the Liquid network to the lab's regtest;
+    /// leaving a lab while on regtest switches back to testnet (the lab's
+    /// regtest cannot be reached without it). A network fixed by
+    /// `TEMPLAR_LIQUID_NETWORK` stays, with the profile's parameters when it
+    /// is regtest. The open wallet is always closed — its managers were built
+    /// on the old backends — and the regtest chain caches are dropped when
+    /// the lab's chain identity changed.
+    pub fn apply_test_server(
+        &mut self,
+        profile: Option<TestServerProfile>,
+    ) -> Result<TestServerApplied, String> {
+        let joining = profile.is_some();
+        let target = if self.liquid_network_env_locked {
+            Some(self.liquid_network.clone())
+        } else if joining {
+            Some(LiquidNetwork::regtest_default())
+        } else if self.liquid_network.is_regtest() && self.test_server.is_some() {
+            None
+        } else {
+            Some(self.liquid_network.clone())
+        };
+        let network = Self::resolve_liquid_network(target.as_ref(), profile.as_ref());
+        // Persist first, as `set_liquid_network` does.
+        let locked = self.liquid_network_env_locked;
+        self.update_config(|cfg| {
+            cfg.test_server = profile.clone();
+            if !locked {
+                cfg.liquid_network = network.is_regtest().then(|| network.clone());
+            }
+        })?;
+
+        let wallet_closed = self.active_wallet_id.is_some();
+        self.close_active_wallet();
+        let network_switched = network != self.liquid_network;
+        self.test_server = profile;
+        self.liquid_network = network;
+        self.asset_registry = Self::asset_registry_for(&self.liquid_network);
+        let regtest_cache_reset = self.reconcile_regtest_cache();
+        eprintln!(
+            "[templarlib] test server → {}; Liquid network {}",
+            self.test_server
+                .as_ref()
+                .map(|p| p.base_url.as_str())
+                .unwrap_or("none"),
+            self.liquid_network
+        );
+        Ok(TestServerApplied {
+            network_switched,
+            wallet_closed,
+            regtest_cache_reset,
+        })
+    }
+
+    /// Drops the regtest chain caches (LWK and BDK scan state, regtest swap
+    /// offers) when the test server's `instance_id` differs from the one
+    /// they were synced against — the lab's chains were reset, or the wallet
+    /// joined or left a lab. Never touches keys, the registry or testnet
+    /// data. Returns whether anything was dropped.
+    pub fn reconcile_regtest_cache(&mut self) -> bool {
+        let marker = self.data_dir.join(REGTEST_INSTANCE_FILE);
+        let have = std::fs::read_to_string(&marker)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let want = self
+            .test_server
+            .as_ref()
+            .map(|p| p.regtest.instance_id.clone());
+        if have == want {
+            return false;
+        }
+        // An open regtest wallet holds those caches (and its sled lock).
+        if self.liquid_network.is_regtest() && self.active_wallet_id.is_some() {
+            self.close_active_wallet();
+        }
+        let mut dropped = false;
+        for dir in REGTEST_CACHE_DIRS {
+            let path = self.data_dir.join(dir);
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    eprintln!(
+                        "[templarlib] dropped regtest chain cache {}",
+                        path.display()
+                    );
+                    dropped = true;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => eprintln!("[templarlib] could not drop {}: {e}", path.display()),
+            }
+        }
+        match crate::handlers::swaps::drop_offers_on(&self.data_dir, "liquid-regtest") {
+            Ok(n) if n > 0 => {
+                eprintln!("[templarlib] dropped {n} regtest swap offer(s)");
+                dropped = true;
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[templarlib] could not drop regtest swap offers: {e}"),
+        }
+        let written = match &want {
+            Some(id) => std::fs::write(&marker, format!("{id}\n")),
+            None => std::fs::remove_file(&marker).or_else(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }),
+        };
+        if let Err(e) = written {
+            eprintln!("[templarlib] could not record the regtest instance: {e}");
+        }
+        dropped
     }
 
     /// Takes the per-data-dir exclusive lock, or explains who has it.
@@ -437,18 +650,10 @@ impl AppState {
         // No config yet: seed it with the folder the config *should* name,
         // not the live one — under a TEMPLAR_DATA_DIR override the live one
         // is a scratch folder that must never be persisted.
-        let mut cfg = AppConfig::load_from(&self.config_path).unwrap_or_else(|| AppConfig {
-            data_dir: self.persisted_data_dir.clone(),
-            last_wallet_id: None,
-            liquid_network: None,
-        });
-        cfg.liquid_network = if network.is_regtest() {
-            Some(network.clone())
-        } else {
-            None
-        };
-        cfg.save_to(&self.config_path)
-            .map_err(|e| format!("Could not save the network setting: {e}"))?;
+        self.update_config(|cfg| {
+            cfg.liquid_network = network.is_regtest().then(|| network.clone());
+        })
+        .map_err(|e| format!("Could not save the network setting: {e}"))?;
 
         if network != self.liquid_network {
             self.close_active_wallet();
@@ -508,6 +713,7 @@ impl AppState {
             asset_registry: AssetRegistry::with_defaults(),
             liquid_network: LiquidNetwork::testnet(),
             liquid_network_env_locked: false,
+            test_server: None,
             active_wallet_id: None,
             bitcoin: None,
             liquid: None,
