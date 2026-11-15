@@ -19,8 +19,8 @@ with 0, any release may change the method contract.
   clippy with `-D warnings`, tests, the build with the optional features
   off, the examples, `cargo deny` and `cargo audit`, on every push to
   `main`, every pull request and once a day. The advisories accepted for
-  the old TLS stacks of the BDK 0.30 / LWK 0.9 Electrum clients are listed
-  in [SECURITY.md](SECURITY.md#known-advisories-accepted).
+  the old TLS stack of the BDK 0.30 Electrum client are listed in
+  [SECURITY.md](SECURITY.md#known-advisories-accepted).
 - Documentation: [README](README.md), [CLAUDE.md](CLAUDE.md),
   [architecture](docs/ARCHITECTURE.md), [method reference](docs/API.md),
   [integration guide](docs/INTEGRATION.md) with a runnable offline example
@@ -59,6 +59,29 @@ with 0, any release may change the method contract.
   `templarlib`: `TemplarLib::call(method, params)` with the stable
   `{"ok": …}` / `{"err": "…"}` envelope, `METHODS`, and the DTOs in
   `templarlib::types`, shared by every host.
+- Liquid runs on LWK 0.20 (`lwk_wollet`, `lwk_common`, `lwk_signer`,
+  `lwk_jade`), up from 0.9, with `elements` 0.27, `elements-miniscript` 0.5
+  and `electrum-client` 0.25. `lwk_wollet` keeps the features 0.9 had on by
+  default. The Liquid Electrum connection now runs on rustls 0.23 and
+  webpki-roots 1.x, so the old-TLS advisories that remain are BDK's alone
+  ([SECURITY.md](SECURITY.md#known-advisories-accepted)). No method,
+  response key or error tag changed, and the LiquiDEX v0 proposal format is
+  unchanged. What a host can see differently comes from LWK:
+  - `inspect_pset`, and the Liquid signing routes that inspect first,
+    answer with an error when an output's blind proofs do not match its
+    commitments, where the output used to come back flagged `unverified`;
+    a PSET with no fee output, or several, is inspected (the fee is their
+    sum) instead of refused; a recipient paid in the clear carries its
+    address; `net_change` leaves out assets whose net change is zero.
+  - Transaction history and `list_received_external_addresses` also count
+    outputs paid to the wallet's scripts in the clear.
+  - LWK selects the L-BTC inputs of a payment instead of spending them all.
+  - TLS Electrum connections on Liquid always validate the server's name.
+- Rust API of `templar-core`: `LiquidNetwork::elements`, `from_elements`,
+  `jade_network` and `LiquidWalletManager::elements_network` use LWK's
+  `Network` (`TestnetLiquid`, `CustomElements`) in place of the removed
+  `ElementsNetwork`, and the `elements` types it hands out (`Pset`,
+  `Transaction`, …) are `elements` 0.27's.
 
 ## [0.1.0] — 2026-09-24
 
