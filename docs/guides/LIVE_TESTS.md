@@ -1,9 +1,9 @@
 # Running the ignored tests
 
-`cargo test --workspace` is offline and is the gate. Seven tests are
+`cargo test --workspace` is offline and is the gate. Eight tests are
 `#[ignore]`d because they need something the gate does not have: a local
-Elements regtest node, a running Templar Protocol site, a public Electrum
-server, or time. This guide says what each one needs and how to run it.
+Elements regtest node, a running Templar testlab, a running Templar
+Protocol site, a public Electrum server, or time. This guide says what each one needs and how to run it.
 
 List them:
 
@@ -41,6 +41,43 @@ cargo test -p templarlib liquid_multisig_round_trip_on_regtest -- --ignored --no
 Each test uses throwaway data directories; nothing of yours is touched.
 `cargo run -p templar-lend-ops -- down` stops the node, `reset` deletes the
 chain.
+
+## Against a running Templar testlab
+
+| Test | Crate | What it proves |
+|---|---|---|
+| `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC, an issued asset and regtest BTC from its public faucet; A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
+
+It needs the Templar testlab (the `templar-testlab` repository) running
+with its order book, on loopback with no admin password (the test mines
+through the lab's admin API, `POST /admin/api/mine`), and one asset issued
+by the lab:
+
+```bash
+# in templar-testlab, with [orderbook] binary = a built templar-orderbook
+# (cargo build --release -p templar-orderbook in templar-protocol)
+./target/release/templar-testlab up
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"name":"Live Swap Token","ticker":"LST","precision":2,"amount":100000}' \
+  http://127.0.0.1:8096/admin/api/assets
+```
+
+Then, here:
+
+```bash
+cargo test -p templarlib live_testlab -- --ignored --nocapture
+```
+
+| Variable | Effect |
+|---|---|
+| `TEMPLAR_LIVE_TESTLAB_URL` | the lab's base URL; default `http://127.0.0.1:8096` |
+| `TEMPLAR_LIVE_TESTLAB_ASSET` | the asset A offers (one the lab's faucet can send); default the newest in the lab's `GET /api/assets` |
+
+One run takes about a minute (most of it waiting for the book's watcher,
+which runs every 60 s) and makes four faucet requests; the lab allows ten
+per client per hour (`[faucet] per_ip_per_hour`), so restart the lab's
+server, or wait, after the second run in an hour. Each run uses throwaway
+data directories; `templar-testlab down` stops the stack.
 
 ## Against a running Templar Protocol site
 

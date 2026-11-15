@@ -2368,6 +2368,370 @@ fn set_test_server_refuses_bad_servers_and_applies_nothing() {
     assert!(!env.dir.join("templar_wallet.json").exists());
 }
 
+// ── Live: LiquiDEX on a Templar testlab ────────────────────────────
+
+/// One side of the live swap: an engine on its own data directory, joined
+/// to the lab, with one fresh software wallet open.
+struct LabWallet {
+    env: TestEnv,
+    id: String,
+}
+
+impl LabWallet {
+    fn join(lab: &str, name: &str) -> Self {
+        let mut env = TestEnv::new();
+        let joined = env.ok("set_test_server", json!({ "url": lab }));
+        assert_eq!(joined["active"]["liquid_network"], json!("liquid-regtest"));
+        let words = env.ok("generate_mnemonic", json!({ "word_count": 12 }));
+        let mnemonic = words
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let created = env.ok(
+            "create_wallet",
+            json!({ "name": name, "mnemonic": mnemonic, "liquid": true }),
+        );
+        let id = created["id"].as_str().unwrap().to_string();
+        Self { env, id }
+    }
+
+    fn ok(&mut self, method: &str, mut params: Value) -> Value {
+        if params.get("wallet_id").is_none() && params.is_object() {
+            params["wallet_id"] = json!(self.id);
+        }
+        self.env.ok(method, params)
+    }
+
+    fn err(&mut self, method: &str, mut params: Value) -> String {
+        if params.get("wallet_id").is_none() && params.is_object() {
+            params["wallet_id"] = json!(self.id);
+        }
+        self.env.err(method, params)
+    }
+
+    fn address(&mut self, asset: &str) -> String {
+        let a = self.ok(
+            "generate_receive_address",
+            json!({ "asset": asset, "fresh": true }),
+        );
+        a["address"].as_str().unwrap().to_string()
+    }
+
+    /// Syncs both chains; both must succeed.
+    fn sync(&mut self) {
+        let outcome = self.ok("sync_wallet", json!({}));
+        assert_eq!(outcome["liquid"], json!("ok"), "sync: {outcome}");
+        assert_eq!(outcome["btc"], json!("ok"), "sync: {outcome}");
+    }
+
+    /// Balance of `asset_id` (base units) after a sync; 0 when absent.
+    fn balance(&mut self, asset_id: &str) -> i64 {
+        self.sync();
+        let dash = self.ok("get_wallet_summary", json!({}));
+        dash["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["asset_id"] == json!(asset_id))
+            .map(|a| a["amount"].as_i64().unwrap())
+            .unwrap_or(0)
+    }
+
+    /// Syncs until `pred` holds on the balance of `asset_id` (Electrum
+    /// indexes a new block a moment after it is mined).
+    fn wait_balance(&mut self, asset_id: &str, what: &str, pred: impl Fn(i64) -> bool) -> i64 {
+        for _ in 0..30 {
+            let b = self.balance(asset_id);
+            if pred(b) {
+                return b;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        panic!("{what}: balance of {asset_id} never satisfied the check");
+    }
+}
+
+fn lab_http() -> reqwest::blocking::Client {
+    reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap()
+}
+
+fn lab_post(url: &str, body: Value) -> Value {
+    let resp = lab_http().post(url).json(&body).send().unwrap();
+    let status = resp.status();
+    let v: Value = resp.json().unwrap_or(Value::Null);
+    assert!(status.is_success(), "POST {url} → {status}: {v}");
+    v
+}
+
+fn lab_get(url: &str) -> Value {
+    lab_http().get(url).send().unwrap().json().unwrap()
+}
+
+/// LiquiDEX end to end on a running Templar testlab (and its order book),
+/// through nothing but the test-server profile: two fresh software
+/// wallets join the lab, get coins from its public faucet, A makes and
+/// publishes an offer, B finds it in `list_markets`, verifies it deep,
+/// previews and takes it, both balances move, the book's watcher closes it;
+/// then A makes a second offer and cancels it, and neither offer can be
+/// taken again. See docs/guides/LIVE_TESTS.md.
+#[test]
+#[ignore = "needs a running Templar testlab with its order book (TEMPLAR_LIVE_TESTLAB_URL)"]
+fn live_testlab_liquidex_make_publish_take_cancel() {
+    let lab = std::env::var("TEMPLAR_LIVE_TESTLAB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8096".to_string());
+    let lab = lab.trim_end_matches('/').to_string();
+    let config = lab_get(&format!("{lab}/api/config"));
+    let regtest = &config["networks"]["liquid-regtest"];
+    let lbtc = regtest["policy_asset"].as_str().unwrap().to_string();
+    let book = config["orderbook_url"].as_str().unwrap().to_string();
+    let faucet = regtest["faucet_url"].as_str().unwrap().to_string();
+    // The asset A offers: TEMPLAR_LIVE_TESTLAB_ASSET, else the lab's newest.
+    let asset = std::env::var("TEMPLAR_LIVE_TESTLAB_ASSET").unwrap_or_else(|_| {
+        let assets = lab_get(&format!("{lab}/api/assets"));
+        assets["assets"]
+            .as_array()
+            .unwrap()
+            .last()
+            .expect("the lab has issued an asset")["asset_id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    });
+    let mine = |n: u32| {
+        lab_post(
+            &format!("{lab}/admin/api/mine"),
+            json!({ "chain": "liquid", "blocks": n }),
+        );
+    };
+    let faucet_pay = |network: &str, address: &str, asset: &str, amount: &str| {
+        let r = lab_post(
+            &faucet,
+            json!({ "network": network, "address": address, "asset": asset, "amount": amount }),
+        );
+        eprintln!("[live] faucet {amount} {asset} → {address}: {}", r["txid"]);
+    };
+
+    let mut a = LabWallet::join(&lab, "Live maker");
+    let mut b = LabWallet::join(&lab, "Live taker");
+    let v = a.env.ok("get_test_server", json!({ "check": true }));
+    assert_eq!(v["check"]["stale"], json!(false), "{v}");
+    assert_eq!(v["active"]["liquid"]["policy_asset"], json!(lbtc));
+    assert_eq!(
+        v["active"]["orderbook"]["publish"]["url"],
+        json!(format!("{book}/api/offers"))
+    );
+
+    // Funding through the public faucet (it mines a block after each pay).
+    let a_lbtc_addr = a.address("LBTC");
+    let a_asset_addr = a.address("LBTC");
+    let b_lbtc_addr = b.address("LBTC");
+    let b_btc_addr = b.address("BTC");
+    assert!(a_lbtc_addr.starts_with("el1"), "{a_lbtc_addr}");
+    assert!(b_btc_addr.starts_with("bcrt1"), "{b_btc_addr}");
+    faucet_pay("liquid-regtest", &a_lbtc_addr, "lbtc", "0.1");
+    faucet_pay("liquid-regtest", &a_asset_addr, &asset, "1000");
+    faucet_pay("liquid-regtest", &b_lbtc_addr, "lbtc", "0.5");
+    faucet_pay("bitcoin-regtest", &b_btc_addr, "btc", "0.01");
+    a.wait_balance(&lbtc, "A funded", |x| x == 10_000_000);
+    let a_asset_start = a.wait_balance(&asset, "A asset", |x| x > 0);
+    b.wait_balance(&lbtc, "B funded", |x| x == 50_000_000);
+    // Bitcoin regtest through the lab's Electrum.
+    b.sync();
+    let dash = b.ok("get_wallet_summary", json!({}));
+    eprintln!("[live] B summary assets: {}", dash["assets"]);
+
+    // ── Make: an exact 500.00-unit coin, offered for 0.05 L-BTC ─────────
+    const OFFER: i64 = 50_000;
+    const PRICE: i64 = 5_000_000;
+    let prep = a.ok(
+        "swap_make_prepare",
+        json!({ "asset_id": asset, "amount_sats": OFFER }),
+    );
+    eprintln!("[live] make_prepare txid {prep}");
+    mine(1);
+    let utxo = {
+        let mut found = None;
+        for _ in 0..30 {
+            a.sync();
+            let utxos = a.ok("list_utxos", json!({ "chain": "liquid" }));
+            found = utxos.as_array().unwrap().iter().find_map(|u| {
+                (u["asset_id"] == json!(asset)
+                    && u["amount"] == json!(OFFER)
+                    && u["outpoint"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(prep.as_str().unwrap()))
+                .then(|| u["outpoint"].as_str().unwrap().to_string())
+            });
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        found.expect("the prepared coin")
+    };
+    let offer = a.ok(
+        "swap_make",
+        json!({ "utxo": utxo, "want_asset_id": lbtc, "want_amount_sats": PRICE }),
+    );
+    let proposal = offer["proposal_json"].as_str().unwrap().to_string();
+    let book_id = a.env.ok(
+        "swap_publish",
+        json!({ "proposal_json": proposal, "note": "live test" }),
+    );
+    eprintln!("[live] published as book offer {book_id}");
+    // The same proposal again is a duplicate.
+    let dup = a
+        .env
+        .err("swap_publish", json!({ "proposal_json": proposal }));
+    assert!(dup.starts_with("BOOK_DUPLICATE:"), "{dup}");
+
+    // ── Take ───────────────────────────────────────────────────────────
+    let markets = b.env.ok("list_markets", json!({}));
+    let row = markets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["proposal_json"] == json!(proposal))
+        .unwrap_or_else(|| panic!("offer not in list_markets: {markets}"))
+        .clone();
+    assert_eq!(row["verified"], json!(true), "{row}");
+    assert_eq!(row["takeable"], json!(true), "{row}");
+    let analysis = b.env.ok(
+        "swap_verify",
+        json!({ "proposal_json": proposal, "deep": true }),
+    );
+    assert_eq!(analysis["valid"], json!(true), "{analysis}");
+    assert_eq!(analysis["takeable"], json!(true), "{analysis}");
+    assert_eq!(analysis["network"], json!("regtest"), "{analysis}");
+    let preview = b.ok("swap_take_preview", json!({ "proposal_json": proposal }));
+    eprintln!("[live] take preview: {preview}");
+    assert_eq!(preview["you_receive"]["amount_sats"], json!(OFFER));
+    assert_eq!(preview["you_pay"]["amount_sats"], json!(PRICE));
+    let fee = preview["fee_sats"].as_i64().unwrap();
+    let take_txid = b.ok("swap_take", json!({ "proposal_json": proposal }));
+    eprintln!("[live] take txid {take_txid}");
+    mine(1);
+
+    b.wait_balance(&asset, "B received the asset", |x| x == OFFER);
+    let b_lbtc = b.wait_balance(&lbtc, "B paid", |x| x < 50_000_000);
+    assert!(
+        b_lbtc <= 50_000_000 - PRICE - fee + 10 && b_lbtc >= 50_000_000 - PRICE - fee - 10,
+        "B L-BTC {b_lbtc}, fee {fee}"
+    );
+    a.wait_balance(&asset, "A gave the asset", |x| x == a_asset_start - OFFER);
+    let a_lbtc = a.wait_balance(&lbtc, "A was paid", |x| x > 10_000_000);
+    assert!(a_lbtc > 10_000_000 + PRICE - 5_000, "A L-BTC {a_lbtc}");
+    eprintln!(
+        "[live] after the take: A L-BTC {a_lbtc}, asset {}; B L-BTC {b_lbtc}, asset {OFFER}; \
+         taker fee {fee}",
+        a_asset_start - OFFER
+    );
+
+    // A taken offer cannot be taken again.
+    let again = b.err("swap_take", json!({ "proposal_json": proposal }));
+    eprintln!("[live] retake refused: {again}");
+    assert!(again.contains("already spent"), "{again}");
+    let mine_offers = a.ok("list_my_offers", json!({}));
+    let first = mine_offers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["proposal_json"] == json!(proposal))
+        .unwrap();
+    assert_eq!(first["status"], json!("closed"), "{first}");
+
+    // ── Cancel: a second offer on the other half of the asset ──────────
+    let utxos = a.ok("list_utxos", json!({ "chain": "liquid" }));
+    let rest = utxos
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["asset_id"] == json!(asset))
+        .expect("A keeps some of the asset")["outpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let second = a.ok(
+        "swap_make",
+        json!({ "utxo": rest, "want_asset_id": lbtc, "want_amount_sats": PRICE }),
+    );
+    let second_json = second["proposal_json"].as_str().unwrap().to_string();
+    let second_id = a
+        .env
+        .ok("swap_publish", json!({ "proposal_json": second_json }));
+    eprintln!("[live] second offer published as {second_id}");
+    let cancel_txid = a.ok("swap_cancel", json!({ "offer_id": second["offer_id"] }));
+    eprintln!("[live] cancel txid {cancel_txid}");
+    mine(1);
+    a.wait_balance(&asset, "A still holds the cancelled coin", |x| {
+        x == a_asset_start - OFFER
+    });
+    let refused = b.err("swap_take", json!({ "proposal_json": second_json }));
+    eprintln!("[live] cancelled offer refused: {refused}");
+    assert!(refused.contains("already spent"), "{refused}");
+    let mine_offers = a.ok("list_my_offers", json!({}));
+    let cancelled = mine_offers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["offer_id"] == second["offer_id"])
+        .unwrap();
+    assert_eq!(cancelled["status"], json!("cancelled"));
+
+    // ── The book's watcher closes both offers (it runs every minute) ───
+    let status_of = |id: &Value| -> String {
+        let rows = lab_get(&format!("{book}/api/markets?network=liquid-regtest&all"));
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["source_id"] == *id
+                    && r["settlement"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("liquidex"))
+            })
+            .map(|r| r["status"].as_str().unwrap_or("").to_string())
+            .unwrap_or_default()
+    };
+    let mut closed = (String::new(), String::new());
+    for _ in 0..40 {
+        closed = (status_of(&book_id), status_of(&second_id));
+        if ![&closed.0, &closed.1]
+            .iter()
+            .any(|s| s.is_empty() || s.as_str() == "open")
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    eprintln!("[live] book statuses after the watcher: {closed:?}");
+    // `filled` or `cancelled` (on regtest the book cannot see who spent a
+    // coin, so a taken offer reads `cancelled` too).
+    for (what, status) in [("taken", &closed.0), ("cancelled", &closed.1)] {
+        assert!(
+            status == "filled" || status == "cancelled",
+            "{what} offer is {status:?} in the book"
+        );
+    }
+    let rows = b.env.ok("list_markets", json!({}));
+    assert!(
+        !rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["proposal_json"] == json!(proposal)
+                || r["proposal_json"] == json!(second_json)),
+        "closed offers must leave the open book"
+    );
+}
+
 // ── Liquid co-signing guard ────────────────────────────────────────
 
 /// A testnet PSET for the test mnemonic's `m/2121'/1'/0'/0/0` key (a loan
