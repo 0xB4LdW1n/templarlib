@@ -15,6 +15,7 @@ pub mod peg;
 pub mod policy;
 pub mod qr;
 pub mod registry;
+pub mod sideswap;
 pub mod test_server;
 pub mod types;
 pub mod vault;

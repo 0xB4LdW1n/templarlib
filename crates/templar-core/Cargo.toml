@@ -77,6 +77,11 @@ lwk_jade    = { version = "0.20", default-features = false, features = ["serial"
 # blinding-factor sampling. Same electrum-client build LWK already uses
 # (rustls, no openssl) — both crates are already in Cargo.lock.
 electrum-client = { version = "0.25", default-features = false, features = ["use-rustls-ring", "proxy"] }
+# SideSwap's peg API is JSON-RPC over a WebSocket (blocking, bounded, rustls
+# with the ring provider and webpki roots the tree already carries).
+tungstenite  = { version = "0.30", default-features = false, features = ["handshake", "__rustls-tls"] }
+rustls       = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 rand            = "0.8"
 
 [dev-dependencies]
