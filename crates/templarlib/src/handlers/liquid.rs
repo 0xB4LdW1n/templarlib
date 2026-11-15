@@ -155,6 +155,7 @@ pub fn network_info(state: &AppState) -> LiquidNetworkDto {
         Ok(r) => (r.value, r.source),
         Err(_) => (LiquidBackend::default_for(network), Source::Default),
     };
+    let (peg_provider, peg_unavailable_reason) = crate::handlers::peg::provider_info(state);
     LiquidNetworkDto {
         network: network.name().to_string(),
         short_name: network.short_name().to_string(),
@@ -165,6 +166,8 @@ pub fn network_info(state: &AppState) -> LiquidNetworkDto {
         regtest_default_policy_asset: REGTEST_DEFAULT_POLICY_ASSET.to_string(),
         backend_source: source.as_str().to_string(),
         test_server: state.test_server.as_ref().map(|p| p.base_url.clone()),
+        peg_provider,
+        peg_unavailable_reason,
     }
 }
 

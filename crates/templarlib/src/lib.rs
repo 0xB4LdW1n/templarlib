@@ -110,6 +110,8 @@ pub const METHODS: &[&str] = &[
     "peg_status",
     "peg_list",
     "peg_cancel",
+    "peg_fund",
+    "peg_claim",
     "list_swaps",
     "list_markets",
     "swap_verify",

@@ -1938,13 +1938,18 @@ fn regtest_refuses_public_services_but_keeps_local_swaps_available() {
     let id = env.create_test_wallet();
     env.ok("set_liquid_network", json!({ "network": "regtest" }));
 
+    // A plain regtest (no test server) has no peg provider; stored orders
+    // still list.
     let err = env.err(
         "peg_quote",
         json!({ "direction": "in", "amount_sats": 100_000 }),
     );
-    assert!(err.contains("not available on Liquid regtest"), "{err}");
-    let err = env.err("peg_list", json!({ "wallet_id": id }));
-    assert!(err.contains("not available on Liquid regtest"), "{err}");
+    assert!(
+        err.starts_with("PEG_UNAVAILABLE: a plain Liquid regtest"),
+        "{err}"
+    );
+    let listed = env.ok("peg_list", json!({ "wallet_id": id }));
+    assert_eq!(listed, json!([]));
     let err = env.err(
         "reregister_asset",
         json!({
@@ -2366,6 +2371,225 @@ fn set_test_server_refuses_bad_servers_and_applies_nothing() {
     assert_eq!(v["configured"], json!(false));
     assert_eq!(v["active"]["liquid_network"], json!("liquid-testnet"));
     assert!(!env.dir.join("templar_wallet.json").exists());
+}
+
+// ── Peg-in / peg-out ───────────────────────────────────────────────
+
+/// Every key of a peg order hosts read: the original ones and the
+/// additive native-peg ones.
+const PEG_ORDER_KEYS: &[&str] = &[
+    "order_id",
+    "wallet_id",
+    "direction",
+    "status",
+    "deposit_address",
+    "deposit_expected_sats",
+    "payout_address",
+    "payout_expected_sats",
+    "created_at",
+    "updated_at",
+    "eta_minutes",
+    "txid_deposit",
+    "txid_payout",
+    "simulated",
+    "status_history",
+    "provider",
+    "confirmations",
+    "confirmations_required",
+    "deposit_received_sats",
+    "txid_claim",
+    "valid_until_liquid_height",
+    "last_error",
+];
+
+const PEG_QUOTE_KEYS: &[&str] = &[
+    "direction",
+    "amount_sats",
+    "rate",
+    "service_fee_sats",
+    "network_fee_sats",
+    "receive_sats",
+    "min_sats",
+    "max_sats",
+    "eta_minutes",
+    "simulated",
+    "provider",
+    "confirmations_required",
+    "network_fee_included",
+];
+
+#[test]
+fn peg_without_a_provider_says_why_and_still_lists() {
+    let mut env = TestEnv::new();
+    let net = env.ok("get_liquid_network", json!({}));
+    assert_keys(
+        "get_liquid_network",
+        &net,
+        &["peg_provider", "peg_unavailable_reason"],
+    );
+    assert!(net["peg_provider"].is_null());
+    let why = net["peg_unavailable_reason"].as_str().unwrap();
+    assert!(why.starts_with("PEG_UNAVAILABLE: Liquid testnet"), "{why}");
+
+    let err = env.err(
+        "peg_quote",
+        json!({ "direction": "out", "amount_sats": 100_000 }),
+    );
+    assert!(err.starts_with("PEG_UNAVAILABLE:"), "{err}");
+    let id = env.create_test_wallet();
+    let err = env.err(
+        "peg_start",
+        json!({ "wallet_id": id, "direction": "in", "amount_sats": 100_000,
+                "payout_address": "x" }),
+    );
+    assert!(err.starts_with("PEG_UNAVAILABLE:"), "{err}");
+    assert_eq!(env.ok("peg_list", json!({ "wallet_id": id })), json!([]));
+    for method in ["peg_fund", "peg_claim", "peg_status", "peg_cancel"] {
+        let err = env.err(method, json!({ "order_id": "pg_nope" }));
+        assert!(err.contains("Unknown peg order"), "{method}: {err}");
+    }
+}
+
+/// A lab config whose chain servers are a port nothing listens on: the
+/// test stays offline and a chain read fails fast.
+fn offline_lab_server() -> String {
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let mut cfg = lab_config(&"33".repeat(32));
+    let reg = &mut cfg["networks"]["liquid-regtest"];
+    reg["liquid_electrum_url"] = json!(format!("tcp://127.0.0.1:{closed}"));
+    reg["bitcoin_electrum_url"] = json!(format!("tcp://127.0.0.1:{closed}"));
+    reg["bitcoin_esplora_url"] = json!(format!("http://127.0.0.1:{closed}"));
+    let slot = std::sync::Arc::new(std::sync::Mutex::new((200, cfg.to_string())));
+    serve(slot)
+}
+
+#[test]
+fn native_peg_orders_have_the_contract_shape() {
+    let mut env = TestEnv::new();
+    let lab = offline_lab_server();
+    env.ok("set_test_server", json!({ "url": lab }));
+    let net = env.ok("get_liquid_network", json!({}));
+    assert_eq!(net["peg_provider"], json!("native"));
+    assert!(net["peg_unavailable_reason"].is_null());
+
+    // Quotes: real terms, no service fee, the lab's limits.
+    let q = env.ok(
+        "peg_quote",
+        json!({ "direction": "in", "amount_sats": 100_000 }),
+    );
+    assert_keys("peg_quote", &q, PEG_QUOTE_KEYS);
+    assert_eq!(q["provider"], json!("native"));
+    assert_eq!(q["simulated"], json!(false));
+    assert_eq!(q["service_fee_sats"], json!(0));
+    assert_eq!(q["confirmations_required"], json!(2));
+    assert_eq!(q["network_fee_included"], json!(true));
+    let q = env.ok(
+        "peg_quote",
+        json!({ "direction": "out", "amount_sats": 100_000 }),
+    );
+    assert_eq!(q["receive_sats"], json!(100_000));
+    assert_eq!(q["max_sats"], json!(100_000_000));
+    let err = env.err(
+        "peg_quote",
+        json!({ "direction": "out", "amount_sats": 100_000_001 }),
+    );
+    assert!(err.contains("above the maximum of 100000000"), "{err}");
+    let err = env.err(
+        "peg_quote",
+        json!({ "direction": "in", "amount_sats": 9_999 }),
+    );
+    assert!(err.contains("below the minimum"), "{err}");
+
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Peg", "mnemonic": MNEMONIC, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let btc = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "BTC" }),
+    )["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let lbtc = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "LBTC" }),
+    )["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A peg-in pays out on Liquid; its address comes from the chain, which
+    // is unreachable here: nothing is stored.
+    let start = |dir: &str, payout: &str, amount: u64| {
+        json!({ "wallet_id": id, "direction": dir, "amount_sats": amount,
+                "payout_address": payout })
+    };
+    let err = env.err("peg_start", start("in", &btc, 100_000));
+    assert!(err.contains("Payout address"), "{err}");
+    env.err("peg_start", start("in", &lbtc, 100_000));
+    // A peg-out pays out on the lab's Bitcoin regtest.
+    let err = env.err(
+        "peg_start",
+        start("out", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", 50_000),
+    );
+    assert!(err.contains("another network"), "{err}");
+    let err = env.err("peg_start", start("out", &btc, 200_000_000));
+    assert!(err.contains("above the maximum"), "{err}");
+    assert_eq!(env.ok("peg_list", json!({ "wallet_id": id })), json!([]));
+
+    let order = env.ok("peg_start", start("out", &btc, 50_000));
+    assert_keys("peg_start", &order, PEG_ORDER_KEYS);
+    assert_eq!(order["provider"], json!("native"));
+    assert_eq!(order["simulated"], json!(false));
+    assert_eq!(order["status"], json!("awaiting_deposit"));
+    assert_eq!(order["deposit_address"], json!(""));
+    assert_eq!(order["deposit_expected_sats"], json!(50_000));
+    assert_eq!(order["payout_expected_sats"], json!(50_000));
+    assert_eq!(order["confirmations"], json!(0));
+    assert_eq!(order["confirmations_required"], json!(2));
+    for null in [
+        "txid_deposit",
+        "txid_payout",
+        "txid_claim",
+        "deposit_received_sats",
+        "valid_until_liquid_height",
+        "last_error",
+    ] {
+        assert!(order[null].is_null(), "{null}: {order}");
+    }
+    assert_keys(
+        "status_history",
+        &order["status_history"][0],
+        &["status", "at"],
+    );
+    let oid = order["order_id"].as_str().unwrap().to_string();
+
+    // Following an unfunded peg-out reads no chain.
+    let s = env.ok("peg_status", json!({ "order_id": oid }));
+    assert_keys("peg_status", &s, PEG_ORDER_KEYS);
+    assert!(s["last_error"].is_null(), "{s}");
+    let listed = env.ok("peg_list", json!({ "wallet_id": id }));
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+    assert_keys("peg_list", &listed[0], PEG_ORDER_KEYS);
+
+    let err = env.err("peg_claim", json!({ "order_id": oid }));
+    assert!(err.starts_with("PEG_NOT_READY: only a peg-in"), "{err}");
+    let cancelled = env.ok("peg_cancel", json!({ "order_id": oid }));
+    assert_eq!(cancelled["status"], json!("cancelled"));
+    let err = env.err("peg_fund", json!({ "order_id": oid }));
+    assert!(err.starts_with("PEG_NOT_READY:"), "{err}");
+
+    // Back on testnet the stored order still reads; nothing can be paid.
+    env.ok("clear_test_server", json!({}));
+    let s = env.ok("peg_status", json!({ "order_id": oid }));
+    assert_eq!(s["status"], json!("cancelled"));
+    let err = env.err("peg_fund", json!({ "order_id": oid }));
+    assert!(err.starts_with("PEG_UNAVAILABLE:"), "{err}");
 }
 
 // ── Live: LiquiDEX on a Templar testlab ────────────────────────────

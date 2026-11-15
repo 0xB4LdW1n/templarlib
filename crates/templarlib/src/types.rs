@@ -286,6 +286,13 @@ pub struct LiquidNetworkDto {
     /// Base URL of the joined test server, null when none.
     #[serde(default)]
     pub test_server: Option<String>,
+    /// The peg provider of this network (`native`), null when there is none.
+    #[serde(default)]
+    pub peg_provider: Option<String>,
+    /// Why there is no peg provider (a `PEG_UNAVAILABLE: …` message), null
+    /// when there is one.
+    #[serde(default)]
+    pub peg_unavailable_reason: Option<String>,
 }
 
 /// `get_test_server` / `set_test_server` / `clear_test_server`: the joined

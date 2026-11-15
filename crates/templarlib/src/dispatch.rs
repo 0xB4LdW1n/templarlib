@@ -776,18 +776,18 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         | "add_liquid_to_wallet"
         | "verify_hw_address" => Err(hw::HW_UNSUPPORTED.to_string()),
 
-        // Peg-in / peg-out — simulated provider (no real funds move).
-        // The peg provider bridges Bitcoin testnet and Liquid testnet; a local
-        // regtest has no counterpart on either side.
+        // Peg-in / peg-out: the active network's provider (the native peg of
+        // a joined test server's regtest). Quoting and starting need one;
+        // following, listing and cancelling read stored orders. Signing
+        // happens only in `peg_fund` and `peg_claim`, the user-confirmed
+        // steps, after the same registry reload as `sign_pset`.
         "peg_quote" => {
-            state.require_liquid_testnet("Peg-in / peg-out")?;
             let p: peg::PegQuoteParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
-            peg::quote(&p.direction, p.amount_sats).map(|v| serde_json::to_value(v).unwrap())
+            peg::quote(state, &p.direction, p.amount_sats).map(|v| serde_json::to_value(v).unwrap())
         }
 
         "peg_start" => {
-            state.require_liquid_testnet("Peg-in / peg-out")?;
             let p: peg::PegStartParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
             peg::start(
@@ -801,24 +801,35 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         }
 
         "peg_status" => {
-            state.require_liquid_testnet("Peg-in / peg-out")?;
             let p: peg::PegOrderIdParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
             peg::status(state, &p.order_id).map(|v| serde_json::to_value(v).unwrap())
         }
 
         "peg_list" => {
-            state.require_liquid_testnet("Peg-in / peg-out")?;
             let p: peg::PegListParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
             peg::list(state, &p.wallet_id).map(|v| serde_json::to_value(v).unwrap())
         }
 
         "peg_cancel" => {
-            state.require_liquid_testnet("Peg-in / peg-out")?;
             let p: peg::PegOrderIdParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
             peg::cancel(state, &p.order_id).map(|v| serde_json::to_value(v).unwrap())
+        }
+
+        "peg_fund" => {
+            let p: peg::PegFundParams =
+                serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            reg::reload_registry(state)?;
+            peg::fund(state, &p.order_id, p.fee_rate).map(|v| serde_json::to_value(v).unwrap())
+        }
+
+        "peg_claim" => {
+            let p: peg::PegOrderIdParams =
+                serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            reg::reload_registry(state)?;
+            peg::claim(state, &p.order_id).map(|v| serde_json::to_value(v).unwrap())
         }
 
         // ── LiquiDEX swaps / order book ───────────────────────────────────────

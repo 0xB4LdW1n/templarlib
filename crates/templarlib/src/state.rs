@@ -622,7 +622,8 @@ impl AppState {
     }
 
     /// Refuses `what` on a regtest, where it cannot exist (the public asset
-    /// registry, the public order book, the peg provider).
+    /// registry, the public order book). The peg has its own gate,
+    /// [`templar_core::Endpoints::peg_provider`].
     pub fn require_liquid_testnet(&self, what: &str) -> Result<(), String> {
         if self.liquid_network.is_regtest() {
             return Err(format!(
