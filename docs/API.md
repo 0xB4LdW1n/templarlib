@@ -62,6 +62,7 @@ for as long as that takes. Everything else is local.
 | `HW_UNSUPPORTED: …` | A [hardware] method in a build without `hardware`. |
 | `LIQUID_HW_UNSUPPORTED: …` | A Liquid asset on a Bitcoin-only hardware or air-gap path. |
 | Hardware tags `HWI_MISSING`, `HWI_PERMISSION`, `DEVICE_NOT_READY`, `DEVICE_NOT_FOUND`, `SIGNING_FAILED` | Prefixes of device errors; the text after the tag explains. |
+| Order-book tags `BOOK_RATE_LIMITED`, `BOOK_CHAIN_UNREACHABLE`, `BOOK_DUPLICATE`, `BOOK_PUBLISH_DISABLED`, `BOOK_REJECTED`, `BOOK_UNAVAILABLE`, `BOOK_UNREACHABLE` | Prefixes of `swap_publish` refusals ([`swap_publish`](#swap_publish)). |
 
 Hosts should key on the tags, not on the text after them.
 
@@ -132,7 +133,41 @@ amount_sats: int, display_amount}]`.
 `liquid-regtest`), `short_name` (`testnet` | `regtest`), `policy_asset`
 (L-BTC id), `backend` (`electrum` | `elements_rpc`),
 `backend_description` (no credentials), `env_locked: bool`,
-`regtest_default_policy_asset`.
+`regtest_default_policy_asset`, `backend_source` (`env` | `profile` |
+`default`: where the backend came from), `test_server: string?` (base URL
+of the joined test server).
+
+**TestServer** (`TestServerDto`), the answer of the three test-server
+methods:
+
+- `configured: bool`: a test server is joined.
+- `profile: TestServerProfile?`: what the server's `/api/config` said,
+  validated and normalised (no trailing slashes, lowercase hex):
+  `base_url`, `name`, `version: u32`, `fetched_at: u64` (Unix s),
+  `orderbook_url`, `regtest: {instance_id, policy_asset, genesis_hash,
+  liquid_electrum_url, bitcoin_network, bitcoin_electrum_url,
+  bitcoin_esplora_url, faucet_url, peg: {provider, pegin_confirmations:
+  u32?, pegout_confirmations: u32?, pegout_max_sat: u64?}}`,
+  `testnet: {faucet_url: string?, peg: {provider, …}?}?` (display only).
+- `check: {reachable: bool, error: string?, server_instance_id: string?,
+  stale: bool}?`: a live look at the server (`set_test_server`, and
+  `get_test_server` with `check: true`). `stale` = the server now says
+  something else than the stored profile (its chains were reset); call
+  `set_test_server` again to apply it.
+- `applied: {liquid_network, network_switched: bool, wallet_closed: bool,
+  regtest_cache_reset: bool}?`: what `set_test_server` / `clear_test_server`
+  changed; null on `get_test_server`. With `wallet_closed`, reopen the
+  wallet (`open_wallet`); with `regtest_cache_reset`, its next sync
+  rescans the regtest chains.
+- `active`: the servers in use now, each with where it came from
+  (`env` | `profile` | `setting` | `default`):
+  `{liquid_network, env_locked: bool,
+  orderbook: {origin, book, markets, publish, atomic_swaps} (each {url,
+  source}), liquid: {network, policy_asset, genesis_hash: string? (a
+  custom regtest genesis), params_source, backend (`electrum` |
+  `elements_rpc`), backend_description, backend_source}, bitcoin:
+  {network (`bitcoin-testnet` | `bitcoin-regtest`), electrum_url,
+  source}}`. No credentials appear.
 
 **PegOrder** (`PegOrderDto`): `order_id`, `wallet_id`, `direction` (`in` =
 BTC → L-BTC, `out` = L-BTC → BTC), `status` (`awaiting_deposit` |
@@ -185,7 +220,9 @@ Params: none. Returns: **LiquidNetwork**. Errors: the common ones.
 ### `set_liquid_network`
 
 Switch the Liquid network. Persists the choice and, when the network
-changes, closes the open wallet: reopen and resync it.
+changes, closes the open wallet: reopen and resync it. With a test server
+joined, `regtest` is the server's regtest (its policy asset and genesis);
+testnet is never changed by a test server.
 
 | Param | Type | Req. | Notes |
 |---|---|---|---|
@@ -194,7 +231,57 @@ changes, closes the open wallet: reopen and resync it.
 
 Returns: **LiquidNetwork** after the switch. Errors: unknown network or bad
 asset id; `The Liquid network is fixed by TEMPLAR_LIQUID_NETWORK for this
-session; …`; `Could not save the network setting: …`.
+session; …`; `Could not save the network setting: …`; a `policy_asset`
+other than the joined test server's (`Liquid regtest is the test server's
+(…) … Clear the test server to use another regtest.`).
+
+### `get_test_server`
+
+The joined Templar test server ("testlab") and the servers in use.
+
+| Param | Type | Req. | Notes |
+|---|---|---|---|
+| `check` | bool | no | also fetch the server's `/api/config` now (*network*, at most 10 s) and report `check` |
+
+Returns: **TestServer** (`applied` null; `check` null unless asked and a
+server is joined). Errors: the common ones. An unreachable server is not
+an error: `check.reachable` is false and the stored profile stays in use.
+
+### `set_test_server`
+
+*network*. Join a test server with one setting: fetch
+`<url>/api/config`, validate it, store it in the app config and apply it.
+After the call the Liquid network is the lab's regtest (unless
+`TEMPLAR_LIQUID_NETWORK` fixes it), the regtest chain is reached through
+the lab's Liquid Electrum server, the Bitcoin side runs on the lab's
+Bitcoin regtest (`bcrt1…` addresses, its own data under
+`bitcoin-regtest/`), and the order book (book, markets, publish, HTLC
+coordinator) is the lab's. Liquid testnet keeps its own servers. The open
+wallet is closed. When the lab's `instance_id` differs from the one the
+regtest data was synced against, the regtest chain caches and regtest swap
+offers are dropped (never keys or the wallet list). Call it again to
+refresh a stale profile.
+
+| Param | Type | Req. | Notes |
+|---|---|---|---|
+| `url` | string | yes | the server's base URL, e.g. `http://127.0.0.1:8096`; one trailing slash is ignored |
+
+Returns: **TestServer**. Errors (nothing is applied):
+`Invalid test server URL: …` (not `http`/`https`, credentials, query or
+fragment, or the server redirects); `Cannot reach the test server: …`;
+`The test server answered HTTP <n> for /api/config`; `The test server's
+/api/config is larger than 65536 bytes`; `This test server needs a newer
+wallet (its config is version <n>; …)`; `The test server's config is
+invalid: <field> …` (the field is named); `The test server's config names a
+mainnet (…)`; `Could not save the settings: …`.
+
+### `clear_test_server`
+
+Leave the joined test server: the profile is forgotten, the order book and
+backends return to the environment and defaults, a Liquid network on the
+lab's regtest returns to testnet, the open wallet is closed and the lab's
+regtest caches are dropped. Params: none. Returns: **TestServer**. Errors:
+`Could not save the settings: …`.
 
 ## Vault
 
@@ -1190,10 +1277,20 @@ cancelled (status: …)` once the deposit has been seen; regtest.
 
 ## LiquiDEX swaps
 
-Swaps through signed LiquiDEX proposals. The order book is the local order
-book service (see [ARCHITECTURE.md](ARCHITECTURE.md#networks-and-chain-access));
-the active Liquid network is sent with every read. Mainnet proposals are
-never signed.
+Swaps through signed LiquiDEX proposals. The order book is the joined test
+server's, else the local order book service on `127.0.0.1:3210`;
+`TEMPLAR_SWAP_BOOK_URL`, `TEMPLAR_SWAP_MARKETS_URL` and
+`TEMPLAR_SWAP_ADMIN_URL` override single routes (see
+[ARCHITECTURE.md](ARCHITECTURE.md#networks-and-chain-access); the URLs in
+use are in **TestServer** `active.orderbook`). The active Liquid network is
+sent with every read. Chain checks, takes and cancels go through the active
+Liquid network's backend. Mainnet proposals are never signed.
+
+A proposal made here carries, on its output leg, the optional
+`blinding_nonce`: the secret the taker seals the maker's output rangeproof
+with, so the maker's wallet can unblind the payment. It reveals nothing the
+legs do not already reveal; proposals without it are still taken (the
+maker's wallet may then not see the payment).
 
 ### `list_swaps`
 
@@ -1284,7 +1381,10 @@ insufficient funds; broadcast errors.
 
 ### `swap_publish`
 
-*network*. Publish a signed proposal to the local book.
+*network*. Publish a signed proposal to the order book's public
+`POST /api/offers`, which verifies it against the chain before storing it
+(`TEMPLAR_SWAP_ADMIN_URL` replaces the URL, for old setups that publish
+through the admin route).
 
 | Param | Type | Req. |
 |---|---|---|
@@ -1293,12 +1393,24 @@ insufficient funds; broadcast errors.
 
 Returns: `u64`, the book's id. Errors: a proposal that fails verification
 (the first failing check); `Liquid mainnet proposals cannot be published`;
-the book refusing.
+the book refusing, tagged by its HTTP status (the text after the tag
+includes the book's own message and may change):
+
+| Tag | Status | Meaning |
+|---|---|---|
+| `BOOK_REJECTED:` | 400, 401, 413, 415, 422 | the offer or the request was refused (bad proposal, coin spent, wrong network, too large; 401: the admin route of a protected book) |
+| `BOOK_PUBLISH_DISABLED:` | 403 | the book takes no public offers for this network |
+| `BOOK_DUPLICATE:` | 409 | the same proposal is already in the book |
+| `BOOK_RATE_LIMITED:` | 429 | too many publishes; the text says when to retry |
+| `BOOK_CHAIN_UNREACHABLE:` | 503 | the book cannot verify on the chain now (or is full); nothing stored |
+| `BOOK_UNAVAILABLE:` | 404, 405, other | no publish route, or another server error |
+| `BOOK_UNREACHABLE:` | none | the book could not be reached |
 
 ### `list_my_offers`
 
-*opens*. This wallet's offers, newest first; open ones get a best-effort
-status refresh (*network*).
+*opens*. This wallet's offers on the active Liquid network, newest first
+(offers stored before the network was recorded show on both); open ones get
+a best-effort status refresh (*network*).
 
 | Param | Type | Req. |
 |---|---|---|
@@ -1322,8 +1434,8 @@ errors.
 
 ## Bitcoin ↔ Liquid HTLC swaps
 
-Testnet only, software wallets with both chains. The local order book
-service coordinates the public state; keys and the maker's preimage are
+Testnet only, software wallets with both chains. The order book service
+(`active.orderbook.atomic_swaps`) coordinates the public state; keys and the maker's preimage are
 derived from the seed and never sent. All six are *opens* and *network*,
 and fail with `Cross-chain swaps v1 require Liquid testnet`, `Cross-chain
 swaps v1 currently require a software wallet` or `Open a wallet with both

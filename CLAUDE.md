@@ -88,8 +88,15 @@ someone else. A new spend or sign path must do both.
 Bitcoin testnet; Liquid testnet or a local Liquid regtest. Mainnet is
 refused: keys on a mainnet coin type are refused at signing
 (`liquid/pset.rs`), LiquiDEX proposals on mainnet L-BTC are refused, BDK
-wallets are built for testnet. Do not add a mainnet path, a mainnet
+wallets are built for testnet (or Bitcoin regtest beside a Templar test
+server's Liquid regtest). Do not add a mainnet path, a mainnet
 default, or a setting that unlocks one.
+
+- Which servers the engine talks to is decided in one place,
+  `templar_core::endpoints` (env > test-server profile > setting >
+  default). Add a server or backend there, not as another env lookup. A
+  test-server profile is a trust boundary (`templar_core::test_server`):
+  it is applied whole or not at all, and never to Liquid testnet.
 
 - Peg-in / peg-out, the public asset registry and the public order book do
   not exist on regtest: those methods call `require_liquid_testnet`.

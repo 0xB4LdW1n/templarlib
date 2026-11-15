@@ -206,6 +206,14 @@ regtest; mainnet is refused. Choose the Liquid network with
 in [ARCHITECTURE.md](ARCHITECTURE.md#networks-and-chain-access). They are
 read by the engine process, so set them before it starts.
 
+To use a Templar test server (a testlab: its own Bitcoin and Liquid
+regtest, faucet and order book), call `set_test_server` with its base URL
+once; the engine fetches its `/api/config` and moves the order book and
+the regtest side there (see [API.md](API.md#set_test_server)). At start,
+`get_test_server` with `check: true` tells whether the lab was reset
+(`check.stale`); calling `set_test_server` again then drops the old
+regtest caches. Environment variables still win over the test server.
+
 For Templar Protocol: Today the protocol runs on a test regtest; in beta it will run on a server of ours; then Liquid mainnet.
 The wallet side of the protocol, what the host must check and send over
 HTTP, is in [CONNECTOR.md](CONNECTOR.md).

@@ -124,20 +124,56 @@ parse is preserved, never overwritten, and reported as the startup error.
 
 ## Networks and chain access
 
-- Bitcoin: testnet through Electrum (`TEMPLAR_ELECTRUM_URL` overrides the
-  default server).
-- Liquid: testnet through Electrum, or a local Elements regtest through
-  `elementsd` JSON-RPC (default `http://127.0.0.1:18884`). Chosen with
-  `set_liquid_network` or `TEMPLAR_LIQUID_NETWORK`; the backend with
-  `TEMPLAR_LIQUID_BACKEND`, `TEMPLAR_LIQUID_ELECTRUM_URL`,
-  `TEMPLAR_LIQUID_ELECTRUM_TLS`, `TEMPLAR_ELEMENTS_RPC_URL/USER/PASS`; the
-  regtest policy asset with `TEMPLAR_LIQUID_REGTEST_POLICY_ASSET`.
-- Order book and HTLC coordination: the local order book service
-  (`services/orderbook` in templar-protocol, `http://127.0.0.1:3210` by
-  default; `TEMPLAR_SWAP_BOOK_URL`, `TEMPLAR_SWAP_MARKETS_URL`,
-  `TEMPLAR_SWAP_ADMIN_URL` override it).
+Which servers the engine talks to is decided in one place,
+`templar_core::endpoints::Endpoints`, built by `AppState::endpoints` over
+the stored test-server profile. Every value has the same precedence and
+reports its source: **env** (an environment variable) > **profile** (a
+joined Templar test server) > **setting** (a regtest policy asset set by
+hand) > **default**.
+
+- Liquid network: testnet, or an Elements regtest. Chosen with
+  `set_liquid_network` or `TEMPLAR_LIQUID_NETWORK`; joining a test server
+  switches to its regtest. A regtest's policy asset (and genesis, for a
+  lab whose genesis is not the stock `liquidregtest` one):
+  `TEMPLAR_LIQUID_REGTEST_POLICY_ASSET` > the lab's > the one set by hand >
+  stock.
+- Liquid backend (`LiquidBackend::resolve`): `TEMPLAR_LIQUID_BACKEND`
+  (`electrum` | `elements_rpc`, with `TEMPLAR_LIQUID_ELECTRUM_URL`,
+  `TEMPLAR_LIQUID_ELECTRUM_TLS`, `TEMPLAR_ELEMENTS_RPC_URL/USER/PASS`) >
+  on regtest, `TEMPLAR_ELEMENTS_RPC_URL` > on regtest, the lab's Electrum
+  server > the default: Blockstream's testnet Electrum, or `elementsd`
+  JSON-RPC on `http://127.0.0.1:18884` for regtest. A test server never
+  changes how Liquid testnet is reached. The resolved backend is pinned on
+  the open wallet (`LiquidWalletManager::set_chain_backend`), so sync,
+  broadcast and LiquiDEX deep checks use it.
+- Bitcoin (`Endpoints::bitcoin_backend`): testnet through Electrum, except
+  beside a lab's Liquid regtest whose `bitcoin_network` is `regtest`:
+  Bitcoin regtest through the lab's Electrum, with its BDK databases under
+  `<data_dir>/bitcoin-regtest/`. `TEMPLAR_ELECTRUM_URL` overrides the server
+  of either. Keys, descriptors, coin selection and signing are the same on
+  both.
+- Order book and HTLC coordination: the order book service
+  (`services/orderbook` in templar-protocol): its routes `…/api/book`,
+  `…/api/markets`, `POST …/api/offers` (publish) and `…/api/atomic-swaps`
+  on the lab's `orderbook_url`, else `http://127.0.0.1:3210`;
+  `TEMPLAR_SWAP_BOOK_URL`, `TEMPLAR_SWAP_MARKETS_URL`,
+  `TEMPLAR_SWAP_ADMIN_URL` (publish, for old admin-route setups) override
+  single routes.
 - Hardware: Ledger and Jade in-process over USB; Trezor, Coldcard, KeepKey,
   BitBox through the `hwi` binary (`TEMPLAR_HWI_BIN` overrides the lookup).
+
+### Test servers
+
+`set_test_server` fetches `<url>/api/config` (`templar_core::test_server`,
+contract version 1 of the Templar testlab), validates it as a trust
+boundary (http(s) only, no redirects, 64 KiB and 10 s bounds, 64-hex ids,
+`tcp://`/`ssl://` Electrum URLs, nothing naming a mainnet) and stores it in
+the app config (`AppConfig.test_server`). Only its `liquid-regtest` block
+and `orderbook_url` are applied. `<data_dir>/regtest_instance` records the
+lab `instance_id` the regtest data was synced against; when it differs
+(the lab reset its chains, or the wallet joined or left a lab) the regtest
+chain caches (`liquid-regtest/`, `bitcoin-regtest/`) and regtest swap
+offers are dropped, never keys or the registry.
 
 No chain client is built when a wallet is opened, only when a method syncs
 or broadcasts.

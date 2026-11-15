@@ -52,8 +52,48 @@ with 0, any release may change the method contract.
   `atomic_swap_join`, `atomic_swap_list`, `atomic_swap_fund`,
   `atomic_swap_claim`, `atomic_swap_refund`, coordinated by the local
   order book service.
+- Test servers: `get_test_server`, `set_test_server`, `clear_test_server`.
+  One setting, a Templar testlab's base URL, joins the wallet to a lab:
+  its `/api/config` (version 1) is fetched, validated (http(s) only, no
+  redirects, size and time bounds, well-formed ids and URLs, nothing naming
+  a mainnet) and stored; the Liquid network becomes the lab's regtest
+  (policy asset, genesis, its Electrum server: no RPC access needed), the
+  Bitcoin side runs on the lab's Bitcoin regtest (`bcrt1…`, data under
+  `bitcoin-regtest/`), and the order book is the lab's. Liquid testnet is
+  never changed. The answer lists every server in use and its source
+  (`env` | `profile` | `setting` | `default`). When the lab resets its
+  chains (`instance_id`), the regtest chain caches and regtest swap offers
+  are dropped; keys and the wallet list never are.
+- `get_liquid_network` answers with `backend_source` and `test_server`.
+- `swap_publish` refusals carry a tag per HTTP status of the order book:
+  `BOOK_RATE_LIMITED`, `BOOK_CHAIN_UNREACHABLE`, `BOOK_DUPLICATE`,
+  `BOOK_PUBLISH_DISABLED`, `BOOK_REJECTED`, `BOOK_UNAVAILABLE`,
+  `BOOK_UNREACHABLE`.
+- LiquiDEX proposals made by this wallet carry the optional
+  `blinding_nonce` on their output leg, and the taker uses it (see Fixed).
+- `templar-core`: `endpoints::Endpoints` (the one resolver of servers and
+  backends), `test_server` (profile parsing and fetch),
+  `LiquidBackend::resolve`, `LiquidNetwork::regtest_with_genesis` and an
+  optional `genesis_hash` on `LiquidRegtest`, `BitcoinBackend` with the
+  `WalletManager::*_on` constructors, `LiquidWalletManager::set_chain_backend`,
+  and `verify_proposal_with` / `proposal_utxo_unspent_with` /
+  `broadcast_transaction_with` (an explicit chain handle).
 
 ### Changed
+
+- `swap_publish` posts to the order book's public, chain-verified
+  `POST /api/offers` instead of the admin route (which answers 401 on a
+  book with an admin password). `TEMPLAR_SWAP_ADMIN_URL` still overrides
+  the URL.
+- The order book's URLs, the HTLC coordinator (no longer hardcoded) and
+  the chain backends come from one resolver: environment variables keep
+  working and win over a test server, which wins over the defaults.
+- `list_my_offers` lists the offers of the active Liquid network (offers
+  stored before the network was recorded show on both).
+- Taking, cancelling, deep-verifying and refreshing LiquiDEX offers go
+  through the wallet's resolved chain backend instead of the environment's.
+- A LiquiDEX proposal refused for failing verification says which check
+  failed.
 
 - The application engine moved out of the wallet's FFI crate into
   `templarlib`: `TemplarLib::call(method, params)` with the stable
@@ -102,6 +142,18 @@ with 0, any release may change the method contract.
   `Network` (`TestnetLiquid`, `CustomElements`) in place of the removed
   `ElementsNetwork`, and the `elements` types it hands out (`Pset`,
   `Transaction`, …) are `elements` 0.27's.
+
+### Fixed
+
+- A LiquiDEX maker's wallet never saw the payment of a taken offer: the
+  taker sealed the maker output's rangeproof with a random secret, which
+  the maker cannot rewind. Found on the first live regtest run. Makers now
+  reveal the secret (`blinding_nonce`) and takers use it; it opens only the
+  amount and blinders the proposal already reveals. Signatures and sighashes
+  are unchanged.
+- Liquid Electrum servers without TLS (`tcp://`, or
+  `TEMPLAR_LIQUID_ELECTRUM_TLS=0`) failed with "Cannot validate the domain
+  without tls"; domain validation now applies only with TLS.
 
 ## [0.1.0] — 2026-09-24
 
