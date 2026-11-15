@@ -17,7 +17,8 @@
 //!
 //! Only the `liquid-regtest` block and `orderbook_url` are ever applied
 //! (see [`crate::endpoints`]). The `liquid-testnet` block is kept for display
-//! — it never changes how Liquid testnet reaches its chain.
+//! and to switch on the testnet peg provider it names (SideSwap) — it never
+//! changes how Liquid testnet reaches its chain, and never names a server.
 //!
 //! Parsing ([`parse_config`]) is pure; only [`fetch_profile`] touches the
 //! network.
@@ -120,7 +121,8 @@ pub struct PegProfile {
     pub pegout_max_sat: Option<u64>,
 }
 
-/// `networks["liquid-testnet"]`: links for display, never chain settings.
+/// `networks["liquid-testnet"]`: links for display and the testnet peg
+/// provider's name, never chain settings or servers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TestnetProfile {
     #[serde(default)]

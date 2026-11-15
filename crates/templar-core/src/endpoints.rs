@@ -22,6 +22,7 @@ use crate::bitcoin::wallet::{electrum_env_override, BitcoinBackend};
 use crate::error::{PegError, TemplarError};
 use crate::liquid::chain::LiquidBackend;
 use crate::liquid::network::{env_non_empty, LiquidNetwork, ENV_REGTEST_POLICY_ASSET};
+use crate::sideswap::{DEFAULT_TESTNET_URL as DEFAULT_SIDESWAP_TESTNET_URL, ENV_SIDESWAP_URL};
 use crate::test_server::TestServerProfile;
 
 /// Origin of the local order book (`templar-orderbook` on its default port).
@@ -203,13 +204,21 @@ pub struct NativePegTerms {
 pub enum PegProvider {
     /// The Elements peg of a Templar test server's regtest.
     Native(NativePegTerms),
+    /// SideSwap's service on Liquid testnet: a custodial swap by a third
+    /// party, not a peg (testnet has no parent chain).
+    SideSwap {
+        /// The WebSocket endpoint (`TEMPLAR_SIDESWAP_URL`, else the
+        /// testnet default).
+        url: String,
+    },
 }
 
 impl PegProvider {
-    /// Wire name: `native`.
+    /// Wire name: `native` | `sideswap`.
     pub fn name(&self) -> &'static str {
         match self {
             PegProvider::Native(_) => "native",
+            PegProvider::SideSwap { .. } => "sideswap",
         }
     }
 }
@@ -222,7 +231,11 @@ impl Endpoints<'_> {
     ///   names `"native"` with all three terms and the regtest in use is the
     ///   lab's own (an environment policy asset that points elsewhere is
     ///   not);
-    /// - on Liquid testnet: none — testnet has no parent chain, so an
+    /// - on Liquid testnet: SideSwap's custodial swap service when the
+    ///   joined test server's config names `"sideswap"` for testnet (the
+    ///   profile only switches it on: the endpoint is
+    ///   `TEMPLAR_SIDESWAP_URL`, else SideSwap's testnet default); none
+    ///   otherwise — testnet has no parent chain, so an
     ///   Elements peg cannot exist there.
     pub fn peg_provider(
         &self,
@@ -230,9 +243,31 @@ impl Endpoints<'_> {
     ) -> Result<Resolved<PegProvider>, TemplarError> {
         let unavailable = |why: String| -> TemplarError { PegError::Unavailable(why).into() };
         if !liquid.is_regtest() {
-            return Err(unavailable(
-                "Liquid testnet has no parent chain, so it has no native peg-in / peg-out.".into(),
-            ));
+            let named = self
+                .profile
+                .and_then(|p| p.testnet.as_ref())
+                .and_then(|t| t.peg.as_ref())
+                .map(|peg| peg.provider.as_str());
+            return match named {
+                Some("sideswap") => {
+                    let (url, source) = match env_non_empty(ENV_SIDESWAP_URL) {
+                        Some(url) => (url, Source::Env),
+                        None => (DEFAULT_SIDESWAP_TESTNET_URL.to_string(), Source::Profile),
+                    };
+                    crate::sideswap::check_url(&url)?;
+                    Ok(Resolved::new(PegProvider::SideSwap { url }, source))
+                }
+                Some(other) => Err(unavailable(format!(
+                    "the test server names peg provider {other:?} for Liquid testnet, which \
+                     this wallet does not support."
+                ))),
+                None => Err(unavailable(
+                    "Liquid testnet has no parent chain, so it has no native peg-in / peg-out \
+                     (a test server whose config names SideSwap for testnet enables its swap \
+                     service)."
+                        .into(),
+                )),
+            };
         }
         let Some(p) = self.profile else {
             return Err(unavailable(
@@ -388,7 +423,9 @@ mod tests {
         let r = Endpoints::new(Some(&p)).peg_provider(&lab).unwrap();
         assert_eq!(r.source, Source::Profile);
         assert_eq!(r.value.name(), "native");
-        let PegProvider::Native(t) = r.value;
+        let PegProvider::Native(t) = r.value else {
+            panic!("native expected");
+        };
         assert_eq!(t.pegin_confirmations, 2);
         assert_eq!(t.pegout_confirmations, 2);
         assert_eq!(t.pegout_max_sat, 100_000_000);
@@ -396,8 +433,23 @@ mod tests {
         assert_eq!(t.instance_id, p.regtest.instance_id);
 
         let why = |e: &Endpoints<'_>, n: &LiquidNetwork| e.peg_provider(n).unwrap_err().to_string();
-        // Testnet: no parent chain, profile or not.
-        let err = why(&Endpoints::new(Some(&p)), &LiquidNetwork::testnet());
+        // Testnet: no parent chain. Without a lab, nothing; a lab naming
+        // SideSwap for testnet switches its service on (never a native peg).
+        let err = why(&Endpoints::default(), &LiquidNetwork::testnet());
+        assert!(err.starts_with("PEG_UNAVAILABLE: Liquid testnet"), "{err}");
+        let s = Endpoints::new(Some(&p))
+            .peg_provider(&LiquidNetwork::testnet())
+            .unwrap();
+        assert_eq!(s.value.name(), "sideswap");
+        assert_eq!(
+            s.value,
+            PegProvider::SideSwap {
+                url: DEFAULT_SIDESWAP_TESTNET_URL.into()
+            }
+        );
+        let mut q = p.clone();
+        q.testnet = None;
+        let err = why(&Endpoints::new(Some(&q)), &LiquidNetwork::testnet());
         assert!(err.starts_with("PEG_UNAVAILABLE: Liquid testnet"), "{err}");
         // A regtest without a lab.
         let err = why(&Endpoints::default(), &LiquidNetwork::regtest_default());
