@@ -1088,8 +1088,8 @@ impl LiquidWalletManager {
     /// Signs a PSET with the software signer.
     ///
     /// Returns an error if this is a watch-only wallet, or if the PSET asks
-    /// the key for anything but SIGHASH_ALL or lacks a single fee output
-    /// ([`refuse_unsafe_signing`]).
+    /// the key for a taproot signature or anything but SIGHASH_ALL, or lacks
+    /// a single fee output ([`refuse_unsafe_signing`]).
     pub fn sign(
         &self,
         pset: &mut lwk_wollet::elements::pset::PartiallySignedTransaction,
@@ -1906,6 +1906,91 @@ mod tests {
         ));
         for (route, result) in sign_every_way(&pset).into_iter().enumerate() {
             assert_eq!(result.unwrap().0, 0, "route {route}");
+        }
+    }
+
+    /// A taproot key-spend input of the test key at `path`, named through
+    /// `tap_key_origins` only, in a PSET carrying the ELIP-101 genesis hash —
+    /// everything LWK 0.20's signer needs to produce a `tap_key_sig`.
+    fn taproot_pset_for_test_key(path: &str) -> PartiallySignedTransaction {
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC, ElementsNetwork::TestnetLiquid).unwrap();
+        let path = DerivationPath::from_str(path).unwrap();
+        let xpub = Signer::derive_xpub(&signer, &path).unwrap();
+        let (xonly, _) = xpub.public_key.x_only_public_key();
+        let secp = lwk_wollet::elements::secp256k1_zkp::Secp256k1::new();
+        let asset = LiquidNetwork::testnet().policy_asset();
+        let mut input = Input::from_prevout(OutPoint::new(Txid::from_byte_array([0x44; 32]), 0));
+        input.witness_utxo = Some(TxOut {
+            asset: confidential::Asset::Explicit(asset),
+            value: confidential::Value::Explicit(10_000),
+            nonce: confidential::Nonce::Null,
+            script_pubkey: Script::new_v1_p2tr(&secp, xonly, None),
+            witness: Default::default(),
+        });
+        input.tap_internal_key = Some(xonly);
+        input
+            .tap_key_origins
+            .insert(xonly, (vec![], (signer.fingerprint(), path)));
+        let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(input);
+        pset.add_output(Output::new_explicit(
+            Script::from(vec![0u8, 20, 7, 7]),
+            9_000,
+            asset,
+            None,
+        ));
+        pset.add_output(Output::from_txout(TxOut::new_fee(1_000, asset)));
+        lwk_common::set_genesis_hash(&mut pset, &ElementsNetwork::TestnetLiquid);
+        pset
+    }
+
+    #[test]
+    fn our_taproot_inputs_are_never_signed_on_any_path() {
+        // m/86'/1776'/… is a mainnet coin type that `refuse_non_testnet_paths`
+        // cannot see (no `bip32_derivation`); m/86'/1'/… is a test one. LWK
+        // 0.9 signed neither; neither is signed now.
+        for path in ["m/86'/1776'/0'/0/0", "m/86'/1'/0'/0/0"] {
+            let pset = taproot_pset_for_test_key(path);
+            let ours: std::collections::BTreeSet<String> = ["73c5da0a".to_string()].into();
+            if path.contains("1776") {
+                assert!(crate::liquid::pset::refuse_non_testnet_paths(&pset, &ours).is_ok());
+            }
+            let wallet = LiquidWalletManager::from_mnemonic_with_persist_on(
+                &LiquidNetwork::testnet(),
+                TEST_MNEMONIC,
+                None,
+            )
+            .unwrap();
+            let mut a = pset.clone();
+            let mut b = pset.clone();
+            let mut c = pset.clone();
+            let results = [
+                LiquidWalletManager::sign_pset_with_mnemonic(&mut a, TEST_MNEMONIC)
+                    .map_err(|e| e.to_string()),
+                crate::liquid::multisig::LiquidMultisigSetup::sign_pset_with_mnemonics(
+                    &mut b,
+                    &[TEST_MNEMONIC.to_string()],
+                )
+                .map_err(|e| e.to_string()),
+                wallet.sign(&mut c).map_err(|e| e.to_string()),
+            ];
+            for (route, (result, after)) in results.iter().zip([&a, &b, &c]).enumerate() {
+                let err = result
+                    .as_ref()
+                    .err()
+                    .unwrap_or_else(|| panic!("{path}: route {route} signed"));
+                assert!(
+                    err.starts_with("Signing failed: refusing to sign input 0:")
+                        && err.contains("taproot"),
+                    "{path}: route {route}: {err}"
+                );
+                assert!(
+                    after.inputs()[0].tap_key_sig.is_none(),
+                    "{path}: route {route}"
+                );
+                assert!(no_signature(after), "{path}: route {route}");
+            }
         }
     }
 }
