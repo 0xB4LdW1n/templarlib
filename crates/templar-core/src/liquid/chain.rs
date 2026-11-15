@@ -640,7 +640,11 @@ impl LiquidChain {
         else {
             return Err(sync_err("electrum", "not an electrum backend"));
         };
-        ElectrumUrl::new(url, *tls, *validate_domain).map_err(|e| sync_err("electrum url", e))
+        // Domain validation is a TLS property: LWK refuses the flag on a
+        // plaintext server (`tcp://`, a local electrs), so it only applies
+        // with TLS.
+        ElectrumUrl::new(url, *tls, *validate_domain && *tls)
+            .map_err(|e| sync_err("electrum url", e))
     }
 
     fn electrum(&self) -> Result<ElectrumClient, TemplarError> {
@@ -878,6 +882,22 @@ mod tests {
             LiquidBackend::resolve(&LiquidNetwork::testnet(), Some(&profile)).unwrap();
         assert_eq!(source, Source::Default);
         assert_eq!(backend, LiquidBackend::testnet_default());
+    }
+
+    /// A plaintext Electrum server (a local electrs, a testlab's `tcp://`)
+    /// gets a usable URL: domain validation only applies with TLS.
+    #[test]
+    fn plaintext_electrum_urls_are_accepted() {
+        let c = LiquidChain::new(
+            LiquidNetwork::regtest_default(),
+            LiquidBackend::Electrum {
+                url: "127.0.0.1:19061".into(),
+                tls: false,
+                validate_domain: true,
+            },
+        )
+        .unwrap();
+        assert!(c.electrum_url().is_ok());
     }
 
     /// Construction is offline for both backends.
