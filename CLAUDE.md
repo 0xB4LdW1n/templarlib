@@ -96,10 +96,17 @@ default, or a setting that unlocks one.
   `templar_core::endpoints` (env > test-server profile > setting >
   default). Add a server or backend there, not as another env lookup. A
   test-server profile is a trust boundary (`templar_core::test_server`):
-  it is applied whole or not at all, and never to Liquid testnet.
+  it is applied whole or not at all, and it never changes how Liquid
+  testnet is reached. Its testnet block can only switch the SideSwap peg
+  provider on; it names no server.
 
-- Peg-in / peg-out, the public asset registry and the public order book do
-  not exist on regtest: those methods call `require_liquid_testnet`.
+- Peg methods need a provider for the active network
+  (`Endpoints::peg_provider`): the native Elements peg on a joined test
+  server's regtest, SideSwap on Liquid testnet when the profile names it,
+  none otherwise (`PEG_UNAVAILABLE`). Only `peg_fund` and `peg_claim` sign;
+  reading an order never does.
+- The public asset registry and the public order book do not exist on
+  regtest: those methods call `require_liquid_testnet`.
 - Switching the Liquid network closes the open wallet. A wallet opened on
   one network must never be driven against the other's chain.
 - Templar Protocol: Today the protocol runs on a test regtest; in beta it will run on a server of ours; then Liquid mainnet.
