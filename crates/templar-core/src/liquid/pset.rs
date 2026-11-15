@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use lwk_wollet::bitcoin::bip32::Fingerprint;
 use lwk_wollet::elements::confidential::{Asset, Value};
 use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction};
 use lwk_wollet::elements::secp256k1_zkp::{All, Secp256k1};
@@ -230,6 +231,88 @@ pub fn refuse_non_testnet_paths(
                 ))
                 .into());
             }
+        }
+    }
+    Ok(())
+}
+
+/// Sighash type value of SIGHASH_ALL.
+const SIGHASH_ALL: u32 = 0x01;
+/// Sighash type value of SIGHASH_DEFAULT (taproot only; commits like ALL).
+const SIGHASH_DEFAULT: u32 = 0x00;
+
+/// Whether a key with one of `signers` as master fingerprint would sign
+/// `input`: the fingerprint appears in its `bip32_derivation` (ECDSA) or
+/// `tap_key_origins` (taproot) — the match LWK's `SwSigner` and Jade make.
+fn signs_input(input: &Input, signers: &[Fingerprint]) -> bool {
+    input
+        .bip32_derivation
+        .values()
+        .any(|(fp, _)| signers.contains(fp))
+        || input
+            .tap_key_origins
+            .values()
+            .any(|(_, (fp, _))| signers.contains(fp))
+}
+
+/// Refuses a PSET whose fee outputs are not exactly one, with LWK 0.9's
+/// words. LWK 0.9 refused such a PSET while reading it, so no co-signing
+/// route signed one; LWK 0.20 reads it (the fee is their sum) and the rule
+/// now lives here.
+pub fn refuse_bad_fee_outputs(pset: &PartiallySignedTransaction) -> Result<(), TemplarError> {
+    let fee_outputs = pset
+        .outputs()
+        .iter()
+        .filter(|o| o.script_pubkey.is_empty())
+        .count();
+    match fee_outputs {
+        1 => Ok(()),
+        0 => Err(
+            LiquidError::PsetInspectionFailed("PSET doesn't contain a fee output".into()).into(),
+        ),
+        _ => Err(LiquidError::PsetInspectionFailed("Multiple fee outputs".into()).into()),
+    }
+}
+
+/// The check every signer of this crate runs before a key with one of
+/// `signers` as master fingerprint touches `pset`. It only refuses; when
+/// none of `signers` would sign any input it lets the PSET through, since
+/// the signer then adds nothing.
+///
+/// - Every input such a key would sign declares no sighash type or
+///   SIGHASH_ALL (SIGHASH_DEFAULT too on a taproot input). LWK 0.9's
+///   signers always produced SIGHASH_ALL signatures; 0.20's sign whatever
+///   type the input declares, and a SIGHASH_NONE, SINGLE or ANYONECANPAY
+///   signature lets whoever holds the PSET change what it pays. Inputs only
+///   other keys sign are not judged: their sighash is their signer's call.
+/// - Exactly one fee output ([`refuse_bad_fee_outputs`]).
+pub fn refuse_unsafe_signing(
+    pset: &PartiallySignedTransaction,
+    signers: &[Fingerprint],
+) -> Result<(), TemplarError> {
+    let ours: Vec<(usize, &Input)> = pset
+        .inputs()
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| signs_input(input, signers))
+        .collect();
+    if ours.is_empty() {
+        return Ok(());
+    }
+    refuse_bad_fee_outputs(pset)?;
+    for (index, input) in ours {
+        let Some(declared) = input.sighash_type else {
+            continue;
+        };
+        let declared = declared.to_u32();
+        let taproot_default = declared == SIGHASH_DEFAULT && lwk_common::is_taproot_input(input);
+        if declared != SIGHASH_ALL && !taproot_default {
+            return Err(LiquidError::SigningFailed(format!(
+                "refusing to sign input {index}: it asks for sighash type 0x{declared:02x}, \
+                 and this wallet signs SIGHASH_ALL only — any other type would let \
+                 whoever holds the transaction change what it pays"
+            ))
+            .into());
         }
     }
     Ok(())
@@ -708,6 +791,90 @@ mod tests {
         }
         // Somebody else's key on a mainnet path is not our call to make.
         refuse_non_testnet_paths(&pset_asking("deadbeef", "m/84'/1776'/0'/0/5"), &ours).unwrap();
+    }
+
+    // -- signing guard ------------------------------------------------------
+
+    /// A taproot key-spend input naming `fp` in `tap_key_origins`.
+    fn taproot_input(fp: Fingerprint, sighash: Option<u32>) -> Input {
+        use lwk_wollet::elements::pset::PsbtSighashType;
+        use lwk_wollet::elements::secp256k1_zkp::{Keypair, SecretKey};
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[5u8; 32]).unwrap());
+        let (xonly, _) = keypair.x_only_public_key();
+        let mut input = input_with(TxOut {
+            asset: Asset::Explicit(AssetId::from_byte_array([7u8; 32])),
+            value: Value::Explicit(1_000),
+            nonce: Nonce::Null,
+            script_pubkey: Script::new_v1_p2tr(&secp, xonly, None),
+            witness: Default::default(),
+        });
+        input.tap_internal_key = Some(xonly);
+        input.tap_key_origins.insert(
+            xonly,
+            (
+                vec![],
+                (
+                    fp,
+                    lwk_wollet::bitcoin::bip32::DerivationPath::from_str("m/86'/1'/0'/0/0")
+                        .unwrap(),
+                ),
+            ),
+        );
+        input.sighash_type = sighash.map(PsbtSighashType::from_u32);
+        input
+    }
+
+    fn with_fee(input: Input) -> PartiallySignedTransaction {
+        let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(input);
+        pset.add_output(Output::from_txout(TxOut::new_fee(
+            100,
+            AssetId::from_byte_array([7u8; 32]),
+        )));
+        pset
+    }
+
+    #[test]
+    fn taproot_inputs_may_ask_for_default_or_all_only() {
+        let ours = Fingerprint::from_str("73c5da0a").unwrap();
+        for ok in [None, Some(0x00), Some(0x01)] {
+            refuse_unsafe_signing(&with_fee(taproot_input(ours, ok)), &[ours])
+                .unwrap_or_else(|e| panic!("{ok:?}: {e}"));
+        }
+        for bad in [0x02u32, 0x03, 0x81, 0x82, 0x83] {
+            let err = refuse_unsafe_signing(&with_fee(taproot_input(ours, Some(bad))), &[ours])
+                .expect_err("non-default taproot sighash")
+                .to_string();
+            assert!(err.contains("SIGHASH_ALL only"), "{err}");
+        }
+        // Someone else's taproot input is theirs to judge.
+        let theirs = Fingerprint::from_str("deadbeef").unwrap();
+        refuse_unsafe_signing(&with_fee(taproot_input(theirs, Some(0x83))), &[ours]).unwrap();
+    }
+
+    #[test]
+    fn fee_outputs_are_counted_whoever_owns_the_inputs() {
+        let ours = Fingerprint::from_str("73c5da0a").unwrap();
+        let mut none = PartiallySignedTransaction::new_v2();
+        none.add_input(taproot_input(ours, None));
+        let err = refuse_bad_fee_outputs(&none).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "PSET inspection failed: PSET doesn't contain a fee output"
+        );
+        assert!(refuse_unsafe_signing(&none, &[ours]).is_err());
+        // Nobody here signs it: the signer has nothing to refuse.
+        refuse_unsafe_signing(&none, &[Fingerprint::from_str("deadbeef").unwrap()]).unwrap();
+
+        let mut two = with_fee(taproot_input(ours, None));
+        two.add_output(Output::from_txout(TxOut::new_fee(
+            100,
+            AssetId::from_byte_array([7u8; 32]),
+        )));
+        let err = refuse_bad_fee_outputs(&two).unwrap_err().to_string();
+        assert_eq!(err, "PSET inspection failed: Multiple fee outputs");
+        refuse_bad_fee_outputs(&with_fee(taproot_input(ours, None))).unwrap();
     }
 
     // -- threshold parsing ---------------------------------------------------

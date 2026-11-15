@@ -84,7 +84,10 @@ pub use liquid::protocol::{
     loan_key_at_zero, proof_fake_txid, verify_check_signature, ESCROW_KEY_PATH,
     LOAN_KEY_PATH_BIP87, PROOF_PREVOUT_TAG,
 };
-pub use liquid::pset::{PsetDetails, PsetInputInfo, PsetOutputInfo, PsetRecipient};
+pub use liquid::pset::{
+    refuse_bad_fee_outputs, refuse_unsafe_signing, PsetDetails, PsetInputInfo, PsetOutputInfo,
+    PsetRecipient,
+};
 pub use liquid::wallet::{
     fetch_asset_metadata, fetch_asset_metadata_on, LiquidBalance, LiquidTx, LiquidWalletManager,
     Pset, LIQUID_ELECTRUM_URL,

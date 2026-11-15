@@ -26,7 +26,7 @@ use crate::error::{LiquidError, TemplarError};
 use crate::frozen::first_frozen;
 use crate::liquid::chain::LiquidChain;
 use crate::liquid::network::LiquidNetwork;
-use crate::liquid::pset::{PsetInputInfo, PsetOutputInfo};
+use crate::liquid::pset::{refuse_unsafe_signing, PsetInputInfo, PsetOutputInfo};
 
 /// A Partially Signed Elements Transaction — Liquid's PSBT.
 ///
@@ -1073,9 +1073,23 @@ impl LiquidWalletManager {
             .collect())
     }
 
+    /// [`refuse_unsafe_signing`] for every key this wallet signs with: its
+    /// software signer and every key origin of its descriptor. The
+    /// co-signing routes run it before a key is unlocked; each signer below
+    /// runs the same check again for its own key.
+    pub fn refuse_unsafe_signing(&self, pset: &Pset) -> Result<(), TemplarError> {
+        let mut signers = self.wollet.signers();
+        if let Some(signer) = &self.signer {
+            signers.push(signer.fingerprint());
+        }
+        refuse_unsafe_signing(pset, &signers)
+    }
+
     /// Signs a PSET with the software signer.
     ///
-    /// Returns an error if this is a watch-only wallet.
+    /// Returns an error if this is a watch-only wallet, or if the PSET asks
+    /// the key for anything but SIGHASH_ALL or lacks a single fee output
+    /// ([`refuse_unsafe_signing`]).
     pub fn sign(
         &self,
         pset: &mut lwk_wollet::elements::pset::PartiallySignedTransaction,
@@ -1084,6 +1098,7 @@ impl LiquidWalletManager {
             .signer
             .as_ref()
             .ok_or_else(|| LiquidError::SigningFailed("Watch-only wallet cannot sign".into()))?;
+        refuse_unsafe_signing(pset, &[signer.fingerprint()])?;
         let sigs = signer
             .sign(pset)
             .map_err(|e| LiquidError::SigningFailed(e.to_string()))?;
@@ -1226,6 +1241,7 @@ impl LiquidWalletManager {
             .map_err(|e| frozen_hint(LiquidError::IssuanceFailed, "Finish PSET", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, true)?;
 
+        refuse_unsafe_signing(&pset, &[signer.fingerprint()])?;
         let sigs = signer
             .sign(&mut pset)
             .map_err(|e| LiquidError::IssuanceFailed(format!("Sign: {e}")))?;
@@ -1346,6 +1362,7 @@ impl LiquidWalletManager {
             .map_err(|e| frozen_hint(LiquidError::ReissuanceFailed, "Finish PSET", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, false)?;
 
+        refuse_unsafe_signing(&pset, &[signer.fingerprint()])?;
         let sigs = signer
             .sign(&mut pset)
             .map_err(|e| LiquidError::ReissuanceFailed(format!("Sign: {e}")))?;
@@ -1416,6 +1433,7 @@ impl LiquidWalletManager {
             .map_err(|e| frozen_hint(LiquidError::BurnFailed, "Finish PSET", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, lbtc)?;
 
+        refuse_unsafe_signing(&pset, &[signer.fingerprint()])?;
         let sigs = signer
             .sign(&mut pset)
             .map_err(|e| LiquidError::BurnFailed(format!("Sign: {e}")))?;
@@ -1494,12 +1512,14 @@ impl LiquidWalletManager {
     }
 
     /// Signs a PSET using a mnemonic (for co-signers who don't have the wallet open).
+    /// Refuses what [`refuse_unsafe_signing`] refuses.
     pub fn sign_pset_with_mnemonic(
         pset: &mut lwk_wollet::elements::pset::PartiallySignedTransaction,
         mnemonic: &str,
     ) -> Result<u32, TemplarError> {
         let signer = SwSigner::new_with_network(mnemonic, ElementsNetwork::TestnetLiquid)
             .map_err(|e| LiquidError::SigningFailed(format!("SwSigner: {e}")))?;
+        refuse_unsafe_signing(pset, &[signer.fingerprint()])?;
         let sigs = signer
             .sign(pset)
             .map_err(|e| LiquidError::SigningFailed(e.to_string()))?;
@@ -1675,5 +1695,217 @@ mod tests {
         assert_eq!(pubkey.len(), 33, "compressed pubkey must be 33 bytes");
         // Must start with 02 or 03 (compressed point prefix)
         assert!(pubkey[0] == 0x02 || pubkey[0] == 0x03);
+    }
+
+    // -- signing guard: what LWK 0.9 never signed stays unsigned -------------
+
+    use lwk_wollet::bitcoin::bip32::{DerivationPath, Fingerprint};
+    use lwk_wollet::bitcoin::PublicKey;
+    use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction, PsbtSighashType};
+    use lwk_wollet::elements::{confidential, AddressParams, OutPoint, Script, TxOut, Txid};
+    use std::str::FromStr;
+
+    /// The test mnemonic's key at `m/84'/1'/0'/0/0` and its fingerprint.
+    fn test_key() -> (PublicKey, Fingerprint, DerivationPath) {
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC, ElementsNetwork::TestnetLiquid).unwrap();
+        let path = DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap();
+        let xpub = Signer::derive_xpub(&signer, &path).unwrap();
+        (PublicKey::new(xpub.public_key), signer.fingerprint(), path)
+    }
+
+    /// An input spending 10 000 explicit testnet sats from `pk`'s P2WPKH,
+    /// naming `fp` / `path` as its key, declaring `sighash`.
+    fn input_for(
+        tag: u8,
+        pk: PublicKey,
+        fp: Fingerprint,
+        path: &DerivationPath,
+        sighash: Option<u32>,
+    ) -> Input {
+        let asset = crate::liquid::network::LiquidNetwork::testnet().policy_asset();
+        let mut input = Input::from_prevout(OutPoint::new(Txid::from_byte_array([tag; 32]), 0));
+        input.witness_utxo = Some(TxOut {
+            asset: confidential::Asset::Explicit(asset),
+            value: confidential::Value::Explicit(10_000),
+            nonce: confidential::Nonce::Null,
+            script_pubkey: Address::p2wpkh(&pk, None, &AddressParams::LIQUID_TESTNET)
+                .script_pubkey(),
+            witness: Default::default(),
+        });
+        input.bip32_derivation.insert(pk, (fp, path.clone()));
+        input.sighash_type = sighash.map(PsbtSighashType::from_u32);
+        input
+    }
+
+    /// One input the test key signs, one payment and `fees` fee outputs.
+    fn pset_for_test_key(sighash: Option<u32>, fees: usize) -> PartiallySignedTransaction {
+        let (pk, fp, path) = test_key();
+        let asset = crate::liquid::network::LiquidNetwork::testnet().policy_asset();
+        let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(input_for(0x11, pk, fp, &path, sighash));
+        pset.add_output(Output::new_explicit(
+            Script::from(vec![0u8, 20, 7, 7]),
+            9_000,
+            asset,
+            None,
+        ));
+        for _ in 0..fees {
+            pset.add_output(Output::from_txout(TxOut::new_fee(1_000, asset)));
+        }
+        pset
+    }
+
+    fn no_signature(pset: &PartiallySignedTransaction) -> bool {
+        pset.inputs().iter().all(|i| i.partial_sigs.is_empty())
+    }
+
+    /// Every software route: the mnemonic signer, the multisig loop and an
+    /// open wallet's own signer.
+    fn sign_every_way(
+        pset: &PartiallySignedTransaction,
+    ) -> Vec<Result<(u32, PartiallySignedTransaction), String>> {
+        let wallet = LiquidWalletManager::from_mnemonic_with_persist_on(
+            &LiquidNetwork::testnet(),
+            TEST_MNEMONIC,
+            None,
+        )
+        .unwrap();
+        let mut a = pset.clone();
+        let mut b = pset.clone();
+        let mut c = pset.clone();
+        vec![
+            LiquidWalletManager::sign_pset_with_mnemonic(&mut a, TEST_MNEMONIC)
+                .map(|n| (n, a))
+                .map_err(|e| e.to_string()),
+            crate::liquid::multisig::LiquidMultisigSetup::sign_pset_with_mnemonics(
+                &mut b,
+                &[TEST_MNEMONIC.to_string()],
+            )
+            .map(|n| (n, b))
+            .map_err(|e| e.to_string()),
+            wallet
+                .sign(&mut c)
+                .map(|n| (n, c))
+                .map_err(|e| e.to_string()),
+        ]
+    }
+
+    #[test]
+    fn our_input_asking_for_anything_but_sighash_all_is_never_signed() {
+        // NONE, SINGLE, ALL|ACP, NONE|ACP, SINGLE|ACP, and 0 (DEFAULT, which
+        // is taproot-only) on a segwit v0 input.
+        for sighash in [0x02u32, 0x03, 0x81, 0x82, 0x83, 0x00] {
+            let pset = pset_for_test_key(Some(sighash), 1);
+            for (route, result) in sign_every_way(&pset).into_iter().enumerate() {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("route {route} signed sighash 0x{sighash:02x}"));
+                assert!(
+                    err.contains(&format!("sighash type 0x{sighash:02x}")),
+                    "route {route}: {err}"
+                );
+            }
+            // The caller's PSET is untouched as well.
+            assert!(no_signature(&pset));
+        }
+    }
+
+    #[test]
+    fn unset_or_sighash_all_is_signed_with_sighash_all_as_before() {
+        use lwk_wollet::elements::secp256k1_zkp::{ecdsa::Signature, Message, Secp256k1};
+        use lwk_wollet::elements::sighash::SighashCache;
+        use lwk_wollet::elements::EcdsaSighashType;
+        let (pk, _, _) = test_key();
+        for sighash in [None, Some(0x01)] {
+            let pset = pset_for_test_key(sighash, 1);
+            for (route, result) in sign_every_way(&pset).into_iter().enumerate() {
+                let (added, signed) =
+                    result.unwrap_or_else(|e| panic!("route {route}, {sighash:?}: {e}"));
+                assert_eq!(added, 1, "route {route}");
+                let raw = &signed.inputs()[0].partial_sigs[&pk];
+                let (byte, der) = raw.split_last().unwrap();
+                assert_eq!(*byte, 0x01, "route {route}: SIGHASH_ALL byte");
+                let tx = signed.extract_tx().unwrap();
+                let msg = SighashCache::new(&tx).segwitv0_sighash(
+                    0,
+                    &Address::p2pkh(&pk, None, &AddressParams::LIQUID_TESTNET).script_pubkey(),
+                    confidential::Value::Explicit(10_000),
+                    EcdsaSighashType::All,
+                );
+                Secp256k1::new()
+                    .verify_ecdsa(
+                        &Message::from_digest(msg.to_byte_array()),
+                        &Signature::from_der(der).unwrap(),
+                        &pk.inner,
+                    )
+                    .unwrap_or_else(|e| panic!("route {route}: {e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_pset_without_exactly_one_fee_output_is_never_signed() {
+        for (fees, words) in [
+            (0, "PSET doesn't contain a fee output"),
+            (2, "Multiple fee outputs"),
+        ] {
+            let pset = pset_for_test_key(None, fees);
+            for (route, result) in sign_every_way(&pset).into_iter().enumerate() {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("route {route}: {fees} fees"));
+                assert!(err.contains(words), "route {route}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn another_partys_input_may_ask_for_single_anyonecanpay() {
+        // A LiquiDEX-style maker input of someone else next to ours: only our
+        // input is judged, and only our input is signed.
+        let (pk, fp, path) = test_key();
+        let mut pset = pset_for_test_key(None, 1);
+        let other_pk = PublicKey::new(
+            lwk_wollet::elements::secp256k1_zkp::SecretKey::from_slice(&[3u8; 32])
+                .unwrap()
+                .public_key(&lwk_wollet::elements::secp256k1_zkp::Secp256k1::new()),
+        );
+        let other_fp = Fingerprint::from_str("deadbeef").unwrap();
+        assert_ne!(other_fp, fp);
+        pset.add_input(input_for(0x22, other_pk, other_fp, &path, Some(0x83)));
+        for (route, result) in sign_every_way(&pset).into_iter().enumerate() {
+            let (added, signed) = result.unwrap_or_else(|e| panic!("route {route}: {e}"));
+            assert_eq!(added, 1, "route {route}");
+            assert!(signed.inputs()[0].partial_sigs.contains_key(&pk));
+            assert!(signed.inputs()[1].partial_sigs.is_empty());
+        }
+        // The same PSET with our input asking for SINGLE|ACP is refused.
+        let mut ours = pset.clone();
+        ours.inputs_mut()[0].sighash_type = Some(PsbtSighashType::from_u32(0x83));
+        assert!(sign_every_way(&ours).iter().all(|r| r.is_err()));
+    }
+
+    #[test]
+    fn a_pset_none_of_our_keys_signs_is_left_alone() {
+        // Nothing to sign, so nothing to refuse: the signers add nothing, as
+        // before (`sign_pset_with_mnemonic_no_match` covers the empty PSET).
+        let (_, _, path) = test_key();
+        let other_pk = PublicKey::new(
+            lwk_wollet::elements::secp256k1_zkp::SecretKey::from_slice(&[3u8; 32])
+                .unwrap()
+                .public_key(&lwk_wollet::elements::secp256k1_zkp::Secp256k1::new()),
+        );
+        let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(input_for(
+            0x22,
+            other_pk,
+            Fingerprint::from_str("deadbeef").unwrap(),
+            &path,
+            Some(0x82),
+        ));
+        for (route, result) in sign_every_way(&pset).into_iter().enumerate() {
+            assert_eq!(result.unwrap().0, 0, "route {route}");
+        }
     }
 }

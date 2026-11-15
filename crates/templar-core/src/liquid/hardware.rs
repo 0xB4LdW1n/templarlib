@@ -188,7 +188,12 @@ impl JadeLiquidSigner {
     /// screen, or the wallet does not belong to this device. Letting it
     /// through surfaces later as an opaque finalize failure that reads like a
     /// network fault.
+    ///
+    /// Refuses first what [`refuse_unsafe_signing`](Self::refuse_unsafe_signing)
+    /// refuses: `lwk_jade` 0.20 forwards the sighash type an input declares to
+    /// the device, where 0.9 always asked for SIGHASH_ALL.
     pub fn sign_pset(&self, pset: &mut PartiallySignedTransaction) -> Result<u32, TemplarError> {
+        self.refuse_unsafe_signing(pset)?;
         let added = Signer::sign(&self.jade, pset)
             .map_err(|e| tagged(ERR_SIGNING, format!("Jade refused to sign: {e}")))?;
         if added == 0 {
@@ -199,6 +204,18 @@ impl JadeLiquidSigner {
             ));
         }
         Ok(added)
+    }
+
+    /// [`crate::liquid::pset::refuse_unsafe_signing`] for this device's key.
+    pub fn refuse_unsafe_signing(
+        &self,
+        pset: &PartiallySignedTransaction,
+    ) -> Result<(), TemplarError> {
+        let fingerprint = self
+            .jade
+            .fingerprint()
+            .map_err(|e| tagged(ERR_DEVICE_NOT_READY, e))?;
+        crate::liquid::pset::refuse_unsafe_signing(pset, &[fingerprint])
     }
 
     /// The device's BIP87 cosigner key: `[fp/87h/1h/0h]tpub…`.
@@ -268,6 +285,8 @@ impl JadeLiquidSigner {
         ct_descriptor: &str,
         pset: &mut PartiallySignedTransaction,
     ) -> Result<u32, TemplarError> {
+        // Before the registration, which the user confirms on screen.
+        self.refuse_unsafe_signing(pset)?;
         self.register_multisig(name, ct_descriptor)?;
         self.sign_pset(pset)
     }

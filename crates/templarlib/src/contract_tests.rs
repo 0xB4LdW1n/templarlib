@@ -2061,6 +2061,122 @@ fn regtest_node_sync_and_send_end_to_end() {
     );
 }
 
+// ── Liquid co-signing guard ────────────────────────────────────────
+
+/// A testnet PSET for the test mnemonic's `m/2121'/1'/0'/0/0` key (a loan
+/// key: outside the wallet descriptor, signed through the fingerprint like
+/// any co-signed input): one explicit 10 000-sat input declaring `sighash`,
+/// one 9 000-sat payment and `fees` fee outputs of 1 000. Base64.
+fn guard_pset(sighash: Option<u32>, fees: usize) -> String {
+    use lwk_wollet::bitcoin::bip32::{DerivationPath, Xpriv};
+    use lwk_wollet::bitcoin::secp256k1::Secp256k1;
+    use lwk_wollet::bitcoin::PublicKey;
+    use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction, PsbtSighashType};
+    use lwk_wollet::elements::{
+        confidential, Address, AddressParams, AssetId, OutPoint, Script, TxOut, Txid,
+    };
+    use std::str::FromStr;
+
+    let secp = Secp256k1::new();
+    let master = Xpriv::from_str(&templar_core::master_xprv(MNEMONIC).unwrap()).unwrap();
+    let path = DerivationPath::from_str("m/2121'/1'/0'/0/0").unwrap();
+    let pk = PublicKey::new(
+        master
+            .derive_priv(&secp, &path)
+            .unwrap()
+            .private_key
+            .public_key(&secp),
+    );
+    let lbtc = AssetId::from_str(templar_core::TESTNET_POLICY_ASSET).unwrap();
+    let mut input = Input::from_prevout(OutPoint::new(Txid::from_byte_array([0x33; 32]), 0));
+    input.witness_utxo = Some(TxOut {
+        asset: confidential::Asset::Explicit(lbtc),
+        value: confidential::Value::Explicit(10_000),
+        nonce: confidential::Nonce::Null,
+        script_pubkey: Address::p2wpkh(&pk, None, &AddressParams::LIQUID_TESTNET).script_pubkey(),
+        witness: Default::default(),
+    });
+    input
+        .bip32_derivation
+        .insert(pk, (master.fingerprint(&secp), path));
+    input.sighash_type = sighash.map(PsbtSighashType::from_u32);
+    let mut pset = PartiallySignedTransaction::new_v2();
+    pset.add_input(input);
+    pset.add_output(Output::new_explicit(
+        Script::from(vec![0u8, 20, 9, 9, 9]),
+        9_000,
+        lbtc,
+        None,
+    ));
+    for _ in 0..fees {
+        pset.add_output(Output::from_txout(TxOut::new_fee(1_000, lbtc)));
+    }
+    templar_core::LiquidWalletManager::pset_to_base64(&pset).unwrap()
+}
+
+/// `sign_pset` signs what LWK 0.9 signed and nothing else: an input of ours
+/// asking for anything but SIGHASH_ALL, or a PSET without exactly one fee
+/// output, is refused with a plain `err` and no signature; unset and
+/// SIGHASH_ALL are signed SIGHASH_ALL. Inspection still describes them all.
+#[test]
+fn sign_pset_signs_sighash_all_and_one_fee_output_only() {
+    let mut env = TestEnv::new();
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Cosigner", "mnemonic": MNEMONIC, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+
+    for sighash in [0x02u32, 0x03, 0x81, 0x82, 0x83] {
+        let pset = guard_pset(Some(sighash), 1);
+        let d = env.ok(
+            "inspect_pset",
+            json!({ "wallet_id": id, "pset_base64": pset }),
+        );
+        assert_eq!(d["inputs"][0]["is_ours"], json!(true));
+        let resp = env.call("sign_pset", json!({ "wallet_id": id, "pset_base64": pset }));
+        assert_keys("sign_pset refusal", &resp, &["err"]);
+        assert!(resp.get("ok").is_none(), "{resp}");
+        let err = resp["err"].as_str().unwrap();
+        assert!(
+            err.contains(&format!("sighash type 0x{sighash:02x}"))
+                && err.contains("SIGHASH_ALL only"),
+            "0x{sighash:02x}: {err}"
+        );
+    }
+
+    for (fees, words) in [
+        (
+            0,
+            "PSET inspection failed: PSET doesn't contain a fee output",
+        ),
+        (2, "PSET inspection failed: Multiple fee outputs"),
+    ] {
+        let pset = guard_pset(None, fees);
+        // Described…
+        let d = env.ok(
+            "inspect_pset",
+            json!({ "wallet_id": id, "pset_base64": pset }),
+        );
+        assert_eq!(d["fee_sats"], json!(1_000 * fees as i64));
+        // …but not signed, in LWK 0.9's words.
+        let err = env.err("sign_pset", json!({ "wallet_id": id, "pset_base64": pset }));
+        assert_eq!(err, words);
+    }
+
+    for sighash in [None, Some(0x01)] {
+        let signed = env.ok(
+            "sign_pset",
+            json!({ "wallet_id": id, "pset_base64": guard_pset(sighash, 1) }),
+        );
+        let signed =
+            templar_core::LiquidWalletManager::pset_from_base64(signed.as_str().unwrap()).unwrap();
+        let sigs: Vec<_> = signed.inputs()[0].partial_sigs.values().collect();
+        assert_eq!(sigs.len(), 1, "{sighash:?}");
+        assert_eq!(sigs[0].last(), Some(&0x01), "{sighash:?}: SIGHASH_ALL byte");
+    }
+}
+
 // ── Templar Protocol connector ─────────────────────────────────────
 
 /// A testnet PSET spending a fake Templar Protocol escrow whose contract names the

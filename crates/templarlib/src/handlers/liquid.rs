@@ -640,8 +640,11 @@ pub fn inspect_pset(
 /// wallet the transaction was built from.
 /// The checks every Liquid signing route runs before a key touches the PSET,
 /// whoever the caller is: the PSET belongs to this wallet's network and
-/// derivations ([`LiquidWalletManager::inspect_pset`]), and every output it
-/// asks the key to pay says what it pays in a way the commitments prove.
+/// derivations ([`LiquidWalletManager::inspect_pset`]), it has exactly one
+/// fee output, the inputs this wallet signs ask for SIGHASH_ALL only
+/// ([`templar_core::refuse_unsafe_signing`]; the signers check again), and
+/// every output it asks the key to pay says what it pays in a way the
+/// commitments prove.
 fn ensure_pset_signable(state: &AppState, pset_base64: &str) -> Result<(), String> {
     let liq = state
         .liquid
@@ -649,6 +652,11 @@ fn ensure_pset_signable(state: &AppState, pset_base64: &str) -> Result<(), Strin
         .ok_or("Open this wallet's Liquid side before signing a Liquid transaction")?;
     let pset = LiquidWalletManager::pset_from_base64(pset_base64).map_err(|e| e.to_string())?;
     let details = liq.inspect_pset(&pset).map_err(|e| e.to_string())?;
+    // LWK 0.9 refused these while inspecting; 0.20 describes them, so the
+    // signing routes refuse them here, whoever the inputs belong to.
+    templar_core::refuse_bad_fee_outputs(&pset).map_err(|e| e.to_string())?;
+    liq.refuse_unsafe_signing(&pset)
+        .map_err(|e| e.to_string())?;
     if details.has_unverified_outputs() {
         return Err(
             "Refusing to sign: an output of this transaction claims an amount or asset its \

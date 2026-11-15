@@ -175,7 +175,8 @@ impl LiquidMultisigSetup {
     /// own. Returns the total number of signatures added.
     ///
     /// Zero added is *not* an error here — the caller decides, because a
-    /// coordinator with no local key legitimately adds none.
+    /// coordinator with no local key legitimately adds none. Each key first
+    /// passes [`crate::liquid::pset::refuse_unsafe_signing`].
     pub fn sign_pset_with_mnemonics(
         pset: &mut PartiallySignedTransaction,
         mnemonics: &[String],
@@ -184,6 +185,7 @@ impl LiquidMultisigSetup {
         for mnemonic in mnemonics {
             let signer = SwSigner::new_with_network(mnemonic, lwk_wollet::Network::TestnetLiquid)
                 .map_err(|e| LiquidError::SigningFailed(format!("SwSigner: {e}")))?;
+            crate::liquid::pset::refuse_unsafe_signing(pset, &[signer.fingerprint()])?;
             added += signer
                 .sign(pset)
                 .map_err(|e| LiquidError::SigningFailed(e.to_string()))?;
