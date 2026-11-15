@@ -42,14 +42,17 @@ A Liquid PSET built elsewhere (a cosigner, a protocol site) passes these
 before a key touches it. The co-signing routes (`sign_pset`, `sign_pset_hw`)
 run them in `ensure_pset_signable`, before any key is unlocked:
 `inspect_pset` (network, mainnet derivation paths), exactly one fee output,
-SIGHASH_ALL only on the inputs this wallet signs, outputs whose amounts the
-commitments prove, then the frozen coins. Every signer in `templar-core` —
+no taproot input among the inputs this wallet signs and SIGHASH_ALL only on
+the others, outputs whose amounts the commitments prove, then the frozen
+coins. Every signer in `templar-core` —
 `LiquidWalletManager::sign`, `sign_pset_with_mnemonic`, issuance, reissuance
 and burn, `LiquidMultisigSetup::sign_pset_with_mnemonics`, the Jade's
 `sign_pset` and `sign_multisig_pset` — runs the fee and sighash rules again
 for its own key (`refuse_unsafe_signing`, `liquid/pset.rs`), so no route
-reaches a key without them. LWK 0.9 enforced both rules itself; 0.20 signs
-whatever sighash type an input declares. LiquiDEX signs its own
+reaches a key without them. The wallet does not sign taproot inputs on
+Liquid. LWK 0.9 enforced these rules itself; 0.20 signs whatever sighash
+type an input declares, and signs taproot inputs through `tap_key_origins`
+at any path, a mainnet coin type included. LiquiDEX signs its own
 `SIGHASH_SINGLE|ANYONECANPAY` maker input without these signers.
 
 ## State

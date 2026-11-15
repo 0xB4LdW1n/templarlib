@@ -86,9 +86,15 @@ with 0, any release may change the method contract.
   pays. Every Liquid signer of `templar-core` now runs
   `refuse_unsafe_signing` for its key first, and `sign_pset` /
   `sign_pset_hw` run it before any key is unlocked: an input this wallet
-  signs may declare no sighash type or SIGHASH_ALL only (SIGHASH_DEFAULT
-  too on taproot), and the PSET must have exactly one fee output
-  (`refuse_bad_fee_outputs`, LWK 0.9's rule and words). Other parties'
+  signs may declare no sighash type or SIGHASH_ALL only, and the PSET must
+  have exactly one fee output (`refuse_bad_fee_outputs`, LWK 0.9's rule and
+  words).
+- The wallet does not sign taproot inputs on Liquid. LWK 0.9 never signed
+  through `tap_key_origins`; 0.20's software signer does, at whatever path
+  the PSET names — a mainnet coin type included, which the mainnet-path
+  check (it reads `bip32_derivation`) does not see. `refuse_unsafe_signing`
+  refuses every taproot input one of the wallet's keys would sign, on every
+  route above. Other parties'
   inputs are not judged, and LiquiDEX keeps signing its maker input
   SIGHASH_SINGLE|ANYONECANPAY with its own signer.
 - Rust API of `templar-core`: `LiquidNetwork::elements`, `from_elements`,

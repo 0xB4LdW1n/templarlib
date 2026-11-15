@@ -33,8 +33,10 @@ Particularly interesting:
   `crates/templar-core/src/liquid/pset.rs`, the `inspect_*` and `sign_*`
   methods);
 - spending a frozen coin, or making the library sign for a coin or a key it
-  should not, or sign one of its inputs with a sighash type other than
-  SIGHASH_ALL (`refuse_unsafe_signing` in `crates/templar-core/src/liquid/pset.rs`);
+  should not, sign one of its inputs with a sighash type other than
+  SIGHASH_ALL, or sign a taproot input at all — the wallet does not sign
+  taproot inputs on Liquid (`refuse_unsafe_signing` in
+  `crates/templar-core/src/liquid/pset.rs`);
 - a Templar Protocol check PSET ([docs/CONNECTOR.md §9](docs/CONNECTOR.md#9-proof-of-key--the-check-pset))
   that the wallet accepts as a proof but that can move funds, or that is
   valid for another site or challenge;
