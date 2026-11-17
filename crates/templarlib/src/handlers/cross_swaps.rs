@@ -1,8 +1,12 @@
 //! Real testnet Bitcoin <-> Liquid atomic-swap workflow.
 //!
-//! The localhost order book is only a public state coordinator. Swap keys and
-//! the maker preimage are deterministically recovered from the software-wallet
-//! seed and never sent to the server.
+//! The order book is only a public state coordinator, and an untrusted one.
+//! Swap keys and the maker preimage are deterministically recovered from the
+//! software-wallet seed and never sent to the server. The terms a wallet
+//! created or accepted (legs, amounts, hash, keys, timeouts) are kept in
+//! `atomic_swaps.json`; every fund, claim and refund rebuilds both HTLCs from
+//! them and refuses a coordinator row that disagrees, so a lying coordinator
+//! can stall a swap but never redirect a payment.
 
 use std::fs;
 use std::str::FromStr;
@@ -92,6 +96,259 @@ struct StoredAtomicSwap {
     wallet_id: String,
     role: String,
     key_index: u32,
+    /// The coordinator the swap lives on; another one's row with the same
+    /// id is not this swap.
+    #[serde(default)]
+    coordinator: Option<String>,
+    /// The terms this wallet created or accepted. Every action rebuilds
+    /// both contracts from them and the wallet's own key; the coordinator's
+    /// row must agree, or nothing is paid, claimed or refunded.
+    #[serde(default)]
+    terms: Option<AcceptedTerms>,
+}
+
+/// What a swap is, as this wallet created (maker) or accepted (taker) it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct AcceptedTerms {
+    offered_chain: String,
+    offered_asset_id: String,
+    offered_amount_sats: u64,
+    wanted_chain: String,
+    wanted_asset_id: String,
+    wanted_amount_sats: u64,
+    payment_hash: String,
+    maker_pubkey: String,
+    maker_timeout: u64,
+    /// Learned by the maker when the taker reserves the swap.
+    #[serde(default)]
+    taker_pubkey: Option<String>,
+    #[serde(default)]
+    taker_timeout: Option<u64>,
+}
+
+/// Least time the maker keeps after the taker's timeout, as `join` asks.
+const TIMEOUT_GAP_SECS: u64 = 3_600;
+
+impl AcceptedTerms {
+    fn from_state(s: &AtomicSwapState) -> Self {
+        Self {
+            offered_chain: s.offered_chain.clone(),
+            offered_asset_id: s.offered_asset_id.to_ascii_lowercase(),
+            offered_amount_sats: s.offered_amount_sats,
+            wanted_chain: s.wanted_chain.clone(),
+            wanted_asset_id: s.wanted_asset_id.to_ascii_lowercase(),
+            wanted_amount_sats: s.wanted_amount_sats,
+            payment_hash: s.payment_hash.to_ascii_lowercase(),
+            maker_pubkey: s.maker_refund_pubkey.clone(),
+            maker_timeout: s.maker_timeout,
+            taker_pubkey: s.taker_claim_pubkey.clone(),
+            taker_timeout: s.taker_timeout,
+        }
+    }
+
+    /// The maker's contract (on the offered chain): the taker claims with
+    /// the preimage, the maker refunds after `maker_timeout`.
+    fn maker_contract(&self) -> Result<templar_core::HtlcContract, String> {
+        let taker = self
+            .taker_pubkey
+            .clone()
+            .ok_or("The taker has not joined yet")?;
+        contract(
+            &self.offered_chain,
+            HtlcTerms {
+                payment_hash: self.payment_hash.clone(),
+                claim_pubkey: taker,
+                refund_pubkey: self.maker_pubkey.clone(),
+                timeout: self.maker_timeout,
+            },
+        )
+    }
+
+    /// The taker's contract (on the wanted chain): the maker claims with
+    /// the preimage, the taker refunds after `taker_timeout`.
+    fn taker_contract(&self) -> Result<templar_core::HtlcContract, String> {
+        let taker = self
+            .taker_pubkey
+            .clone()
+            .ok_or("The taker has not joined yet")?;
+        contract(
+            &self.wanted_chain,
+            HtlcTerms {
+                payment_hash: self.payment_hash.clone(),
+                claim_pubkey: self.maker_pubkey.clone(),
+                refund_pubkey: taker,
+                timeout: self.taker_timeout.ok_or("The taker has not joined yet")?,
+            },
+        )
+    }
+}
+
+/// Refuses a coordinator row that disagrees with the accepted terms: the
+/// legs, the hash, the keys, the timeouts, and any contract it publishes
+/// (which must be the one rebuilt from the terms).
+fn check_row(row: &AtomicSwapRow, terms: &AcceptedTerms) -> Result<(), String> {
+    let s = &row.state;
+    let mut wrong = Vec::new();
+    let mut same = |what: &str, ok: bool| {
+        if !ok {
+            wrong.push(what.to_string());
+        }
+    };
+    same("offered chain", s.offered_chain == terms.offered_chain);
+    same(
+        "offered asset",
+        s.offered_asset_id
+            .eq_ignore_ascii_case(&terms.offered_asset_id),
+    );
+    same(
+        "offered amount",
+        s.offered_amount_sats == terms.offered_amount_sats,
+    );
+    same("wanted chain", s.wanted_chain == terms.wanted_chain);
+    same(
+        "wanted asset",
+        s.wanted_asset_id
+            .eq_ignore_ascii_case(&terms.wanted_asset_id),
+    );
+    same(
+        "wanted amount",
+        s.wanted_amount_sats == terms.wanted_amount_sats,
+    );
+    same(
+        "payment hash",
+        s.payment_hash.eq_ignore_ascii_case(&terms.payment_hash),
+    );
+    same("maker key", s.maker_refund_pubkey == terms.maker_pubkey);
+    same("maker timeout", s.maker_timeout == terms.maker_timeout);
+    if terms.taker_pubkey.is_some() {
+        same("taker key", s.taker_claim_pubkey == terms.taker_pubkey);
+        same("taker timeout", s.taker_timeout == terms.taker_timeout);
+        let maker = terms.maker_contract()?;
+        let taker = terms.taker_contract()?;
+        let matches =
+            |addr: &Option<String>, script: &Option<String>, c: &templar_core::HtlcContract| {
+                addr.as_deref().is_none_or(|a| a == c.address)
+                    && script
+                        .as_deref()
+                        .is_none_or(|x| x.eq_ignore_ascii_case(&c.script_hex))
+            };
+        same(
+            "maker contract",
+            matches(&s.maker_contract_address, &s.maker_contract_script, &maker),
+        );
+        same(
+            "taker contract",
+            matches(&s.taker_contract_address, &s.taker_contract_script, &taker),
+        );
+    }
+    if wrong.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "The swap coordinator's record of swap {} no longer matches the terms this wallet \
+             accepted ({}); nothing was signed.",
+            row.id,
+            wrong.join(", ")
+        ))
+    }
+}
+
+/// The accepted terms of `local`, checked against the coordinator's `row`.
+/// A maker learns (and keeps) the taker's key and timeout once, when the
+/// swap is reserved, after checking the timeout leaves it time to claim.
+/// A record written before terms were kept adopts the row's, but only if
+/// the wallet's own part of it (its key, and for a maker the hash of its
+/// preimage) is what its seed derives.
+fn accepted_terms(
+    state: &AppState,
+    local: &mut StoredAtomicSwap,
+    row: &AtomicSwapRow,
+) -> Result<AcceptedTerms, String> {
+    let coordinator = api(state);
+    if local
+        .coordinator
+        .as_deref()
+        .is_some_and(|c| c != coordinator)
+    {
+        return Err(
+            "This swap lives on another swap coordinator; join that test server to follow it."
+                .into(),
+        );
+    }
+    if row.id != local.offer_id {
+        return Err("The swap coordinator answered for another swap".into());
+    }
+    let maker = local.role == "maker";
+    let mnemonic = mnemonic(state, &local.wallet_id)?;
+    let own = swap_public_key(
+        &derive_swap_secret_key(mnemonic, if maker { 0 } else { 1 }, local.key_index)
+            .map_err(|e| e.to_string())?,
+    )
+    .to_string();
+    let mut changed = false;
+    let mut terms = match local.terms.clone() {
+        Some(t) => t,
+        None => {
+            let t = AcceptedTerms::from_state(&row.state);
+            let own_part = if maker {
+                let key = derive_swap_secret_key(mnemonic, 0, local.key_index)
+                    .map_err(|e| e.to_string())?;
+                t.maker_pubkey == own
+                    && t.payment_hash == sha256_hex(&deterministic_preimage(&key.secret_bytes()))
+            } else {
+                t.taker_pubkey.as_deref() == Some(own.as_str())
+            };
+            if !own_part {
+                return Err(format!(
+                    "The swap coordinator's record of swap {} does not carry this wallet's key; \
+                     nothing was signed.",
+                    row.id
+                ));
+            }
+            changed = true;
+            t
+        }
+    };
+    if maker && terms.taker_pubkey.is_none() {
+        if let (Some(key), Some(timeout)) = (&row.state.taker_claim_pubkey, row.state.taker_timeout)
+        {
+            bdk::bitcoin::secp256k1::PublicKey::from_str(key)
+                .map_err(|_| "The taker's key is not a public key".to_string())?;
+            if timeout.saturating_add(TIMEOUT_GAP_SECS) > terms.maker_timeout
+                || timeout <= now_secs()
+            {
+                return Err(format!(
+                    "The taker's timeout {timeout} leaves this wallet no safe time to claim before \
+                     its own refund at {}; nothing was signed.",
+                    terms.maker_timeout
+                ));
+            }
+            terms.taker_pubkey = Some(key.clone());
+            terms.taker_timeout = Some(timeout);
+            changed = true;
+        }
+    }
+    check_row(row, &terms)?;
+    if changed {
+        local.terms = Some(terms.clone());
+        local.coordinator = Some(coordinator);
+        save_local(state, local)?;
+    }
+    Ok(terms)
+}
+
+/// Writes one swap record back.
+fn save_local(state: &AppState, local: &StoredAtomicSwap) -> Result<(), String> {
+    let mut store = load_store(state)?;
+    match store
+        .swaps
+        .iter_mut()
+        .find(|s| s.wallet_id == local.wallet_id && s.offer_id == local.offer_id)
+    {
+        Some(slot) => *slot = local.clone(),
+        None => store.swaps.push(local.clone()),
+    }
+    save_store(state, &store)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -158,6 +415,7 @@ pub fn create(state: &AppState, p: CreateParams) -> Result<MyAtomicSwap, String>
         swap_public_key(&maker_key).to_string(),
         p.note,
     );
+    let terms = AcceptedTerms::from_state(&state_public);
     let row: AtomicSwapRow = post_json(
         &api(state),
         &serde_json::json!({
@@ -165,11 +423,15 @@ pub fn create(state: &AppState, p: CreateParams) -> Result<MyAtomicSwap, String>
             "state": state_public,
         }),
     )?;
+    // The coordinator stores what it was given, or the swap is not made.
+    check_row(&row, &terms)?;
     store.swaps.push(StoredAtomicSwap {
         offer_id: row.id,
         wallet_id: p.wallet_id.clone(),
         role: "maker".into(),
         key_index,
+        coordinator: Some(api(state)),
+        terms: Some(terms),
     });
     save_store(state, &store)?;
     Ok(enrich(row, &p.wallet_id, "maker", key_index))
@@ -179,6 +441,9 @@ pub fn join(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
     let mnemonic = mnemonic(state, &p.wallet_id)?;
     let mut row = fetch(state, p.offer_id)?;
+    if row.id != p.offer_id {
+        return Err("The swap coordinator answered for another swap".into());
+    }
     if row.status != "open" {
         return Err("Offer is no longer open".into());
     }
@@ -190,35 +455,31 @@ pub fn join(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     let taker_key = derive_swap_secret_key(mnemonic, 1, key_index).map_err(|e| e.to_string())?;
     let taker_pubkey = swap_public_key(&taker_key).to_string();
     let now = now_secs();
-    if row.state.maker_timeout <= now + TAKER_TIMEOUT_SECS + 3_600 {
+    if row.state.maker_timeout <= now + TAKER_TIMEOUT_SECS + TIMEOUT_GAP_SECS {
         return Err("Maker refund window is too short; create a fresh offer".into());
     }
-    row.state.taker_claim_pubkey = Some(taker_pubkey.clone());
+    bdk::bitcoin::secp256k1::PublicKey::from_str(&row.state.maker_refund_pubkey)
+        .map_err(|_| "The maker's key is not a public key".to_string())?;
+    // What the user accepts by joining: the offer as shown, with this
+    // wallet's key and timeout. From here on these terms are the swap.
+    row.state.taker_claim_pubkey = Some(taker_pubkey);
     row.state.taker_timeout = Some(now + TAKER_TIMEOUT_SECS);
-    let maker_terms = HtlcTerms {
-        payment_hash: row.state.payment_hash.clone(),
-        claim_pubkey: taker_pubkey.clone(),
-        refund_pubkey: row.state.maker_refund_pubkey.clone(),
-        timeout: row.state.maker_timeout,
-    };
-    let taker_terms = HtlcTerms {
-        payment_hash: row.state.payment_hash.clone(),
-        claim_pubkey: row.state.maker_refund_pubkey.clone(),
-        refund_pubkey: taker_pubkey,
-        timeout: row.state.taker_timeout.expect("set"),
-    };
-    let maker_contract = contract(&row.state.offered_chain, maker_terms)?;
-    let taker_contract = contract(&row.state.wanted_chain, taker_terms)?;
+    let terms = AcceptedTerms::from_state(&row.state);
+    let maker_contract = terms.maker_contract()?;
+    let taker_contract = terms.taker_contract()?;
     row.state.maker_contract_address = Some(maker_contract.address);
     row.state.maker_contract_script = Some(maker_contract.script_hex);
     row.state.taker_contract_address = Some(taker_contract.address);
     row.state.taker_contract_script = Some(taker_contract.script_hex);
     row = transition(state, &row, "reserved")?;
+    check_row(&row, &terms)?;
     store.swaps.push(StoredAtomicSwap {
         offer_id: row.id,
         wallet_id: p.wallet_id.clone(),
         role: "taker".into(),
         key_index,
+        coordinator: Some(api(state)),
+        terms: Some(terms),
     });
     save_store(state, &store)?;
     Ok(enrich(row, &p.wallet_id, "taker", key_index))
@@ -234,9 +495,13 @@ pub fn list_mine(state: &AppState, wallet_id: &str) -> Result<Vec<MyAtomicSwap>,
         .collect()
 }
 
+/// Funds this wallet's side: the maker pays its contract on the offered
+/// chain; the taker first checks the maker's funding on chain, then pays
+/// its contract on the wanted chain. Both contracts are rebuilt from the
+/// accepted terms; the coordinator's addresses are only compared.
 pub fn fund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
-    let local = owned(state, &p.wallet_id, p.offer_id)?;
+    let mut local = owned(state, &p.wallet_id, p.offer_id)?;
     let mut row = fetch(state, p.offer_id)?;
     let maker = local.role == "maker";
     if (maker && row.status != "reserved") || (!maker && row.status != "maker_funded") {
@@ -245,32 +510,16 @@ pub fn fund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
             local.role, row.status
         ));
     }
-    let (chain, asset, amount, address) = if maker {
-        (
-            &row.state.offered_chain,
-            &row.state.offered_asset_id,
-            row.state.offered_amount_sats,
-            row.state.maker_contract_address.as_deref(),
-        )
-    } else {
-        (
-            &row.state.wanted_chain,
-            &row.state.wanted_asset_id,
-            row.state.wanted_amount_sats,
-            row.state.taker_contract_address.as_deref(),
-        )
-    };
-    let address = address.ok_or("HTLC contract is missing")?;
+    let terms = accepted_terms(state, &mut local, &row)?;
+    let maker_contract = terms.maker_contract()?;
+    let taker_contract = terms.taker_contract()?;
     if !maker {
         verify_funding(
             state,
-            &row.state.offered_chain,
-            &row.state.offered_asset_id,
-            row.state.offered_amount_sats,
-            row.state
-                .maker_contract_address
-                .as_deref()
-                .ok_or("Maker contract missing")?,
+            &terms.offered_chain,
+            &terms.offered_asset_id,
+            terms.offered_amount_sats,
+            &maker_contract.address,
             row.state
                 .maker_funding_txid
                 .as_deref()
@@ -280,6 +529,21 @@ pub fn fund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
                 .ok_or("Maker funding vout missing")?,
         )?;
     }
+    let (chain, asset, amount, address) = if maker {
+        (
+            &terms.offered_chain,
+            &terms.offered_asset_id,
+            terms.offered_amount_sats,
+            &maker_contract.address,
+        )
+    } else {
+        (
+            &terms.wanted_chain,
+            &terms.wanted_asset_id,
+            terms.wanted_amount_sats,
+            &taker_contract.address,
+        )
+    };
     let funded = fund_contract(state, chain, asset, amount, address)?;
     if maker {
         row.state.maker_funding_txid = Some(funded.txid);
@@ -295,9 +559,12 @@ pub fn fund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     Ok(enrich(row, &p.wallet_id, &local.role, local.key_index))
 }
 
+/// Claims the counterparty's contract with the preimage: the maker its
+/// own (derived from its seed), the taker the one the maker revealed,
+/// checked against the accepted hash.
 pub fn claim(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
-    let local = owned(state, &p.wallet_id, p.offer_id)?;
+    let mut local = owned(state, &p.wallet_id, p.offer_id)?;
     let mut row = fetch(state, p.offer_id)?;
     let maker = local.role == "maker";
     if (maker && row.status != "taker_funded") || (!maker && row.status != "maker_claimed") {
@@ -306,10 +573,11 @@ pub fn claim(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
             local.role, row.status
         ));
     }
+    let terms = accepted_terms(state, &mut local, &row)?;
     let mnemonic = mnemonic(state, &p.wallet_id)?;
     let key = derive_swap_secret_key(mnemonic, if maker { 0 } else { 1 }, local.key_index)
         .map_err(|e| e.to_string())?;
-    let preimage = if maker {
+    let preimage: [u8; 32] = if maker {
         deterministic_preimage(&key.secret_bytes())
     } else {
         let raw = row
@@ -322,70 +590,41 @@ pub fn claim(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
             .try_into()
             .map_err(|_| "Preimage must be 32 bytes".to_string())?
     };
-    let (chain, asset, amount, txid, vout, script, terms) = if maker {
+    if sha256_hex(&preimage) != terms.payment_hash {
+        return Err("The preimage does not match the swap's payment hash".into());
+    }
+    let (chain, asset, amount, txid, vout, c) = if maker {
         (
-            &row.state.wanted_chain,
-            &row.state.wanted_asset_id,
-            row.state.wanted_amount_sats,
-            row.state.taker_funding_txid.as_deref(),
+            &terms.wanted_chain,
+            &terms.wanted_asset_id,
+            terms.wanted_amount_sats,
+            row.state.taker_funding_txid.clone(),
             row.state.taker_funding_vout,
-            row.state.taker_contract_script.as_deref(),
-            HtlcTerms {
-                payment_hash: row.state.payment_hash.clone(),
-                claim_pubkey: row.state.maker_refund_pubkey.clone(),
-                refund_pubkey: row
-                    .state
-                    .taker_claim_pubkey
-                    .clone()
-                    .ok_or("Taker pubkey missing")?,
-                timeout: row.state.taker_timeout.ok_or("Taker timeout missing")?,
-            },
+            terms.taker_contract()?,
         )
     } else {
         (
-            &row.state.offered_chain,
-            &row.state.offered_asset_id,
-            row.state.offered_amount_sats,
-            row.state.maker_funding_txid.as_deref(),
+            &terms.offered_chain,
+            &terms.offered_asset_id,
+            terms.offered_amount_sats,
+            row.state.maker_funding_txid.clone(),
             row.state.maker_funding_vout,
-            row.state.maker_contract_script.as_deref(),
-            HtlcTerms {
-                payment_hash: row.state.payment_hash.clone(),
-                claim_pubkey: row
-                    .state
-                    .taker_claim_pubkey
-                    .clone()
-                    .ok_or("Taker pubkey missing")?,
-                refund_pubkey: row.state.maker_refund_pubkey.clone(),
-                timeout: row.state.maker_timeout,
-            },
+            terms.maker_contract()?,
         )
     };
-    let contract_address = if maker {
-        row.state.taker_contract_address.as_deref()
-    } else {
-        row.state.maker_contract_address.as_deref()
-    }
-    .ok_or("HTLC contract address missing")?;
-    verify_funding(
-        state,
-        chain,
-        asset,
-        amount,
-        contract_address,
-        txid.ok_or("Funding txid missing")?,
-        vout.ok_or("Funding vout missing")?,
-    )?;
+    let txid = txid.ok_or("Funding txid missing")?;
+    let vout = vout.ok_or("Funding vout missing")?;
+    verify_funding(state, chain, asset, amount, &c.address, &txid, vout)?;
     let spend_txid = spend_contract(
         state,
         SpendSpec {
             chain,
             asset,
             amount,
-            funding_txid: txid.expect("verified"),
-            funding_vout: vout.expect("verified"),
-            script_hex: script.ok_or("HTLC script missing")?,
-            terms,
+            funding_txid: &txid,
+            funding_vout: vout,
+            script_hex: &c.script_hex,
+            terms: c.terms.clone(),
             preimage: Some(hex::encode(preimage)),
             key: key.secret_bytes(),
         },
@@ -401,15 +640,18 @@ pub fn claim(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     Ok(enrich(row, &p.wallet_id, &local.role, local.key_index))
 }
 
+/// Takes this wallet's own contract back after its timeout (from the
+/// accepted terms, not the coordinator's).
 pub fn refund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     require_testnet_software(state, &p.wallet_id)?;
-    let local = owned(state, &p.wallet_id, p.offer_id)?;
+    let mut local = owned(state, &p.wallet_id, p.offer_id)?;
     let mut row = fetch(state, p.offer_id)?;
     let maker = local.role == "maker";
+    let terms = accepted_terms(state, &mut local, &row)?;
     let timeout = if maker {
-        row.state.maker_timeout
+        terms.maker_timeout
     } else {
-        row.state.taker_timeout.ok_or("Taker timeout missing")?
+        terms.taker_timeout.ok_or("Taker timeout missing")?
     };
     if now_secs() < timeout {
         return Err(format!("Refund unlocks at Unix time {timeout}"));
@@ -417,70 +659,38 @@ pub fn refund(state: &AppState, p: IdParams) -> Result<MyAtomicSwap, String> {
     let mnemonic = mnemonic(state, &p.wallet_id)?;
     let key = derive_swap_secret_key(mnemonic, if maker { 0 } else { 1 }, local.key_index)
         .map_err(|e| e.to_string())?;
-    let (chain, asset, amount, txid, vout, script, terms) = if maker {
+    let (chain, asset, amount, txid, vout, c) = if maker {
         (
-            &row.state.offered_chain,
-            &row.state.offered_asset_id,
-            row.state.offered_amount_sats,
-            row.state.maker_funding_txid.as_deref(),
+            &terms.offered_chain,
+            &terms.offered_asset_id,
+            terms.offered_amount_sats,
+            row.state.maker_funding_txid.clone(),
             row.state.maker_funding_vout,
-            row.state.maker_contract_script.as_deref(),
-            HtlcTerms {
-                payment_hash: row.state.payment_hash.clone(),
-                claim_pubkey: row
-                    .state
-                    .taker_claim_pubkey
-                    .clone()
-                    .ok_or("Taker pubkey missing")?,
-                refund_pubkey: row.state.maker_refund_pubkey.clone(),
-                timeout: row.state.maker_timeout,
-            },
+            terms.maker_contract()?,
         )
     } else {
         (
-            &row.state.wanted_chain,
-            &row.state.wanted_asset_id,
-            row.state.wanted_amount_sats,
-            row.state.taker_funding_txid.as_deref(),
+            &terms.wanted_chain,
+            &terms.wanted_asset_id,
+            terms.wanted_amount_sats,
+            row.state.taker_funding_txid.clone(),
             row.state.taker_funding_vout,
-            row.state.taker_contract_script.as_deref(),
-            HtlcTerms {
-                payment_hash: row.state.payment_hash.clone(),
-                claim_pubkey: row.state.maker_refund_pubkey.clone(),
-                refund_pubkey: row
-                    .state
-                    .taker_claim_pubkey
-                    .clone()
-                    .ok_or("Taker pubkey missing")?,
-                timeout,
-            },
+            terms.taker_contract()?,
         )
     };
-    let contract_address = if maker {
-        row.state.maker_contract_address.as_deref()
-    } else {
-        row.state.taker_contract_address.as_deref()
-    }
-    .ok_or("HTLC contract address missing")?;
-    verify_funding(
-        state,
-        chain,
-        asset,
-        amount,
-        contract_address,
-        txid.ok_or("Funding txid missing")?,
-        vout.ok_or("Funding vout missing")?,
-    )?;
+    let txid = txid.ok_or("Funding txid missing")?;
+    let vout = vout.ok_or("Funding vout missing")?;
+    verify_funding(state, chain, asset, amount, &c.address, &txid, vout)?;
     let refund_txid = spend_contract(
         state,
         SpendSpec {
             chain,
             asset,
             amount,
-            funding_txid: txid.expect("verified"),
-            funding_vout: vout.expect("verified"),
-            script_hex: script.ok_or("HTLC script missing")?,
-            terms,
+            funding_txid: &txid,
+            funding_vout: vout,
+            script_hex: &c.script_hex,
+            terms: c.terms.clone(),
             preimage: None,
             key: key.secret_bytes(),
         },

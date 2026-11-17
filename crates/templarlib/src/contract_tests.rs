@@ -2726,6 +2726,223 @@ fn live_sideswap_testnet_quote_and_orders() {
     }
 }
 
+// ── Cross-chain swaps against a lying coordinator ──────────────────
+
+/// A loopback HTLC coordinator (`/api/atomic-swaps`) keeping one swap row
+/// the test can rewrite between calls. Returns its origin.
+fn mock_coordinator(row: std::sync::Arc<std::sync::Mutex<Value>>) -> String {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 8192];
+            let (head, body) = loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break (String::new(), Vec::new()),
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+                if let Some(at) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&req[..at]).to_string();
+                    let len = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    while req.len() < at + 4 + len {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => req.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    break (head, req[at + 4..].to_vec());
+                }
+            };
+            let method = head.split_whitespace().next().unwrap_or("").to_string();
+            let sent: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let answer = {
+                let mut row = row.lock().unwrap();
+                match method.as_str() {
+                    "POST" => {
+                        *row = json!({
+                            "id": 7, "network": sent["network"], "status": "open",
+                            "state": sent["state"], "created_at": 1, "updated_at": 1
+                        });
+                    }
+                    "PUT" => {
+                        row["status"] = sent["status"].clone();
+                        row["state"] = sent["state"].clone();
+                    }
+                    _ => {}
+                }
+                row.to_string()
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{answer}",
+                answer.len()
+            );
+        }
+    });
+    url
+}
+
+/// An engine on Liquid testnet whose order book (and so HTLC coordinator)
+/// is `coordinator`, with one software wallet from `mnemonic`.
+fn swap_env(coordinator: &str, mnemonic: &str) -> (TestEnv, String) {
+    let mut env = TestEnv::new();
+    let mut cfg = lab_config(&"55".repeat(32));
+    cfg["orderbook_url"] = json!(coordinator);
+    let lab = serve(std::sync::Arc::new(std::sync::Mutex::new((
+        200,
+        cfg.to_string(),
+    ))));
+    env.ok("set_test_server", json!({ "url": lab }));
+    env.ok("set_liquid_network", json!({ "network": "testnet" }));
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Swap", "mnemonic": mnemonic, "liquid": true }),
+    );
+    (env, created["id"].as_str().unwrap().to_string())
+}
+
+#[test]
+fn a_lying_htlc_coordinator_cannot_redirect_a_swap_payment() {
+    use templar_core::{
+        bitcoin_contract, derive_swap_secret_key, liquid_contract, swap_public_key, HtlcTerms,
+    };
+    let row = std::sync::Arc::new(std::sync::Mutex::new(Value::Null));
+    let coordinator = mock_coordinator(row.clone());
+    let (mut maker, maker_id) = swap_env(&coordinator, MNEMONIC);
+    let created = maker.ok(
+        "atomic_swap_create",
+        json!({
+            "wallet_id": maker_id, "direction": "btc-to-liquid", "btc_amount_sats": 50_000,
+            "liquid_asset_id": templar_core::TESTNET_POLICY_ASSET, "liquid_ticker": "LBTC",
+            "liquid_name": "Liquid Bitcoin", "liquid_amount_sats": 50_000
+        }),
+    );
+    assert_eq!(created["offer_id"], json!(7));
+
+    // A taker joins (simulated): its key and timeout, the honest contracts.
+    let taker_key = derive_swap_secret_key(
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        1,
+        0,
+    )
+    .unwrap();
+    let taker_pub = swap_public_key(&taker_key).to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (honest, attacker) = {
+        let mut r = row.lock().unwrap();
+        let st = &mut r["state"];
+        st["taker_claim_pubkey"] = json!(taker_pub);
+        st["taker_timeout"] = json!(now + 24 * 3600);
+        let maker_terms = HtlcTerms {
+            payment_hash: st["payment_hash"].as_str().unwrap().into(),
+            claim_pubkey: taker_pub.clone(),
+            refund_pubkey: st["maker_refund_pubkey"].as_str().unwrap().into(),
+            timeout: st["maker_timeout"].as_u64().unwrap(),
+        };
+        let honest = bitcoin_contract(maker_terms.clone()).unwrap();
+        // The coordinator's own key as the refund key: its address, not the
+        // maker's contract.
+        let attacker = bitcoin_contract(HtlcTerms {
+            refund_pubkey: taker_pub.clone(),
+            ..maker_terms
+        })
+        .unwrap();
+        let taker_contract = liquid_contract(HtlcTerms {
+            payment_hash: st["payment_hash"].as_str().unwrap().into(),
+            claim_pubkey: st["maker_refund_pubkey"].as_str().unwrap().into(),
+            refund_pubkey: taker_pub.clone(),
+            timeout: now + 24 * 3600,
+        })
+        .unwrap();
+        st["maker_contract_address"] = json!(attacker.address);
+        st["maker_contract_script"] = json!(attacker.script_hex);
+        st["taker_contract_address"] = json!(taker_contract.address);
+        st["taker_contract_script"] = json!(taker_contract.script_hex);
+        r["status"] = json!("reserved");
+        (honest, attacker)
+    };
+    assert_ne!(honest.address, attacker.address);
+    let fund = json!({ "wallet_id": maker_id, "offer_id": 7 });
+    // The maker would pay the coordinator's address: refused before any
+    // coin is selected (an unfunded wallet would otherwise fail on funds).
+    let err = maker.err("atomic_swap_fund", fund.clone());
+    assert!(
+        err.contains("no longer matches") && err.contains("maker contract"),
+        "{err}"
+    );
+    // Honest contracts, but the amount changed after creation: refused.
+    {
+        let mut r = row.lock().unwrap();
+        r["state"]["maker_contract_address"] = json!(honest.address);
+        r["state"]["maker_contract_script"] = json!(honest.script_hex);
+        r["state"]["offered_amount_sats"] = json!(5_000_000);
+    }
+    let err = maker.err("atomic_swap_fund", fund.clone());
+    assert!(err.contains("offered amount"), "{err}");
+    // A taker timeout that leaves the maker no time to claim: refused.
+    {
+        let mut r = row.lock().unwrap();
+        r["state"]["offered_amount_sats"] = json!(50_000);
+        let maker_timeout = r["state"]["maker_timeout"].as_u64().unwrap();
+        r["state"]["taker_timeout"] = json!(maker_timeout);
+    }
+    let err = maker.err("atomic_swap_fund", fund.clone());
+    assert!(err.contains("no safe time"), "{err}");
+
+    // The taker's side: it joins an open offer and keeps what it accepted.
+    {
+        let mut r = row.lock().unwrap();
+        r["status"] = json!("open");
+        for k in [
+            "taker_claim_pubkey",
+            "taker_timeout",
+            "maker_contract_address",
+            "maker_contract_script",
+            "taker_contract_address",
+            "taker_contract_script",
+        ] {
+            r["state"][k] = Value::Null;
+        }
+    }
+    let (mut taker, taker_id) = swap_env(
+        &coordinator,
+        "legal winner thank year wave sausage worth useful legal winner thank yellow",
+    );
+    let joined = taker.ok(
+        "atomic_swap_join",
+        json!({ "wallet_id": taker_id, "offer_id": 7 }),
+    );
+    assert_eq!(joined["row"]["status"], json!("reserved"));
+    // The maker's key changes after the taker accepted: the taker's
+    // funding is refused.
+    {
+        let mut r = row.lock().unwrap();
+        r["status"] = json!("maker_funded");
+        r["state"]["maker_refund_pubkey"] = json!(taker_pub);
+        r["state"]["maker_funding_txid"] = json!("11".repeat(32));
+        r["state"]["maker_funding_vout"] = json!(0);
+    }
+    let err = taker.err(
+        "atomic_swap_fund",
+        json!({ "wallet_id": taker_id, "offer_id": 7 }),
+    );
+    assert!(err.contains("maker key"), "{err}");
+}
+
 // ── Live: LiquiDEX on a Templar testlab ────────────────────────────
 
 /// One side of the live swap: an engine on its own data directory, joined
