@@ -287,26 +287,24 @@ pub(super) fn quote(
     amount_sats: u64,
 ) -> Result<PegQuoteDto, String> {
     let pegin = direction == "in";
-    let (max, fee, required) = if pegin {
+    let (min, max, fee, required) = if pegin {
         (
+            core_peg::MIN_PEG_SATS,
             core_peg::MAX_MONEY_SATS,
             CLAIM_FEE_ESTIMATE_SATS,
             t.pegin_confirmations,
         )
     } else {
+        // Below the lab's minimum the output is never paid: the L-BTC would
+        // be burned.
         (
+            core_peg::MIN_PEG_SATS.max(t.pegout_min_sat),
             t.pegout_max_sat,
             PEGOUT_FEE_ESTIMATE_SATS,
             t.pegout_confirmations,
         )
     };
-    let min = core_peg::MIN_PEG_SATS;
-    if amount_sats < min {
-        return Err(format!("Amount is below the minimum of {min} sats"));
-    }
-    if amount_sats > max {
-        return Err(format!("Amount is above the maximum of {max} sats"));
-    }
+    check_limits(amount_sats, min, max)?;
     Ok(PegQuoteDto {
         direction: direction.to_string(),
         amount_sats,
@@ -327,6 +325,17 @@ pub(super) fn quote(
         confirmations_required: required,
         network_fee_included: pegin,
     })
+}
+
+/// The amount limits, with the texts the quote has always used.
+fn check_limits(amount: u64, min: u64, max: u64) -> Result<(), String> {
+    if amount < min {
+        return Err(format!("Amount is below the minimum of {min} sats"));
+    }
+    if amount > max {
+        return Err(format!("Amount is above the maximum of {max} sats"));
+    }
+    Ok(())
 }
 
 pub(super) struct NewOrder<'a> {
@@ -863,12 +872,12 @@ fn fund_pegin(state: &AppState, o: &mut StoredOrder, fee_rate: Option<f32>) -> R
 /// Builds, signs and broadcasts the peg-out transaction.
 fn fund_pegout(state: &AppState, t: &NativePegTerms, o: &mut StoredOrder) -> Result<(), String> {
     let amount = o.order.deposit_expected_sats;
-    if amount > t.pegout_max_sat {
-        return Err(format!(
-            "Amount is above the maximum of {} sats",
-            t.pegout_max_sat
-        ));
-    }
+    // The lab's terms may have changed since the order was opened.
+    check_limits(
+        amount,
+        core_peg::MIN_PEG_SATS.max(t.pegout_min_sat),
+        t.pegout_max_sat,
+    )?;
     let chain = state.liquid_chain()?;
     if let Some(raw) = native_of(o)?.pending_deposit_tx.clone() {
         let bytes = hex::decode(raw).map_err(|e| format!("Stored peg-out: {e}"))?;
@@ -1050,7 +1059,7 @@ pub(super) fn claim(
                         o.order.order_id,
                         tx.txid()
                     );
-                    after_claim(o, &d.outpoint());
+                    after_claim(o, &d.outpoint(), &tx.txid().to_string());
                     persist(&state.data_dir, o)
                 }
                 Err(e) => {
@@ -1082,9 +1091,14 @@ pub(super) fn claim(
     }
 }
 
-/// The order after a claim of `outpoint` went out: settling if it was the
-/// order's own deposit.
-fn after_claim(o: &mut StoredOrder, outpoint: &str) {
+/// The order after a claim (`claim_txid`) of `outpoint` went out: its row
+/// in `deposits` shows it, and the order is settling if it was its own
+/// deposit.
+fn after_claim(o: &mut StoredOrder, outpoint: &str, claim_txid: &str) {
+    if let Some(row) = o.order.deposits.iter_mut().find(|d| d.outpoint == outpoint) {
+        row.txid_claim = Some(claim_txid.to_string());
+        row.status = SETTLING.to_string();
+    }
     let primary = o.native.as_ref().and_then(|n| n.primary.as_deref()) == Some(outpoint);
     if primary {
         o.order.eta_minutes = LIQUID_BLOCK_MINUTES;
@@ -1221,7 +1235,7 @@ fn build_claim(
         o.order.order_id,
         tx.txid()
     );
-    after_claim(o, &outpoint);
+    after_claim(o, &outpoint, &tx.txid().to_string());
     persist(&state.data_dir, o)
 }
 
@@ -1238,6 +1252,7 @@ mod tests {
             pegin_confirmations: 2,
             pegout_confirmations: 3,
             pegout_max_sat: 100_000_000,
+            pegout_min_sat: 100_000,
         }
     }
 
@@ -1410,6 +1425,18 @@ mod tests {
         let err = quote(&terms(), "out", 100_000_001).unwrap_err();
         assert!(err.contains("above the maximum of 100000000"), "{err}");
         assert!(quote(&terms(), "in", 100_000_001).is_ok());
+        // Below the lab's pegout_min_sat a peg-out would be burned, not
+        // paid: refused, and the quote's minimum says so.
+        let err = quote(&terms(), "out", 99_999).unwrap_err();
+        assert!(err.contains("below the minimum of 100000"), "{err}");
+        assert_eq!(quote(&terms(), "out", 100_000).unwrap().min_sats, 100_000);
+        let mut low = terms();
+        low.pegout_min_sat = 1_000;
+        assert_eq!(
+            quote(&low, "out", 20_000).unwrap().min_sats,
+            core_peg::MIN_PEG_SATS,
+            "never below the wallet's own floor"
+        );
     }
 
     #[test]

@@ -200,6 +200,10 @@ pub struct NativePegTerms {
     pub pegout_confirmations: u32,
     /// Largest peg-out the lab pays on its own.
     pub pegout_max_sat: u64,
+    /// Smallest peg-out the lab pays (its config's `pegout_min_sat`, else
+    /// [`crate::test_server::DEFAULT_PEGOUT_MIN_SAT`]); smaller ones would
+    /// be burned.
+    pub pegout_min_sat: u64,
 }
 
 /// Who performs peg-ins and peg-outs on the active network.
@@ -319,6 +323,9 @@ impl Endpoints<'_> {
                 pegin_confirmations: pegin,
                 pegout_confirmations: pegout,
                 pegout_max_sat: max,
+                pegout_min_sat: peg
+                    .pegout_min_sat
+                    .unwrap_or(crate::test_server::DEFAULT_PEGOUT_MIN_SAT),
             }),
             Source::Profile,
         ))
@@ -434,6 +441,14 @@ mod tests {
         assert_eq!(t.pegin_confirmations, 2);
         assert_eq!(t.pegout_confirmations, 2);
         assert_eq!(t.pegout_max_sat, 100_000_000);
+        assert_eq!(t.pegout_min_sat, 100_000, "the documented default");
+        let mut q = p.clone();
+        q.regtest.peg.pegout_min_sat = Some(30_000);
+        let PegProvider::Native(t) = Endpoints::new(Some(&q)).peg_provider(&lab).unwrap().value
+        else {
+            panic!("native expected");
+        };
+        assert_eq!(t.pegout_min_sat, 30_000);
         assert_eq!(t.esplora_url, "https://lab.example.org/bitcoin-esplora");
         assert_eq!(t.instance_id, p.regtest.instance_id);
 

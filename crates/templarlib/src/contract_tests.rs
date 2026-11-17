@@ -2401,6 +2401,7 @@ const PEG_ORDER_KEYS: &[&str] = &[
     "valid_until_liquid_height",
     "last_error",
     "expires_at",
+    "deposits",
 ];
 
 const PEG_QUOTE_KEYS: &[&str] = &[
@@ -2493,6 +2494,19 @@ fn native_peg_orders_have_the_contract_shape() {
     );
     assert_eq!(q["receive_sats"], json!(100_000));
     assert_eq!(q["max_sats"], json!(100_000_000));
+    assert_eq!(q["min_sats"], json!(100_000), "the lab's pegout_min_sat");
+    let ts = env.ok("get_test_server", json!({}));
+    assert_keys(
+        "profile.regtest.peg",
+        &ts["profile"]["regtest"]["peg"],
+        &[
+            "provider",
+            "pegin_confirmations",
+            "pegout_confirmations",
+            "pegout_max_sat",
+            "pegout_min_sat",
+        ],
+    );
     let err = env.err(
         "peg_quote",
         json!({ "direction": "out", "amount_sats": 100_000_001 }),
@@ -2536,21 +2550,25 @@ fn native_peg_orders_have_the_contract_shape() {
     // A peg-out pays out on the lab's Bitcoin regtest.
     let err = env.err(
         "peg_start",
-        start("out", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", 50_000),
+        start("out", "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx", 150_000),
     );
     assert!(err.contains("another network"), "{err}");
     let err = env.err("peg_start", start("out", &btc, 200_000_000));
     assert!(err.contains("above the maximum"), "{err}");
     assert_eq!(env.ok("peg_list", json!({ "wallet_id": id })), json!([]));
 
-    let order = env.ok("peg_start", start("out", &btc, 50_000));
+    // Below the lab's pegout_min_sat (absent here: 100 000) the output
+    // would be burned: refused.
+    let err = env.err("peg_start", start("out", &btc, 50_000));
+    assert!(err.contains("below the minimum of 100000"), "{err}");
+    let order = env.ok("peg_start", start("out", &btc, 150_000));
     assert_keys("peg_start", &order, PEG_ORDER_KEYS);
     assert_eq!(order["provider"], json!("native"));
     assert_eq!(order["simulated"], json!(false));
     assert_eq!(order["status"], json!("awaiting_deposit"));
     assert_eq!(order["deposit_address"], json!(""));
-    assert_eq!(order["deposit_expected_sats"], json!(50_000));
-    assert_eq!(order["payout_expected_sats"], json!(50_000));
+    assert_eq!(order["deposit_expected_sats"], json!(150_000));
+    assert_eq!(order["payout_expected_sats"], json!(150_000));
     assert_eq!(order["confirmations"], json!(0));
     assert_eq!(order["confirmations_required"], json!(2));
     for null in [

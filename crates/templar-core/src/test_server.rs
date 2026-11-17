@@ -119,6 +119,11 @@ pub struct PegProfile {
     pub pegout_confirmations: Option<u32>,
     #[serde(default)]
     pub pegout_max_sat: Option<u64>,
+    /// Smallest peg-out the lab pays; smaller outputs are never paid (the
+    /// L-BTC is burned). Optional in version 1: absent means
+    /// [`DEFAULT_PEGOUT_MIN_SAT`].
+    #[serde(default)]
+    pub pegout_min_sat: Option<u64>,
 }
 
 /// `networks["liquid-testnet"]`: links for display and the testnet peg
@@ -314,6 +319,10 @@ fn electrum_url(o: &Map<String, Value>, path: &str, key: &str) -> Result<String,
     Ok(format!("{}://{host_port}", if tls { "ssl" } else { "tcp" }))
 }
 
+/// The lab's smallest paid peg-out when its config does not say
+/// (`api-config.md`: "when absent, assume 100000").
+pub const DEFAULT_PEGOUT_MIN_SAT: u64 = 100_000;
+
 /// Most confirmations a peg may ask for: Liquid mainnet's peg-in depth is
 /// 102; anything far beyond a few hundred is a broken or hostile config.
 pub const MAX_PEG_CONFIRMATIONS: u32 = 1_000;
@@ -364,6 +373,7 @@ fn peg(v: &Value, path: &str) -> Result<PegProfile, TemplarError> {
         pegin_confirmations: opt_confirmations(o, path, "pegin_confirmations")?,
         pegout_confirmations: opt_confirmations(o, path, "pegout_confirmations")?,
         pegout_max_sat: opt_u64(o, path, "pegout_max_sat")?,
+        pegout_min_sat: opt_u64(o, path, "pegout_min_sat")?,
     })
 }
 
@@ -621,6 +631,12 @@ mod tests {
             "https://lab.example.org/bitcoin-esplora"
         );
         assert_eq!(r.peg.pegout_max_sat, Some(100_000_000));
+        assert_eq!(r.peg.pegout_min_sat, None, "absent in the example");
+        let p = parse(&with(|v| reg(v)["peg"]["pegout_min_sat"] = 25_000.into())).unwrap();
+        assert_eq!(p.regtest.peg.pegout_min_sat, Some(25_000));
+        p.revalidate().unwrap();
+        let err = parse(&with(|v| reg(v)["peg"]["pegout_min_sat"] = "1".into())).unwrap_err();
+        assert!(err.contains("pegout_min_sat"), "{err}");
         assert_eq!(
             r.liquid_backend().unwrap(),
             LiquidBackend::Electrum {
