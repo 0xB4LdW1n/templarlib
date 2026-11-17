@@ -35,10 +35,26 @@ impl AppConfig {
         Self::load_from(&Self::config_path())
     }
 
-    /// Loads the config at `path`.
+    /// Loads the config at `path`. A stored test-server profile that no
+    /// longer passes the rules a fetched one meets
+    /// ([`TestServerProfile::revalidate`]: edited on disk, written by a
+    /// build with other rules) is dropped with a log line, so the wallet
+    /// starts on its defaults instead of applying it — or panicking on it.
     pub fn load_from(path: &std::path::Path) -> Option<Self> {
         let content = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
+        let mut cfg: Self = serde_json::from_str(&content).ok()?;
+        if let Some(profile) = &cfg.test_server {
+            if let Err(e) = profile.revalidate() {
+                eprintln!("[config] the stored test server is not applied: {e}");
+                cfg.test_server = None;
+                // Its regtest went with it; a regtest setting without a lab
+                // falls back to testnet rather than a guess.
+                if cfg.liquid_network.as_ref().is_some_and(|n| n.is_regtest()) {
+                    cfg.liquid_network = None;
+                }
+            }
+        }
+        Some(cfg)
     }
 
     /// Saves the config to `~/.config/templar_wallet.json`.
@@ -53,8 +69,9 @@ impl AppConfig {
         }
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| StorageError::SerializationFailed(e.to_string()))?;
-        fs::write(path, json).map_err(StorageError::IoError)?;
-        Ok(())
+        // Atomic: a crash mid-write must not truncate the file that points
+        // at the wallet data folder.
+        crate::registry::atomic_write(path, &json)
     }
 
     /// Returns the config file path: `~/.config/templar_wallet.json`.
@@ -123,6 +140,49 @@ mod tests {
         assert!(json.contains("liquid-regtest"), "{json}");
         let back: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back.liquid_network(), LiquidNetwork::regtest_default());
+    }
+
+    #[test]
+    fn a_bad_stored_test_server_is_dropped_on_load() {
+        let dir = std::env::temp_dir().join(format!("templar_cfg_bad_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("templar_wallet.json");
+        let mut profile = crate::test_server::parse_config(
+            "http://127.0.0.1:8096",
+            crate::test_server::tests_example(),
+            1,
+        )
+        .unwrap();
+        let cfg = AppConfig {
+            data_dir: dir.clone(),
+            last_wallet_id: None,
+            liquid_network: Some(profile.regtest.liquid_network().unwrap()),
+            test_server: Some(profile.clone()),
+        };
+        cfg.save_to(&path).unwrap();
+        let back = AppConfig::load_from(&path).unwrap();
+        assert_eq!(back.test_server.as_ref(), Some(&profile));
+        assert!(back.liquid_network().is_regtest());
+        // Edited on disk: a non-hex policy asset. Dropped, back to testnet.
+        profile.regtest.policy_asset = "not-hex".into();
+        let cfg = AppConfig {
+            test_server: Some(profile),
+            ..cfg
+        };
+        std::fs::write(&path, serde_json::to_string(&cfg).unwrap()).unwrap();
+        let back = AppConfig::load_from(&path).unwrap();
+        assert!(back.test_server.is_none());
+        assert_eq!(back.liquid_network(), LiquidNetwork::testnet());
+        assert_eq!(back.data_dir, dir);
+        // Saved atomically: no temporary file left behind.
+        back.save_to(&path).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != "templar_wallet.json")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

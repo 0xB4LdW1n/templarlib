@@ -108,9 +108,11 @@ fn not_ready(msg: impl Into<String>) -> String {
 fn eta_minutes(direction: &str, required: u32, seen: u32) -> u32 {
     let left = required.saturating_sub(seen);
     if direction == "in" {
-        left * BITCOIN_BLOCK_MINUTES + LIQUID_BLOCK_MINUTES
+        left.saturating_mul(BITCOIN_BLOCK_MINUTES)
+            .saturating_add(LIQUID_BLOCK_MINUTES)
     } else {
-        left * LIQUID_BLOCK_MINUTES + BITCOIN_BLOCK_MINUTES
+        left.saturating_mul(LIQUID_BLOCK_MINUTES)
+            .saturating_add(BITCOIN_BLOCK_MINUTES)
     }
 }
 
@@ -944,6 +946,9 @@ mod tests {
         assert_eq!(pegout_status(2, 2), SETTLING);
         assert_eq!(eta_minutes("in", 2, 1), 11);
         assert_eq!(eta_minutes("in", 2, 5), 1);
+        // Huge confirmation counts saturate instead of overflowing.
+        assert_eq!(eta_minutes("in", u32::MAX, 0), u32::MAX);
+        assert_eq!(eta_minutes("out", u32::MAX, 0), u32::MAX);
     }
 
     #[test]

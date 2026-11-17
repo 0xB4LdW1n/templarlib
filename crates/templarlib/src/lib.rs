@@ -195,4 +195,53 @@ mod public_api_tests {
             );
         }
     }
+
+    /// A config edited on disk with a test-server profile the fetch would
+    /// refuse (a non-hex policy asset, on regtest) used to panic in
+    /// `with_data_dir`. It is dropped instead and the engine starts on
+    /// testnet.
+    #[test]
+    fn a_tampered_stored_test_server_does_not_stop_the_engine() {
+        let dir = std::env::temp_dir().join(format!(
+            "templar-tampered-profile-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = serde_json::json!({
+            "data_dir": dir,
+            "last_wallet_id": null,
+            "liquid_network": {"kind": "liquid-regtest", "policy_asset": "33".repeat(32)},
+            "test_server": {
+                "base_url": "http://127.0.0.1:8096", "name": "lab", "version": 1,
+                "fetched_at": 1, "orderbook_url": "http://127.0.0.1:3210",
+                "regtest": {
+                    "instance_id": "11".repeat(32), "policy_asset": "not hex at all",
+                    "genesis_hash": "22".repeat(32),
+                    "liquid_electrum_url": "tcp://127.0.0.1:19061",
+                    "bitcoin_network": "regtest",
+                    "bitcoin_electrum_url": "tcp://127.0.0.1:19060",
+                    "bitcoin_esplora_url": "http://127.0.0.1:19070",
+                    "faucet_url": "http://127.0.0.1:8096/api/faucet",
+                    "peg": {"provider": "native"}
+                },
+                "testnet": null
+            }
+        });
+        std::fs::write(dir.join("templar_wallet.json"), cfg.to_string()).unwrap();
+        let lib = super::TemplarLib::with_data_dir(&dir);
+        let v = lib.call("get_test_server", &serde_json::json!({}));
+        assert_eq!(v["ok"]["configured"], serde_json::json!(false), "{v}");
+        let n = lib.call("get_liquid_network", &serde_json::json!({}));
+        assert_eq!(
+            n["ok"]["network"],
+            serde_json::json!("liquid-testnet"),
+            "{n}"
+        );
+        drop(lib);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

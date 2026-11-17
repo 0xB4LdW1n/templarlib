@@ -141,7 +141,10 @@ impl<'a> Endpoints<'a> {
             }
         }
         if let Some(p) = self.profile {
-            return Resolved::new(p.regtest.liquid_network(), Source::Profile);
+            match p.regtest.liquid_network() {
+                Ok(n) => return Resolved::new(n, Source::Profile),
+                Err(e) => eprintln!("[liquid] the test server's regtest: {e}; ignored"),
+            }
         }
         match setting {
             Some(n) if n.is_regtest() => Resolved::new(n.clone(), Source::Setting),
@@ -284,7 +287,9 @@ impl Endpoints<'_> {
                 peg.provider
             )));
         }
-        if *liquid != p.regtest.liquid_network() || !p.regtest.bitcoin_is_regtest() {
+        if p.regtest.liquid_network().ok().as_ref() != Some(liquid)
+            || !p.regtest.bitcoin_is_regtest()
+        {
             return Err(unavailable(format!(
                 "the Liquid regtest in use is not the test server's own chain (check \
                  {ENV_REGTEST_POLICY_ASSET})."
@@ -377,7 +382,7 @@ mod tests {
         let custom = LiquidNetwork::regtest(&"cc".repeat(32)).unwrap();
         let with = Endpoints::new(Some(&p)).regtest_network(Some(&custom));
         assert_eq!(with.source, Source::Profile);
-        assert_eq!(with.value, p.regtest.liquid_network());
+        assert_eq!(with.value, p.regtest.liquid_network().unwrap());
         let without = Endpoints::default().regtest_network(Some(&custom));
         assert_eq!(without, Resolved::new(custom, Source::Setting));
         let none = Endpoints::default().regtest_network(Some(&LiquidNetwork::testnet()));
@@ -391,7 +396,7 @@ mod tests {
     fn bitcoin_runs_on_regtest_only_beside_the_labs_liquid_regtest() {
         let p = profile();
         let e = Endpoints::new(Some(&p));
-        let lab = e.bitcoin_backend(&p.regtest.liquid_network());
+        let lab = e.bitcoin_backend(&p.regtest.liquid_network().unwrap());
         assert_eq!(lab.source, Source::Profile);
         assert_eq!(lab.value.network, Network::Regtest);
         assert_eq!(lab.value.electrum_url, "ssl://lab.example.org:50012");
@@ -419,7 +424,7 @@ mod tests {
     #[test]
     fn the_native_peg_is_the_labs_and_only_on_its_regtest() {
         let p = profile();
-        let lab = p.regtest.liquid_network();
+        let lab = p.regtest.liquid_network().unwrap();
         let r = Endpoints::new(Some(&p)).peg_provider(&lab).unwrap();
         assert_eq!(r.source, Source::Profile);
         assert_eq!(r.value.name(), "native");

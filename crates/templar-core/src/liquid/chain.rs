@@ -155,7 +155,7 @@ impl LiquidBackend {
                 return Ok((Self::regtest_default(), Source::Env));
             }
             if let Some(profile) = regtest {
-                return Ok((profile.liquid_backend(), Source::Profile));
+                return Ok((profile.liquid_backend()?, Source::Profile));
             }
             return Ok((Self::regtest_default(), Source::Default));
         }
@@ -942,7 +942,7 @@ mod tests {
         )
         .unwrap()
         .regtest;
-        let regtest = profile.liquid_network();
+        let regtest = profile.liquid_network().unwrap();
         let (backend, source) = LiquidBackend::resolve(&regtest, Some(&profile)).unwrap();
         assert_eq!(source, Source::Profile);
         assert_eq!(backend.describe(), "electrum tcp://127.0.0.1:19061");

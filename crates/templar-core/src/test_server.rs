@@ -133,21 +133,23 @@ pub struct TestnetProfile {
 
 impl RegtestProfile {
     /// The Liquid regtest this lab runs: its policy asset and genesis.
-    pub fn liquid_network(&self) -> LiquidNetwork {
+    /// Fallible: a profile is validated when fetched and again when loaded
+    /// ([`TestServerProfile::revalidate`]), but this never panics on one
+    /// that slipped through.
+    pub fn liquid_network(&self) -> Result<LiquidNetwork, TemplarError> {
         LiquidNetwork::regtest_with_genesis(&self.policy_asset, &self.genesis_hash)
-            .expect("validated when the profile was parsed")
     }
 
     /// The lab's Liquid Electrum server as a chain backend. TLS certificates
     /// are validated against the host.
-    pub fn liquid_backend(&self) -> LiquidBackend {
-        let (host_port, tls) =
-            split_electrum_url(&self.liquid_electrum_url).expect("validated when parsed");
-        LiquidBackend::Electrum {
+    pub fn liquid_backend(&self) -> Result<LiquidBackend, TemplarError> {
+        let (host_port, tls) = split_electrum_url(&self.liquid_electrum_url)
+            .map_err(|e| invalid(format!("liquid_electrum_url: {e}")))?;
+        Ok(LiquidBackend::Electrum {
             url: host_port,
             tls,
             validate_domain: true,
-        }
+        })
     }
 
     /// Whether the lab's Bitcoin side is Bitcoin regtest.
@@ -157,6 +159,39 @@ impl RegtestProfile {
 }
 
 impl TestServerProfile {
+    /// Checks a stored profile (read back from the app config, which anyone
+    /// with access to the file can edit) with exactly the rules a fetched
+    /// `/api/config` meets: it is turned back into that document and parsed
+    /// again, and must come out unchanged. A profile that fails is not
+    /// applied.
+    pub fn revalidate(&self) -> Result<(), TemplarError> {
+        let base = normalize_base_url(&self.base_url)?;
+        let mut networks = Map::new();
+        networks.insert(
+            "liquid-regtest".into(),
+            serde_json::to_value(&self.regtest).map_err(|e| invalid(e.to_string()))?,
+        );
+        if let Some(t) = &self.testnet {
+            networks.insert(
+                "liquid-testnet".into(),
+                serde_json::to_value(t).map_err(|e| invalid(e.to_string()))?,
+            );
+        }
+        let doc = serde_json::json!({
+            "version": self.version,
+            "name": self.name,
+            "orderbook_url": self.orderbook_url,
+            "networks": networks,
+        });
+        let parsed = parse_config(&base, &doc.to_string(), self.fetched_at)?;
+        if parsed != *self {
+            return Err(invalid(
+                "the stored profile is not in the form the wallet writes".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether `other` (a fresh fetch) says anything different from this
     /// stored profile, ignoring the fetch time.
     pub fn differs_from(&self, other: &TestServerProfile) -> bool {
@@ -279,14 +314,27 @@ fn electrum_url(o: &Map<String, Value>, path: &str, key: &str) -> Result<String,
     Ok(format!("{}://{host_port}", if tls { "ssl" } else { "tcp" }))
 }
 
-fn opt_u32(o: &Map<String, Value>, path: &str, key: &str) -> Result<Option<u32>, TemplarError> {
+/// Most confirmations a peg may ask for: Liquid mainnet's peg-in depth is
+/// 102; anything far beyond a few hundred is a broken or hostile config.
+pub const MAX_PEG_CONFIRMATIONS: u32 = 1_000;
+
+fn opt_confirmations(
+    o: &Map<String, Value>,
+    path: &str,
+    key: &str,
+) -> Result<Option<u32>, TemplarError> {
     match o.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(v) => v
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n <= MAX_PEG_CONFIRMATIONS)
             .map(Some)
-            .ok_or_else(|| invalid(format!("{path}.{key} is not a small whole number"))),
+            .ok_or_else(|| {
+                invalid(format!(
+                    "{path}.{key} is not a whole number up to {MAX_PEG_CONFIRMATIONS}"
+                ))
+            }),
     }
 }
 
@@ -313,8 +361,8 @@ fn peg(v: &Value, path: &str) -> Result<PegProfile, TemplarError> {
     }
     Ok(PegProfile {
         provider: provider.to_string(),
-        pegin_confirmations: opt_u32(o, path, "pegin_confirmations")?,
-        pegout_confirmations: opt_u32(o, path, "pegout_confirmations")?,
+        pegin_confirmations: opt_confirmations(o, path, "pegin_confirmations")?,
+        pegout_confirmations: opt_confirmations(o, path, "pegout_confirmations")?,
         pegout_max_sat: opt_u64(o, path, "pegout_max_sat")?,
     })
 }
@@ -574,14 +622,14 @@ mod tests {
         );
         assert_eq!(r.peg.pegout_max_sat, Some(100_000_000));
         assert_eq!(
-            r.liquid_backend(),
+            r.liquid_backend().unwrap(),
             LiquidBackend::Electrum {
                 url: "127.0.0.1:19061".into(),
                 tls: false,
                 validate_domain: true
             }
         );
-        let net = r.liquid_network();
+        let net = r.liquid_network().unwrap();
         assert!(net.is_regtest());
         assert_eq!(net.policy_asset_hex(), r.policy_asset);
         assert_eq!(net.elements().genesis_hash().to_string(), r.genesis_hash);
@@ -718,6 +766,84 @@ mod tests {
         }
         assert!(parse("not json").unwrap_err().contains("not JSON"));
         assert!(parse("[]").unwrap_err().contains("not an object"));
+    }
+
+    #[test]
+    fn a_stored_profile_is_checked_again_with_the_fetch_rules() {
+        let good = parse(EXAMPLE).unwrap();
+        good.revalidate().unwrap();
+        let mut no_testnet = good.clone();
+        no_testnet.testnet = None;
+        no_testnet.revalidate().unwrap();
+        type Tamper = Box<dyn FnOnce(&mut TestServerProfile)>;
+        let cases: Vec<(Tamper, &str)> = vec![
+            (
+                Box::new(|p| p.regtest.policy_asset = "zz".repeat(32)),
+                "policy_asset",
+            ),
+            (
+                Box::new(|p| p.regtest.policy_asset = LBTC_MAINNET_ASSET_ID.into()),
+                "mainnet",
+            ),
+            (
+                Box::new(|p| p.regtest.genesis_hash = LIQUID_MAINNET_GENESIS.into()),
+                "mainnet",
+            ),
+            (
+                Box::new(|p| p.regtest.bitcoin_network = "bitcoin".into()),
+                "mainnet",
+            ),
+            (
+                Box::new(|p| p.regtest.liquid_electrum_url = "http://h:1".into()),
+                "liquid_electrum_url",
+            ),
+            (
+                Box::new(|p| p.regtest.peg.pegin_confirmations = Some(u32::MAX)),
+                "pegin_confirmations",
+            ),
+            (
+                Box::new(|p| p.base_url = "ftp://h".into()),
+                "test server URL",
+            ),
+            (
+                Box::new(|p| p.regtest.instance_id = "AB".repeat(32)),
+                "form the wallet writes",
+            ),
+        ];
+        for (tamper, want) in cases {
+            let mut p = good.clone();
+            tamper(&mut p);
+            let err = p.revalidate().unwrap_err().to_string();
+            assert!(err.contains(want), "{want}: {err}");
+        }
+        // The accessors fail instead of panicking on such a profile.
+        let mut p = good.clone();
+        p.regtest.policy_asset = "not hex".into();
+        assert!(p.regtest.liquid_network().is_err());
+        p.regtest.liquid_electrum_url = "garbage".into();
+        assert!(p.regtest.liquid_backend().is_err());
+    }
+
+    #[test]
+    fn peg_confirmations_are_capped() {
+        let err = parse(&with(|v| {
+            reg(v)["peg"]["pegin_confirmations"] = 4_294_967_295u64.into()
+        }))
+        .unwrap_err();
+        assert!(err.contains("pegin_confirmations"), "{err}");
+        let err = parse(&with(|v| {
+            reg(v)["peg"]["pegout_confirmations"] = (MAX_PEG_CONFIRMATIONS + 1).into()
+        }))
+        .unwrap_err();
+        assert!(err.contains("pegout_confirmations"), "{err}");
+        let p = parse(&with(|v| {
+            reg(v)["peg"]["pegin_confirmations"] = MAX_PEG_CONFIRMATIONS.into()
+        }))
+        .unwrap();
+        assert_eq!(
+            p.regtest.peg.pegin_confirmations,
+            Some(MAX_PEG_CONFIRMATIONS)
+        );
     }
 
     #[test]

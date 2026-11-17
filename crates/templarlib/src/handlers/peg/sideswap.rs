@@ -50,9 +50,11 @@ fn s(e: impl std::fmt::Display) -> String {
 fn eta_minutes(direction: &str, required: u32, seen: u32) -> u32 {
     let left = required.saturating_sub(seen);
     if direction == "in" {
-        left * BITCOIN_BLOCK_MINUTES + LIQUID_BLOCK_MINUTES
+        left.saturating_mul(BITCOIN_BLOCK_MINUTES)
+            .saturating_add(LIQUID_BLOCK_MINUTES)
     } else {
-        left * LIQUID_BLOCK_MINUTES + BITCOIN_BLOCK_MINUTES
+        left.saturating_mul(LIQUID_BLOCK_MINUTES)
+            .saturating_add(BITCOIN_BLOCK_MINUTES)
     }
 }
 
