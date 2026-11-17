@@ -105,8 +105,12 @@ default, or a setting that unlocks one.
   server's regtest, SideSwap on Liquid testnet when the profile names it,
   none otherwise (`PEG_UNAVAILABLE`). Only `peg_fund` and `peg_claim` sign;
   reading an order never does.
-- The public asset registry and the public order book do not exist on
-  regtest: those methods call `require_liquid_testnet`.
+- Liquid testnet only: Blockstream's public asset registry (never asked
+  on regtest), SideSwap, and the BTC ↔ Liquid HTLC swaps
+  (`cross_swaps::available_on`: elsewhere the list is `[]` and nothing is
+  contacted, the steps refuse). The order book and its asset registry
+  serve both networks, partitioned by `network`; a lab's faucet is asked
+  only on that lab's own regtest (`Endpoints::faucet`).
 - Switching the Liquid network closes the open wallet. A wallet opened on
   one network must never be driven against the other's chain.
 - Templar Protocol: Today the protocol runs on a test regtest; in beta it will run on a server of ours; then Liquid mainnet.
