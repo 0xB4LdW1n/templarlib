@@ -18,6 +18,7 @@ use lwk_wollet::{
         Address, AssetId, Script,
     },
     elements_miniscript::{Descriptor, DescriptorPublicKey},
+    hashes::Hash,
     FakeStore, Network as ElementsNetwork, Recipient, Wollet, WolletBuilder, WolletDescriptor,
 };
 use serde_json::json;
@@ -1231,12 +1232,76 @@ impl LiquidWalletManager {
         refuse_unsafe_signing(pset, &signers, self.signing_descriptor())
     }
 
+    /// Signs the claim of one of this wallet's own peg-in orders: the one
+    /// route that signs a peg-in input. Every other signer refuses one
+    /// ([`refuse_unsafe_signing`]).
+    ///
+    /// `deposit`, `claim_index` and `claim_script` are the order's own
+    /// record. The PSET must spend exactly one input, a peg-in of `deposit`
+    /// whose claim script and coin are `claim_script`, and `claim_script`
+    /// must be this wallet's external script at `claim_index`. Then the
+    /// checks of every other route run, with that one input allowed to be a
+    /// peg-in — the ownership rule included, so the key signs only at the
+    /// path that derives `claim_script`.
+    pub fn sign_own_pegin_claim(
+        &self,
+        pset: &mut Pset,
+        deposit: &lwk_wollet::bitcoin::OutPoint,
+        claim_index: u32,
+        claim_script: &Script,
+    ) -> Result<u32, TemplarError> {
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| LiquidError::SigningFailed("Watch-only wallet cannot sign".into()))?;
+        let refuse = |why: &str| -> TemplarError {
+            LiquidError::SigningFailed(format!("refusing to sign the peg-in claim: {why}")).into()
+        };
+        let [input] = pset.inputs() else {
+            return Err(refuse("a claim spends the peg-in and nothing else"));
+        };
+        if !input.is_pegin() {
+            return Err(refuse("its input is not a peg-in"));
+        }
+        let outpoint_is_the_deposit = input.previous_txid.to_byte_array()
+            == deposit.txid.to_byte_array()
+            && input.previous_output_index == deposit.vout | (1 << 30);
+        if !outpoint_is_the_deposit {
+            return Err(refuse("it claims another deposit than this order's"));
+        }
+        let coin_script = input.witness_utxo.as_ref().map(|o| &o.script_pubkey);
+        if input.pegin_claim_script.as_ref() != Some(claim_script)
+            || coin_script != Some(claim_script)
+        {
+            return Err(refuse("its claim script is not this order's"));
+        }
+        let ours = self
+            .wollet
+            .wollet_descriptor()
+            .script_pubkey(lwk_wollet::Chain::External, claim_index)
+            .map_err(|e| refuse(&format!("claim script: {e}")))?;
+        if ours != *claim_script {
+            return Err(refuse(
+                "the order's claim script is not this wallet's script at its claim index",
+            ));
+        }
+        crate::liquid::pset::refuse_unsafe_signing_except(
+            pset,
+            &[signer.fingerprint()],
+            self.signing_descriptor(),
+            Some(0),
+        )?;
+        signer
+            .sign(pset)
+            .map_err(|e| LiquidError::SigningFailed(e.to_string()).into())
+    }
+
     /// Signs a PSET with the software signer.
     ///
     /// Returns an error if this is a watch-only wallet, or if the PSET asks
     /// the key for a taproot signature or anything but SIGHASH_ALL, lacks a
-    /// single fee output, or names a coin other than the one the key's
-    /// signature would spend ([`refuse_unsafe_signing`]).
+    /// single fee output, spends a peg-in, or names a coin other than the
+    /// one the key's signature would spend ([`refuse_unsafe_signing`]).
     pub fn sign(
         &self,
         pset: &mut lwk_wollet::elements::pset::PartiallySignedTransaction,
@@ -2371,5 +2436,20 @@ mod tests {
         {
             assert_eq!(result.unwrap().0, 1, "route {route}");
         }
+    }
+
+    #[test]
+    fn a_peg_in_input_is_never_signed_by_a_co_signing_route() {
+        // The wallet's own claim script and key, flagged as a peg-in: only
+        // the claim of one of the wallet's own peg-in orders signs that.
+        let (pk, fp, path) = test_key();
+        let mut input = input_for(0x11, pk, fp, &path, None);
+        input.previous_output_index |= 1 << 30;
+        input.pegin_claim_script = Some(input.witness_utxo.as_ref().unwrap().script_pubkey.clone());
+        input.pegin_value = Some(10_000);
+        assert!(input.is_pegin());
+        let pset = pset_spending(input);
+        bare_lwk_signature(&pset);
+        refused_everywhere(&pset, "peg-in", "peg-in");
     }
 }

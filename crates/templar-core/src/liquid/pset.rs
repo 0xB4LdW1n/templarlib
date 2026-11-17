@@ -293,6 +293,10 @@ pub fn refuse_bad_fee_outputs(pset: &PartiallySignedTransaction) -> Result<(), T
 ///   SINGLE or ANYONECANPAY signature lets whoever holds the PSET change
 ///   what it pays.
 /// - Exactly one fee output ([`refuse_bad_fee_outputs`]).
+/// - No input is a peg-in. The one peg-in this wallet signs is the claim of
+///   its own peg-in order, through
+///   [`LiquidWalletManager::sign_own_pegin_claim`](crate::LiquidWalletManager::sign_own_pegin_claim),
+///   which is not this function.
 /// - Every input such a key would sign says truthfully which coin it spends
 ///   ([`refuse_unowned_input`]): a key of `wallet` signs only the very
 ///   coin `wallet` derives at that key's path, and any other key of ours
@@ -306,6 +310,18 @@ pub fn refuse_unsafe_signing(
     pset: &PartiallySignedTransaction,
     signers: &[Fingerprint],
     wallet: Option<&Descriptor<DescriptorPublicKey>>,
+) -> Result<(), TemplarError> {
+    refuse_unsafe_signing_except(pset, signers, wallet, None)
+}
+
+/// [`refuse_unsafe_signing`], letting input `own_pegin` be a peg-in. Only
+/// [`LiquidWalletManager::sign_own_pegin_claim`](crate::LiquidWalletManager::sign_own_pegin_claim)
+/// passes `Some`, after checking the claim against the wallet's own order.
+pub(crate) fn refuse_unsafe_signing_except(
+    pset: &PartiallySignedTransaction,
+    signers: &[Fingerprint],
+    wallet: Option<&Descriptor<DescriptorPublicKey>>,
+    own_pegin: Option<usize>,
 ) -> Result<(), TemplarError> {
     let ours: Vec<(usize, &Input)> = pset
         .inputs()
@@ -340,6 +356,15 @@ pub fn refuse_unsafe_signing(
                      SIGHASH_ALL only — any other type would let whoever holds the \
                      transaction change what it pays"
                 ),
+            ));
+        }
+    }
+    for (index, input) in pset.inputs().iter().enumerate() {
+        if input.is_pegin() && own_pegin != Some(index) {
+            return Err(refusal(
+                index,
+                "it claims a peg-in, and this wallet signs a peg-in only as the claim of \
+                 one of its own peg-in orders (peg_claim)",
             ));
         }
     }
@@ -1255,6 +1280,40 @@ mod tests {
         );
         input.witness_utxo = None;
         check(input).unwrap();
+    }
+
+    #[test]
+    fn a_peg_in_anywhere_is_refused_once_a_key_of_ours_signs() {
+        let (pk, ours, path, stranger) = loan_and_stranger();
+        let p2wpkh = lwk_wollet::elements::Address::p2wpkh(
+            &pk,
+            None,
+            &lwk_wollet::elements::AddressParams::LIQUID_TESTNET,
+        )
+        .script_pubkey();
+        let mut pset = with_fee(named(p2wpkh.clone(), pk, ours, &path));
+        refuse_unsafe_signing(&pset, &[ours], None).unwrap();
+        // Someone else's peg-in beside our input.
+        let mut theirs = named(
+            p2wpkh,
+            stranger,
+            Fingerprint::from_str("deadbeef").unwrap(),
+            &path,
+        );
+        theirs.previous_output_index |= PEGIN_FLAG;
+        pset.add_input(theirs);
+        let err = refuse_unsafe_signing(&pset, &[ours], None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("Signing failed: refusing to sign input 1:") && err.contains("peg-in"),
+            "{err}"
+        );
+        // The claim route's allowance covers exactly the input it names.
+        refuse_unsafe_signing_except(&pset, &[ours], None, Some(1)).unwrap();
+        assert!(refuse_unsafe_signing_except(&pset, &[ours], None, Some(0)).is_err());
+        // Nobody of ours signs: nothing to refuse.
+        refuse_unsafe_signing(&pset, &[Fingerprint::from_str("0badf00d").unwrap()], None).unwrap();
     }
 
     // -- threshold parsing ---------------------------------------------------

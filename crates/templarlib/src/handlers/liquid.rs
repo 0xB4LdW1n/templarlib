@@ -669,8 +669,8 @@ pub fn inspect_pset(
 /// The checks every Liquid signing route runs before a key touches the PSET,
 /// whoever the caller is: the PSET belongs to this wallet's network and
 /// derivations ([`LiquidWalletManager::inspect_pset`]), it has exactly one
-/// fee output, and the inputs this wallet signs ask for SIGHASH_ALL only
-/// and name the coin the key's signature would spend — a
+/// fee output, no peg-in input, and the inputs this wallet signs ask for
+/// SIGHASH_ALL only and name the coin the key's signature would spend — a
 /// coin of this wallet exactly as its descriptor derives it
 /// ([`templar_core::refuse_unsafe_signing`]; the signers check again) — and
 /// every output it asks the key to pay says what it pays in a way the

@@ -617,6 +617,97 @@ mod tests {
         );
     }
 
+    /// The wallet's own claim of a verified deposit: refused by every
+    /// co-signing route (a peg-in input), signed by
+    /// `sign_own_pegin_claim` against the order's record only.
+    #[test]
+    fn the_wallets_own_claim_signs_only_against_its_order() {
+        let c = good_case();
+        let claim_script = c.address.claim_script().clone();
+        let funding = verify(&c).unwrap();
+        let deposit = funding.deposit().outpoint();
+        let network = crate::LiquidNetwork::regtest_with_genesis(
+            "b0b2bef620ac742b2399a0085bc84e4860ae2c65b5375e3b94399debec69aa6b",
+            "d51392db10c135e2e5f7bcfeab36e859ca4e69d6f76439ec0ebcb0a8da7be248",
+        )
+        .unwrap();
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                        abandon abandon abandon about";
+        let wallet =
+            crate::LiquidWalletManager::from_mnemonic_with_persist_on(&network, mnemonic, None)
+                .unwrap();
+        let payout = wallet.get_new_address().unwrap();
+        let claim = wallet
+            .create_pegin_claim(lwk_wollet::PeginInput::from(funding), &payout)
+            .unwrap();
+
+        // No co-signing route signs a peg-in input.
+        let mut a = claim.clone();
+        let err = wallet.sign(&mut a).unwrap_err().to_string();
+        assert!(
+            err.starts_with("Signing failed: refusing to sign input 0:") && err.contains("peg-in"),
+            "{err}"
+        );
+        let mut b = claim.clone();
+        let err = crate::LiquidMultisigSetup::sign_pset_with_mnemonics(
+            &mut b,
+            &[mnemonic.to_string()],
+            wallet.signing_descriptor(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("peg-in"), "{err}");
+        assert!(wallet.refuse_unsafe_signing(&claim).is_err());
+        assert!(a.inputs()[0].partial_sigs.is_empty() && b.inputs()[0].partial_sigs.is_empty());
+
+        // Any record but the order's own is refused.
+        let index_4 = wallet
+            .pegin_address(4, &lab_fed_peg())
+            .unwrap()
+            .claim_script()
+            .clone();
+        let other_vout = bitcoin::OutPoint::new(deposit.txid, 1);
+        let other_txid = bitcoin::OutPoint::new(Txid::from_byte_array([9u8; 32]), deposit.vout);
+        for (outpoint, index, script, words) in [
+            (other_vout, 3, &claim_script, "another deposit"),
+            (other_txid, 3, &claim_script, "another deposit"),
+            (deposit, 4, &claim_script, "not this wallet's script"),
+            (deposit, 4, &index_4, "claim script is not this order's"),
+        ] {
+            let mut p = claim.clone();
+            let err = wallet
+                .sign_own_pegin_claim(&mut p, &outpoint, index, script)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(words), "{words}: {err}");
+            assert!(p.inputs()[0].partial_sigs.is_empty());
+        }
+        // A claim with a second input is not a claim.
+        let mut two = claim.clone();
+        two.add_input(lwk_wollet::elements::pset::Input::from_prevout(
+            lwk_wollet::elements::OutPoint::new(
+                lwk_wollet::elements::Txid::from_byte_array([8u8; 32]),
+                0,
+            ),
+        ));
+        let err = wallet
+            .sign_own_pegin_claim(&mut two, &deposit, 3, &claim_script)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nothing else"), "{err}");
+
+        // The order's own record signs it, and it finalizes as a peg-in.
+        let mut signed = claim.clone();
+        assert_eq!(
+            wallet
+                .sign_own_pegin_claim(&mut signed, &deposit, 3, &claim_script)
+                .unwrap(),
+            1
+        );
+        let tx = wallet.finalize(&mut signed).unwrap();
+        assert!(tx.input.len() == 1 && tx.input[0].is_pegin);
+    }
+
     #[test]
     fn a_tampered_proof_is_rejected() {
         let mut c = good_case();

@@ -1187,7 +1187,21 @@ fn build_claim(
         true,
     )
     .map_err(s)?;
-    liq.sign(&mut pset).map_err(s)?;
+    // The one route that signs a peg-in: judged against this order's own
+    // record (deposit, claim index, claim script), never against the PSET.
+    let claim_script = n
+        .claim_script_hex
+        .as_deref()
+        .and_then(|h| hex::decode(h).ok())
+        .map(elements::Script::from)
+        .ok_or("The order is missing its claim script")?;
+    liq.sign_own_pegin_claim(
+        &mut pset,
+        &bitcoin::OutPoint::new(txid, d.vout),
+        index,
+        &claim_script,
+    )
+    .map_err(s)?;
     let tx = liq.finalize(&mut pset).map_err(s)?;
     let payout = state
         .liquid_network

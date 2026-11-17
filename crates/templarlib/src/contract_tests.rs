@@ -4007,6 +4007,46 @@ fn sign_pset_refuses_a_wallet_coin_named_as_another_coin() {
     }
 }
 
+/// `sign_pset` signs no peg-in input: the wallet's own claim is signed by
+/// `peg_claim` alone, against its stored order. The input names the loan
+/// key, so inspection describes it; signing is refused with a plain `err`.
+#[test]
+fn sign_pset_never_signs_a_peg_in_input() {
+    let mut env = TestEnv::new();
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Owner", "mnemonic": MNEMONIC, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let pegin = key_pset("m/2121'/1'/0'/0/0", 1, |input, _| {
+        input.previous_output_index |= 1 << 30;
+        input.pegin_claim_script = input.witness_utxo.as_ref().map(|o| o.script_pubkey.clone());
+        input.pegin_value = Some(10_000);
+    });
+    let d = env.ok(
+        "inspect_pset",
+        json!({ "wallet_id": id, "pset_base64": pegin }),
+    );
+    assert_eq!(d["inputs"][0]["is_ours"], json!(true));
+    let resp = env.call(
+        "sign_pset",
+        json!({ "wallet_id": id, "pset_base64": pegin }),
+    );
+    assert_keys("sign_pset peg-in refusal", &resp, &["err"]);
+    let err = resp["err"].as_str().unwrap();
+    assert!(
+        err.starts_with("Signing failed: refusing to sign input 0:") && err.contains("peg-in"),
+        "{err}"
+    );
+    // The same input without the peg-in flag signs as before.
+    let plain = env.ok(
+        "sign_pset",
+        json!({ "wallet_id": id, "pset_base64": guard_pset(None, 1) }),
+    );
+    assert!(plain.as_str().is_some());
+}
+
 // ── Templar Protocol connector ─────────────────────────────────────
 
 /// A testnet PSET spending a fake Templar Protocol escrow whose contract names the
