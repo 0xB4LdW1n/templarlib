@@ -3061,6 +3061,97 @@ fn a_lying_htlc_coordinator_cannot_redirect_a_swap_payment() {
     assert!(err.contains("maker key"), "{err}");
 }
 
+/// The record found on the owner's machine (an older engine, an order book
+/// whose database is gone), for the wallet `id`.
+fn legacy_swap_store(id: &str) -> String {
+    json!({"swaps": [{"key_index": 0, "offer_id": 1, "role": "maker", "wallet_id": id}]})
+        .to_string()
+}
+
+#[test]
+fn atomic_swap_list_is_empty_on_a_labs_regtest_and_touches_nothing() {
+    let mut env = TestEnv::new();
+    let (lab, _) = lab_server(&"11".repeat(32));
+    env.ok("set_test_server", json!({ "url": lab }));
+    let id = env.create_test_wallet();
+    let path = env.dir.join("atomic_swaps.json");
+    std::fs::write(&path, legacy_swap_store(&id)).unwrap();
+    // The lab's book answers on 127.0.0.1:3210 only if something runs
+    // there; nothing may be asked anyway.
+    let listed = env.ok("atomic_swap_list", json!({ "wallet_id": id }));
+    assert_eq!(listed, json!([]));
+    // Even for a wallet that does not exist: nothing is opened.
+    let listed = env.ok("atomic_swap_list", json!({ "wallet_id": "nope" }));
+    assert_eq!(listed, json!([]));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        legacy_swap_store(&id)
+    );
+}
+
+#[test]
+fn atomic_swap_list_survives_a_record_the_book_does_not_know() {
+    use crate::test_http::{MockHttp, Reply};
+    let book = MockHttp::start(|_| Reply::json(404, r#"{"error":"Unknown atomic swap: 1"}"#));
+    let (mut env, id) = swap_env(&book.url, MNEMONIC);
+    let path = env.dir.join("atomic_swaps.json");
+    std::fs::write(&path, legacy_swap_store(&id)).unwrap();
+    // The owner's bug: `Order book HTTP 404: Unknown atomic swap: 1` for the
+    // whole list. Now the legacy record (no terms: nothing to act on) is
+    // left out and kept.
+    let listed = env.ok("atomic_swap_list", json!({ "wallet_id": id }));
+    assert_eq!(listed, json!([]));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        legacy_swap_store(&id)
+    );
+    assert_eq!(book.requests()[0].target, "/api/atomic-swaps/1");
+
+    // A record that kept its terms is listed, with why it is not live.
+    let coordinator = format!("{}/api/atomic-swaps", book.url);
+    let with_terms = json!({"swaps": [{
+        "key_index": 1, "offer_id": 2, "role": "taker", "wallet_id": id,
+        "coordinator": coordinator,
+        "terms": {
+            "offered_chain": "bitcoin", "offered_asset_id": "btc-testnet",
+            "offered_amount_sats": 50000, "wanted_chain": "liquid",
+            "wanted_asset_id": templar_core::TESTNET_POLICY_ASSET,
+            "wanted_amount_sats": 49000, "payment_hash": "ab".repeat(32),
+            "maker_pubkey": "02".to_string() + &"11".repeat(32),
+            "maker_timeout": 4_000_000_000u64,
+            "taker_pubkey": "03".to_string() + &"22".repeat(32),
+            "taker_timeout": 3_900_000_000u64
+        }
+    }]});
+    std::fs::write(&path, with_terms.to_string()).unwrap();
+    let listed = env.ok("atomic_swap_list", json!({ "wallet_id": id }));
+    let row = &listed[0];
+    assert_keys(
+        "atomic_swap_list row",
+        row,
+        &[
+            "offer_id",
+            "wallet_id",
+            "role",
+            "key_index",
+            "row",
+            "next_action",
+            "can_fund",
+            "can_claim",
+            "can_refund",
+            "availability",
+            "availability_note",
+            "coordinator",
+        ],
+    );
+    assert_eq!(row["availability"], json!("not_on_this_book"));
+    assert_eq!(row["row"]["status"], json!("unavailable"));
+    assert_eq!(row["next_action"], json!("wait"));
+    assert_eq!(row["row"]["state"]["offered_amount_sats"], json!(50000));
+    assert_eq!(row["row"]["state"]["wanted_ticker"], json!("LBTC"));
+    assert_eq!(row["coordinator"], json!(coordinator));
+}
+
 // ── Live: LiquiDEX on a Templar testlab ────────────────────────────
 
 /// One side of a live test: an engine on its own data directory (joined to

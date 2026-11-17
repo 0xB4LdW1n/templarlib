@@ -11,6 +11,8 @@ pub mod types;
 
 #[cfg(test)]
 mod contract_tests;
+#[cfg(test)]
+mod test_http;
 
 use std::path::PathBuf;
 use std::sync::Mutex;

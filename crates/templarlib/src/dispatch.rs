@@ -925,9 +925,14 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
             ensure_wallet_open(state, &p.wallet_id)?;
             cross_swaps::join(state, p).map(|v| serde_json::to_value(v).unwrap())
         }
+        // Testnet only: anywhere else an empty list at once, no wallet
+        // opened, no server contacted, no record read.
         "atomic_swap_list" => {
             let p: cross_swaps::ListParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            if !cross_swaps::available_on(&state.liquid_network) {
+                return Ok(serde_json::json!([]));
+            }
             ensure_wallet_open(state, &p.wallet_id)?;
             cross_swaps::list_mine(state, &p.wallet_id).map(|v| serde_json::to_value(v).unwrap())
         }
