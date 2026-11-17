@@ -1,9 +1,9 @@
 # Running the ignored tests
 
-`cargo test --workspace` is offline and is the gate. Eleven tests are
+`cargo test --workspace` is offline and is the gate. Twelve tests are
 `#[ignore]`d because they need something the gate does not have: a local
 Elements regtest node, a running Templar testlab, a running Templar
-Protocol site, a public Electrum server, or time. This guide says what each one needs and how to run it.
+Protocol site, a public Electrum server, a public faucet, or time. This guide says what each one needs and how to run it.
 
 List them:
 
@@ -116,6 +116,63 @@ No funds move: SideSwap's deposit addresses are never paid. On
 2026-11-15 SideSwap's testnet answered `server_status`, but refused both
 orders: peg-out with `disabled on testnet`, peg-in with an internal error
 of its own backend; the test then checks the refusals, not an order.
+
+## Against public Liquid testnet and the local order book
+
+| Test | Crate | What it proves |
+|---|---|---|
+| `live_testnet_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end on public Liquid testnet with no test server joined: two software wallets get coins from the public faucet (A its TEST asset and L-BTC for fees, B L-BTC), each payment confirmed before the next request; A prepares an exact coin (`swap_make_prepare`), waits for its block, makes an offer of TEST for L-BTC whose output leg carries a `blinding_nonce`, publishes it to the local order book's testnet book, which verifies it on chain (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets` (verified, takeable), verifies it deep (`network: testnet`), previews and takes it; after the block both wallets show the trade, and A's wallet unblinds the L-BTC it was paid (a coin of exactly the price from the take's txid, and the dashboard balance); a second take is refused; a second offer is published, cancelled (`swap_cancel`) and refused to B; the book's watcher marks the first `filled` and the second `cancelled` |
+
+It needs:
+
+- the order book (`templar-orderbook`) running on `http://127.0.0.1:3210`
+  with its default testnet chain backend (Blockstream's public Liquid
+  testnet Electrum); `curl http://127.0.0.1:3210/api/health` shows
+  `"public_publish": {… "liquid-testnet": "chain"}`. The engine's defaults
+  already point there when no test server is joined;
+- the network: Blockstream's Liquid testnet Electrum
+  (`elements-testnet.blockstream.info:50002`) for both wallets, Bitcoin
+  testnet Electrum for the Bitcoin half of `sync_wallet` (its failure is
+  ignored), and the public faucet `https://liquidtestnet.com/api/faucet`.
+
+No `TEMPLAR_*` variable is needed; do not join a test server.
+
+```bash
+cargo test -p templarlib live_testnet_liquidex -- --ignored --nocapture
+```
+
+| Variable | Effect |
+|---|---|
+| `TEMPLAR_LIVE_TESTNET_DIR` | a directory for the two wallets' data directories (`maker/`, `taker/`), kept after the run. A rerun reopens the same wallets and asks the faucet only for what they lack; without it each run uses throwaway directories and asks the faucet three times |
+
+The faucet pays 100 000 sats of L-BTC (`action=lbtc`) or 5 000 base units
+of its TEST asset (`action=test`,
+`38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5`) per
+request, allows 3 requests a minute, and serves about one payment per
+block: it spends its own change, so a request made before its previous
+payment confirmed answers HTTP 200 with
+`{"result": "error", "error": "…InsufficientFunds…"}`. The test makes each
+request only after the previous one is confirmed and never retries one; a
+refusal fails the run with the faucet's answer.
+
+The test offers 2 000 base units of TEST (2.000 TEST: the registry gives
+it precision 3) for 20 000 sats of L-BTC; the second offer is the
+remaining TEST coin. Liquid testnet makes a block about every minute; the
+test syncs every 15 s and allows 15 minutes per confirmation, and prints
+how long each wait took and every txid as a Blockstream explorer link.
+On 2026-11-17 two runs passed: each faucet payment confirmed in about
+40 s, the prepared coin in about 60 s, the take and the cancel in 40–60 s,
+the book's deep verification took about 1.7 s, and the watcher had closed
+both offers within 15 s of the cancel's confirmation. A run with funded
+wallets takes 3–5 minutes; each missing faucet payment adds about a
+minute. Fees seen: 40 sats for the preparation and for the cancel, 377
+for the take (the taker pays it).
+
+Neither the engine nor the order book knows the TEST asset's metadata:
+the engine reads no public registry for assets it did not issue, and the
+book names an unknown asset `Unregistered asset` with ticker `38FCA2D9`
+and precision 8 until its admin adds it. Amounts are right in base
+units, but both show 2 000 units as `0.00002000`.
 
 ## Against a running Templar Protocol site
 

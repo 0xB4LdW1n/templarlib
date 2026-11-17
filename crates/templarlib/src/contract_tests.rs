@@ -31,31 +31,64 @@ static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
 struct TestEnv {
     state: AppState,
     dir: PathBuf,
+    /// Leave the data directory on disk when dropped (a live test asked to
+    /// keep its funded wallets for the next run).
+    keep: bool,
 }
+
+/// The passphrase of every test vault.
+const TEST_VAULT_PASSPHRASE: &str = "contract-test-passphrase";
 
 impl TestEnv {
     fn new() -> Self {
         let mut env = Self::new_without_vault();
+        env.install_test_vault();
+        env
+    }
+
+    /// An engine on a data directory that outlives the test: reopened (its
+    /// test vault unlocked) when it exists, set up like [`TestEnv::new`]
+    /// otherwise. Never removed.
+    fn kept(dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&dir).expect("create kept data dir");
+        let reopen = templar_core::registry::vault_is_initialized(&dir);
+        let state = AppState::new_for_test(dir.clone());
+        let mut env = Self {
+            state,
+            dir,
+            keep: true,
+        };
+        if reopen {
+            env.ok(
+                "unlock_vault",
+                json!({ "passphrase": TEST_VAULT_PASSPHRASE }),
+            );
+        } else {
+            env.install_test_vault();
+        }
+        env
+    }
+
+    fn install_test_vault(&mut self) {
         // Production never stores a seed without a vault (A2), so neither does
         // the harness: `create_wallet` is refused on an unencrypted install.
         // Built directly with cheap KDF parameters — going through
         // `vault::setup` would spend 64 MiB and half a second of Argon2 per
         // test for no extra coverage.
-        if env.state.startup_error.is_none() {
+        if self.state.startup_error.is_none() {
             let (vault, header) = templar_core::Vault::create_with_params(
-                "contract-test-passphrase",
+                TEST_VAULT_PASSPHRASE,
                 templar_core::KdfParams::FAST_FOR_TESTS,
             )
             .expect("test vault");
-            templar_core::registry::save_vault_header(&env.dir, &header)
+            templar_core::registry::save_vault_header(&self.dir, &header)
                 .expect("test vault header");
-            env.state
+            self.state
                 .registry
-                .save_with_vault(&env.dir, Some(&vault))
+                .save_with_vault(&self.dir, Some(&vault))
                 .expect("seal test registry");
-            env.state.vault = Some(vault);
+            self.state.vault = Some(vault);
         }
-        env
     }
 
     /// A fresh install with no vault at all — what the app sees before the
@@ -73,7 +106,11 @@ impl TestEnv {
         ));
         std::fs::create_dir_all(&dir).expect("create test data dir");
         let state = AppState::new_for_test(dir.clone());
-        Self { state, dir }
+        Self {
+            state,
+            dir,
+            keep: false,
+        }
     }
 
     /// Raw dispatch — returns the full `{"ok": ...}` / `{"err": ...}` envelope.
@@ -122,7 +159,9 @@ impl TestEnv {
 
 impl Drop for TestEnv {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
@@ -3024,8 +3063,8 @@ fn a_lying_htlc_coordinator_cannot_redirect_a_swap_payment() {
 
 // ── Live: LiquiDEX on a Templar testlab ────────────────────────────
 
-/// One side of the live swap: an engine on its own data directory, joined
-/// to the lab, with one fresh software wallet open.
+/// One side of a live test: an engine on its own data directory (joined to
+/// the lab, or on Liquid testnet), with one software wallet open.
 struct LabWallet {
     env: TestEnv,
     id: String,
@@ -3036,6 +3075,11 @@ impl LabWallet {
         let mut env = TestEnv::new();
         let joined = env.ok("set_test_server", json!({ "url": lab }));
         assert_eq!(joined["active"]["liquid_network"], json!("liquid-regtest"));
+        Self::create(env, name)
+    }
+
+    /// A fresh software wallet (Bitcoin and Liquid) named `name` in `env`.
+    fn create(mut env: TestEnv, name: &str) -> Self {
         let words = env.ok("generate_mnemonic", json!({ "word_count": 12 }));
         let mnemonic = words
             .as_array()
@@ -3406,6 +3450,490 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
                 || r["proposal_json"] == json!(second_json)),
         "closed offers must leave the open book"
     );
+}
+
+// ── Live: LiquiDEX on public Liquid testnet ────────────────────────
+
+/// The public Liquid testnet faucet (liquidtestnet.com, OpenAPI at
+/// `/openapi.json`): `action=lbtc` pays 100 000 sats of L-BTC,
+/// `action=test` 5 000 base units of its TEST asset; 3 requests a minute.
+const TESTNET_FAUCET: &str = "https://liquidtestnet.com/api/faucet";
+/// The faucet's TEST asset, registered in Blockstream's asset registry.
+const TESTNET_FAUCET_ASSET: &str =
+    "38fca2d939696061a8f76d4e6b5eecd54e3b4221c846f24a6b279e79952850a5";
+const TESTNET_EXPLORER_TX: &str = "https://blockstream.info/liquidtestnet/tx/";
+/// Liquid testnet makes a block about every minute: poll every 15 s.
+const TESTNET_POLL: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long one wait for a confirmation may take (a slow block, a busy
+/// public Electrum).
+const TESTNET_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// One faucet request, never retried: the faucet's coins and its rate
+/// limit are shared by everyone. Only throwaway addresses go to it.
+fn testnet_faucet(address: &str, action: &str) -> String {
+    let url = format!("{TESTNET_FAUCET}?address={address}&action={action}");
+    let resp = lab_http()
+        .get(&url)
+        .send()
+        .unwrap_or_else(|e| panic!("the testnet faucet cannot be reached: {e}"));
+    let status = resp.status();
+    let v: Value = resp.json().unwrap_or(Value::Null);
+    let txid = v["txid"].as_str().unwrap_or_default().to_string();
+    assert!(
+        status.is_success() && txid.len() == 64,
+        "the testnet faucet refused {action} (HTTP {status}): {v}; not retried"
+    );
+    eprintln!("[live] faucet {action} → {address}: {TESTNET_EXPLORER_TX}{txid}");
+    txid
+}
+
+/// One faucet payment of `action` to a fresh address of `w`, waited for
+/// until it is confirmed in `w`.
+fn testnet_fund(w: &mut LabWallet, who: &str, action: &str, asset_id: &str) {
+    let to = w.address("LBTC");
+    let txid = testnet_faucet(&to, action);
+    w.wait_coins(
+        &format!("{who}: faucet {action} confirmed"),
+        TESTNET_CONFIRM_TIMEOUT,
+        |c| confirmed(coin_from(c, &txid, asset_id)),
+    );
+}
+
+/// Sum of `asset_id` over `coins` with at least `min_conf` confirmations.
+fn coin_sum(coins: &[Value], asset_id: &str, min_conf: u64) -> i64 {
+    coins
+        .iter()
+        .filter(|c| c["asset_id"] == json!(asset_id))
+        .filter(|c| c["confirmations"].as_u64().unwrap_or(0) >= min_conf)
+        .map(|c| c["amount"].as_i64().unwrap())
+        .sum()
+}
+
+/// The coin of `asset_id` that transaction `txid` paid this wallet, if any.
+fn coin_from<'a>(coins: &'a [Value], txid: &str, asset_id: &str) -> Option<&'a Value> {
+    coins.iter().find(|c| {
+        c["asset_id"] == json!(asset_id)
+            && c["outpoint"]
+                .as_str()
+                .is_some_and(|o| o.starts_with(&format!("{txid}:")))
+    })
+}
+
+fn confirmed(coin: Option<&Value>) -> bool {
+    coin.is_some_and(|c| c["confirmations"].as_u64().unwrap_or(0) >= 1)
+}
+
+impl LabWallet {
+    /// A wallet on Liquid testnet: in a throwaway data directory, or, with
+    /// `keep`, in `keep` (reopened when a previous run left it there, so a
+    /// rerun spends what the faucet already paid).
+    fn on_testnet(name: &str, keep: Option<PathBuf>) -> Self {
+        let Some(dir) = keep else {
+            return Self::create(TestEnv::new(), name);
+        };
+        let mut env = TestEnv::kept(dir);
+        let wallets = env.ok("list_wallets", json!({}));
+        let existing = wallets
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|w| w["name"] == json!(name))
+            .and_then(|w| w["id"].as_str())
+            .map(str::to_string);
+        match existing {
+            Some(id) => {
+                eprintln!(
+                    "[live] {name}: reusing the wallet kept in {}",
+                    env.dir.display()
+                );
+                Self { env, id }
+            }
+            None => Self::create(env, name),
+        }
+    }
+
+    /// The Liquid coins after a sync, or `None` when the Liquid sync failed
+    /// (a public Electrum server has bad moments; the caller polls again).
+    /// The Bitcoin side is synced too and ignored.
+    fn liquid_coins(&mut self) -> Option<Vec<Value>> {
+        let outcome = self.ok("sync_wallet", json!({}));
+        if outcome["liquid"] != json!("ok") {
+            eprintln!("[live] Liquid sync: {}", outcome["liquid"]);
+            return None;
+        }
+        let coins = self.ok("list_utxos", json!({ "chain": "liquid" }));
+        Some(coins.as_array().unwrap().clone())
+    }
+
+    /// Syncs every [`TESTNET_POLL`] until `pred` holds on the Liquid coins;
+    /// panics after `timeout` or six failed syncs in a row. Prints how long
+    /// it took.
+    fn wait_coins(
+        &mut self,
+        what: &str,
+        timeout: std::time::Duration,
+        pred: impl Fn(&[Value]) -> bool,
+    ) -> Vec<Value> {
+        let start = std::time::Instant::now();
+        let mut failures = 0;
+        loop {
+            match self.liquid_coins() {
+                Some(coins) if pred(&coins) => {
+                    eprintln!("[live] {what}: after {} s", start.elapsed().as_secs());
+                    return coins;
+                }
+                Some(_) => failures = 0,
+                None => {
+                    failures += 1;
+                    assert!(
+                        failures < 6,
+                        "{what}: the Liquid sync failed 6 times in a row"
+                    );
+                }
+            }
+            assert!(
+                start.elapsed() < timeout,
+                "{what}: not seen after {} s",
+                start.elapsed().as_secs()
+            );
+            std::thread::sleep(TESTNET_POLL);
+        }
+    }
+}
+
+/// LiquiDEX end to end on public Liquid testnet with the local order book's
+/// testnet book (`http://127.0.0.1:3210`, the engine's default with no test
+/// server joined): two fresh software wallets, funded by the public faucet
+/// (A: its TEST asset and L-BTC for fees; B: L-BTC); A prepares an exact
+/// coin, makes and publishes an offer of TEST for L-BTC; B finds it in
+/// `list_markets`, verifies it deep, previews and takes it; both wallets
+/// see the trade (the maker sees the L-BTC it was paid); a second take is
+/// refused; a second offer is published and cancelled and can no longer
+/// be taken; the book's watcher marks the first `filled` and the second
+/// `cancelled`. See docs/guides/LIVE_TESTS.md.
+#[test]
+#[ignore = "needs public Liquid testnet (faucet, Blockstream Electrum) and the local order book on 127.0.0.1:3210"]
+fn live_testnet_liquidex_make_publish_take_cancel() {
+    // The asset A offers, in base units, and the L-BTC it asks for.
+    const OFFER: i64 = 2_000;
+    const PRICE: i64 = 20_000;
+    // What each side needs before the trade: A some L-BTC for the
+    // preparation and cancel fees, B the price and its fee.
+    const A_LBTC_MIN: i64 = 2_000;
+    const B_LBTC_MIN: i64 = PRICE + 2_000;
+    let keep = std::env::var("TEMPLAR_LIVE_TESTNET_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
+    let asset = TESTNET_FAUCET_ASSET;
+    let tx_link = |txid: &str| format!("{TESTNET_EXPLORER_TX}{txid}");
+    let run = std::time::Instant::now();
+
+    let mut a = LabWallet::on_testnet("Live testnet maker", keep.as_ref().map(|d| d.join("maker")));
+    let mut b = LabWallet::on_testnet("Live testnet taker", keep.as_ref().map(|d| d.join("taker")));
+    // No test server, Liquid testnet: the defaults (local order book,
+    // Blockstream's public Electrum).
+    let v = a.env.ok("get_test_server", json!({}));
+    assert_eq!(v["configured"], json!(false), "{v}");
+    let active = &v["active"];
+    assert_eq!(active["liquid_network"], json!("liquid-testnet"), "{v}");
+    let lbtc = active["liquid"]["policy_asset"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let markets_url = active["orderbook"]["markets"]["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    eprintln!(
+        "[live] order book: publish {}, markets {markets_url}; Liquid backend {}",
+        active["orderbook"]["publish"]["url"], active["liquid"]["backend_description"]
+    );
+    assert!(
+        markets_url.starts_with("http://127.0.0.1:3210/"),
+        "expected the local order book: {markets_url}"
+    );
+
+    // ── Fund: only what is missing (a kept wallet may hold enough) ──────
+    // One faucet request at a time, each confirmed before the next: the
+    // faucet spends its own unconfirmed change no sooner than the next
+    // block, and a second request in the same block fails with
+    // `InsufficientFunds`.
+    let a_coins = a.wait_coins("A first sync", TESTNET_CONFIRM_TIMEOUT, |_| true);
+    let b_coins = b.wait_coins("B first sync", TESTNET_CONFIRM_TIMEOUT, |_| true);
+    if coin_sum(&a_coins, asset, 0) <= OFFER {
+        testnet_fund(&mut a, "A", "test", asset);
+    }
+    if coin_sum(&a_coins, &lbtc, 0) < A_LBTC_MIN {
+        testnet_fund(&mut a, "A", "lbtc", &lbtc);
+    }
+    if coin_sum(&b_coins, &lbtc, 0) < B_LBTC_MIN {
+        testnet_fund(&mut b, "B", "lbtc", &lbtc);
+    }
+    // A kept wallet's coins may still be waiting for their block.
+    let a_coins = a.wait_coins("A's funds confirmed", TESTNET_CONFIRM_TIMEOUT, |c| {
+        coin_sum(c, asset, 1) > OFFER && coin_sum(c, &lbtc, 1) >= A_LBTC_MIN
+    });
+    let b_coins = b.wait_coins("B's funds confirmed", TESTNET_CONFIRM_TIMEOUT, |c| {
+        coin_sum(c, &lbtc, 1) >= B_LBTC_MIN
+    });
+    let a_asset_start = coin_sum(&a_coins, asset, 0);
+    let a_lbtc_start = coin_sum(&a_coins, &lbtc, 0);
+    let b_lbtc_start = coin_sum(&b_coins, &lbtc, 0);
+    let b_asset_start = coin_sum(&b_coins, asset, 0);
+    eprintln!(
+        "[live] funded: A {a_asset_start} TEST + {a_lbtc_start} L-BTC sats, \
+         B {b_lbtc_start} L-BTC sats + {b_asset_start} TEST"
+    );
+    assert!(a_asset_start > OFFER, "A holds {a_asset_start} TEST");
+    assert!(
+        b_lbtc_start >= B_LBTC_MIN,
+        "B holds {b_lbtc_start} L-BTC sats"
+    );
+
+    // ── Make: an exact coin of OFFER, offered for PRICE L-BTC ──────────
+    let prep = a.ok(
+        "swap_make_prepare",
+        json!({ "asset_id": asset, "amount_sats": OFFER }),
+    );
+    let prep = prep.as_str().unwrap().to_string();
+    eprintln!("[live] make_prepare: {}", tx_link(&prep));
+    let coins = a.wait_coins("A's exact coin confirmed", TESTNET_CONFIRM_TIMEOUT, |c| {
+        c.iter().any(|u| {
+            u["asset_id"] == json!(asset)
+                && u["amount"] == json!(OFFER)
+                && u["outpoint"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{prep}:"))
+                && u["confirmations"].as_u64().unwrap_or(0) >= 1
+        })
+    });
+    let utxo = coins
+        .iter()
+        .find(|u| {
+            u["asset_id"] == json!(asset)
+                && u["amount"] == json!(OFFER)
+                && u["outpoint"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("{prep}:"))
+        })
+        .unwrap()["outpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let a_lbtc_before = coin_sum(&coins, &lbtc, 0);
+    eprintln!(
+        "[live] preparation fee: {} sats",
+        a_lbtc_start - a_lbtc_before
+    );
+    let offer = a.ok(
+        "swap_make",
+        json!({ "utxo": utxo, "want_asset_id": lbtc, "want_amount_sats": PRICE }),
+    );
+    let proposal = offer["proposal_json"].as_str().unwrap().to_string();
+    let wire: Value = serde_json::from_str(&proposal).unwrap();
+    assert!(
+        wire["outputs"][0]["blinding_nonce"].is_string(),
+        "the proposal carries the maker's blinding nonce: {}",
+        wire["outputs"][0]
+    );
+    let published = std::time::Instant::now();
+    let book_id = a.env.ok(
+        "swap_publish",
+        json!({ "proposal_json": proposal, "note": "templarlib live testnet test" }),
+    );
+    eprintln!(
+        "[live] published as testnet book offer {book_id} (deep-verified by the book in {} ms)",
+        published.elapsed().as_millis()
+    );
+    let dup = a
+        .env
+        .err("swap_publish", json!({ "proposal_json": proposal }));
+    assert!(dup.starts_with("BOOK_DUPLICATE:"), "{dup}");
+
+    // ── Take ───────────────────────────────────────────────────────────
+    let markets = b.env.ok("list_markets", json!({}));
+    let row = markets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["proposal_json"] == json!(proposal))
+        .unwrap_or_else(|| panic!("offer not in list_markets: {markets}"))
+        .clone();
+    eprintln!(
+        "[live] B's market row: {} {} for {} {}, verified {}, takeable {}",
+        row["maker_gives"]["display_amount"],
+        row["maker_gives"]["ticker"],
+        row["maker_wants"]["display_amount"],
+        row["maker_wants"]["ticker"],
+        row["verified"],
+        row["takeable"]
+    );
+    assert_eq!(row["verified"], json!(true), "{row}");
+    assert_eq!(row["takeable"], json!(true), "{row}");
+    assert_eq!(row["maker_gives"]["asset_id"], json!(asset), "{row}");
+    assert_eq!(row["maker_gives"]["amount_sats"], json!(OFFER), "{row}");
+    assert_eq!(row["maker_wants"]["asset_id"], json!(lbtc), "{row}");
+    assert_eq!(row["maker_wants"]["amount_sats"], json!(PRICE), "{row}");
+    let analysis = b.env.ok(
+        "swap_verify",
+        json!({ "proposal_json": proposal, "deep": true }),
+    );
+    assert_eq!(analysis["valid"], json!(true), "{analysis}");
+    assert_eq!(analysis["takeable"], json!(true), "{analysis}");
+    assert_eq!(analysis["network"], json!("testnet"), "{analysis}");
+    let preview = b.ok("swap_take_preview", json!({ "proposal_json": proposal }));
+    eprintln!("[live] take preview: {preview}");
+    assert_eq!(preview["you_receive"]["amount_sats"], json!(OFFER));
+    assert_eq!(preview["you_pay"]["amount_sats"], json!(PRICE));
+    let fee = preview["fee_sats"].as_i64().unwrap();
+    let take_txid = b.ok("swap_take", json!({ "proposal_json": proposal }));
+    let take_txid = take_txid.as_str().unwrap().to_string();
+    eprintln!("[live] take: {}", tx_link(&take_txid));
+
+    let b_coins = b.wait_coins("B's take confirmed", TESTNET_CONFIRM_TIMEOUT, |c| {
+        confirmed(coin_from(c, &take_txid, asset))
+    });
+    let b_asset = coin_sum(&b_coins, asset, 0);
+    let b_lbtc = coin_sum(&b_coins, &lbtc, 0);
+    assert_eq!(b_asset, b_asset_start + OFFER, "B's TEST");
+    assert!(
+        (b_lbtc - (b_lbtc_start - PRICE - fee)).abs() <= 10,
+        "B L-BTC {b_lbtc}, started {b_lbtc_start}, price {PRICE}, fee {fee}"
+    );
+    // The maker sees the L-BTC it was paid: the take's output to A is
+    // blinded with the proposal's nonce, which A's wallet unblinds.
+    let a_coins = a.wait_coins("A sees the payment", TESTNET_CONFIRM_TIMEOUT, |c| {
+        confirmed(coin_from(c, &take_txid, &lbtc))
+    });
+    let paid = coin_from(&a_coins, &take_txid, &lbtc).unwrap();
+    assert_eq!(paid["amount"], json!(PRICE), "{paid}");
+    let a_asset = coin_sum(&a_coins, asset, 0);
+    let a_lbtc = coin_sum(&a_coins, &lbtc, 0);
+    assert_eq!(a_asset, a_asset_start - OFFER, "A's TEST");
+    assert_eq!(a_lbtc, a_lbtc_before + PRICE, "A's L-BTC");
+    let summary = a.ok("get_wallet_summary", json!({}));
+    let a_dash_lbtc = summary["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["asset_id"] == json!(lbtc))
+        .map(|x| x["amount"].as_i64().unwrap())
+        .unwrap_or(0);
+    assert_eq!(a_dash_lbtc, a_lbtc, "A's dashboard L-BTC");
+    eprintln!(
+        "[live] after the take: A {a_asset} TEST + {a_lbtc} L-BTC sats (paid {PRICE} at {}); \
+         B {b_asset} TEST + {b_lbtc} L-BTC sats (taker fee {fee})",
+        paid["outpoint"]
+    );
+
+    // A taken offer cannot be taken again.
+    let again = b.err("swap_take", json!({ "proposal_json": proposal }));
+    eprintln!("[live] second take refused: {again}");
+    assert!(again.contains("already spent"), "{again}");
+    let mine = a.ok("list_my_offers", json!({}));
+    let first = mine
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["proposal_json"] == json!(proposal))
+        .unwrap();
+    assert_eq!(first["status"], json!("closed"), "{first}");
+
+    // ── Cancel: a second offer on another TEST coin ────────────────────
+    let rest = a_coins
+        .iter()
+        .find(|u| u["asset_id"] == json!(asset) && u["confirmations"].as_u64().unwrap_or(0) >= 1)
+        .expect("A keeps a confirmed TEST coin")
+        .clone();
+    let rest_outpoint = rest["outpoint"].as_str().unwrap().to_string();
+    let second = a.ok(
+        "swap_make",
+        json!({ "utxo": rest_outpoint, "want_asset_id": lbtc, "want_amount_sats": PRICE }),
+    );
+    let second_json = second["proposal_json"].as_str().unwrap().to_string();
+    let second_id = a.env.ok(
+        "swap_publish",
+        json!({ "proposal_json": second_json, "note": "templarlib live testnet test (cancelled)" }),
+    );
+    eprintln!(
+        "[live] second offer ({} TEST at {rest_outpoint}) published as {second_id}",
+        rest["amount"]
+    );
+    let cancel_txid = a.ok("swap_cancel", json!({ "offer_id": second["offer_id"] }));
+    let cancel_txid = cancel_txid.as_str().unwrap().to_string();
+    eprintln!("[live] cancel: {}", tx_link(&cancel_txid));
+    let a_coins = a.wait_coins("A's cancel confirmed", TESTNET_CONFIRM_TIMEOUT, |c| {
+        confirmed(coin_from(c, &cancel_txid, asset))
+    });
+    assert_eq!(
+        coin_from(&a_coins, &cancel_txid, asset).unwrap()["amount"],
+        rest["amount"]
+    );
+    assert_eq!(
+        coin_sum(&a_coins, asset, 0),
+        a_asset,
+        "A still holds its TEST"
+    );
+    let refused = b.err("swap_take", json!({ "proposal_json": second_json }));
+    eprintln!("[live] cancelled offer refused: {refused}");
+    assert!(refused.contains("already spent"), "{refused}");
+    let mine = a.ok("list_my_offers", json!({}));
+    let cancelled = mine
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["offer_id"] == second["offer_id"])
+        .unwrap();
+    assert_eq!(cancelled["status"], json!("cancelled"), "{cancelled}");
+
+    // ── The book's watcher closes both (it runs every 60 s) ────────────
+    let status_of = |rows: &Value, id: &Value| -> String {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["source_id"] == *id
+                    && r["settlement"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("liquidex"))
+            })
+            .map(|r| r["status"].as_str().unwrap_or("").to_string())
+            .unwrap_or_default()
+    };
+    let feed = format!("{markets_url}?network=liquid-testnet&all");
+    let watch = std::time::Instant::now();
+    let mut closed = (String::new(), String::new());
+    while watch.elapsed() < std::time::Duration::from_secs(300) {
+        let rows = lab_get(&feed);
+        closed = (status_of(&rows, &book_id), status_of(&rows, &second_id));
+        if closed.0 != "open" && closed.1 != "open" && !closed.0.is_empty() && !closed.1.is_empty()
+        {
+            break;
+        }
+        std::thread::sleep(TESTNET_POLL);
+    }
+    eprintln!(
+        "[live] book statuses after {} s: taken {:?}, cancelled {:?}",
+        watch.elapsed().as_secs(),
+        closed.0,
+        closed.1
+    );
+    assert_eq!(closed.0, "filled", "the taken offer in the book");
+    assert_eq!(closed.1, "cancelled", "the cancelled offer in the book");
+    let rows = b.env.ok("list_markets", json!({}));
+    assert!(
+        !rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["proposal_json"] == json!(proposal)
+                || r["proposal_json"] == json!(second_json)),
+        "closed offers must leave the open book"
+    );
+    eprintln!("[live] done in {} s", run.elapsed().as_secs());
 }
 
 /// The manual tester's order, live: a wallet created and synced on Liquid
