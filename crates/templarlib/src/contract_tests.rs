@@ -4055,6 +4055,223 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
     );
 }
 
+/// The running lab's base URL (`TEMPLAR_LIVE_TESTLAB_URL`, default the
+/// local one) and its `/api/config`.
+fn live_lab() -> (String, Value) {
+    let lab = std::env::var("TEMPLAR_LIVE_TESTLAB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8096".to_string());
+    let lab = lab.trim_end_matches('/').to_string();
+    let config = lab_get(&format!("{lab}/api/config"));
+    (lab, config)
+}
+
+fn live_mine(lab: &str, chain: &str) {
+    lab_post(
+        &format!("{lab}/admin/api/mine"),
+        json!({ "chain": chain, "blocks": 1 }),
+    );
+}
+
+/// A fresh wallet funds itself from the lab's public faucet with
+/// `test_server_faucet`: regtest BTC and L-BTC, each at a fresh address of
+/// its own, each the amount the faucet reports. Needs a lab whose
+/// `/api/config` lists its faucet (`networks["liquid-regtest"].faucet`);
+/// skips, saying so, on an older lab. See docs/guides/LIVE_TESTS.md.
+#[test]
+#[ignore = "needs a running Templar testlab whose /api/config lists its faucet (TEMPLAR_LIVE_TESTLAB_URL)"]
+fn live_testlab_wallet_funds_itself_from_the_faucet() {
+    let (lab, config) = live_lab();
+    let regtest = &config["networks"]["liquid-regtest"];
+    if !regtest["faucet"].is_array() {
+        eprintln!(
+            "[live] SKIPPED: {lab}/api/config has no `faucet` list (an older lab); \
+             test_server_faucet was not exercised"
+        );
+        return;
+    }
+    let lbtc = regtest["policy_asset"].as_str().unwrap().to_string();
+    let mut w = LabWallet::join(&lab, "Live faucet");
+    let ts = w.env.ok("get_test_server", json!({}));
+    eprintln!("[live] faucet: {}", ts["faucet"]);
+    assert_eq!(ts["faucet"]["assets_source"], json!("profile"), "{ts}");
+    assert_eq!(ts["faucet"]["available"], json!(true), "{ts}");
+
+    let lbtc_paid = w.ok("test_server_faucet", json!({ "asset": "lbtc" }));
+    eprintln!("[live] faucet L-BTC: {lbtc_paid}");
+    assert_eq!(lbtc_paid["network"], json!("liquid-regtest"));
+    assert!(lbtc_paid["address"].as_str().unwrap().starts_with("el1"));
+    let btc_paid = w.ok("test_server_faucet", json!({ "asset": "btc" }));
+    eprintln!("[live] faucet BTC: {btc_paid}");
+    assert_eq!(btc_paid["network"], json!("bitcoin-regtest"));
+    assert!(btc_paid["address"].as_str().unwrap().starts_with("bcrt1"));
+    live_mine(&lab, "liquid");
+    live_mine(&lab, "bitcoin");
+
+    let want_lbtc = lbtc_paid["amount_sat"].as_i64().unwrap();
+    w.wait_balance(&lbtc, "the faucet's L-BTC", |x| x == want_lbtc);
+    let want_btc = btc_paid["amount_sat"].as_i64().unwrap();
+    w.wait_balance("BTC", "the faucet's BTC", |x| x == want_btc);
+    // Never on testnet.
+    w.env
+        .ok("set_liquid_network", json!({ "network": "testnet" }));
+    let err = w.err("test_server_faucet", json!({ "asset": "lbtc" }));
+    assert!(err.starts_with("FAUCET_UNAVAILABLE:"), "{err}");
+}
+
+/// A token issued on the lab is named for everyone, not only its issuer:
+/// A issues it with no domain (regtest), the engine announces it to the
+/// order book's registry (`book_registered`), A offers 100.00 of it; a
+/// second wallet sees the ticker and precision in `list_markets`, in the
+/// take preview and, after taking it, in its own summary, all marked
+/// `metadata_source: "book"`. Needs an order book with `/api/assets`;
+/// skips, saying so, without one. See docs/guides/LIVE_TESTS.md.
+#[test]
+#[ignore = "needs a running Templar testlab whose order book has /api/assets (TEMPLAR_LIVE_TESTLAB_URL)"]
+fn live_testlab_registered_token_is_named_for_another_wallet() {
+    let (lab, config) = live_lab();
+    let lbtc = config["networks"]["liquid-regtest"]["policy_asset"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let book = config["orderbook_url"].as_str().unwrap().to_string();
+    let registry = lab_http()
+        .get(format!("{book}/api/assets?network=liquid-regtest"))
+        .send()
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0);
+    if registry != 200 {
+        eprintln!(
+            "[live] SKIPPED: {book}/api/assets answered {registry} (an order book without \
+             the registry); the announcement and the names were not exercised"
+        );
+        return;
+    }
+    let admin_pay = |address: &str, amount: &str| {
+        let r = lab_post(
+            &format!("{lab}/admin/api/send"),
+            json!({ "network": "liquid-regtest", "address": address, "asset": "lbtc",
+                    "amount": amount }),
+        );
+        eprintln!(
+            "[live] admin send {amount} L-BTC → {address}: {}",
+            r["txid"]
+        );
+    };
+    let mut a = LabWallet::join(&lab, "Live registry issuer");
+    let mut b = LabWallet::join(&lab, "Live registry buyer");
+    let a_addr = a.address("LBTC");
+    let b_addr = b.address("LBTC");
+    admin_pay(&a_addr, "0.01");
+    admin_pay(&b_addr, "0.2");
+    live_mine(&lab, "liquid");
+    a.wait_balance(&lbtc, "A funded", |x| x == 1_000_000);
+    b.wait_balance(&lbtc, "B funded", |x| x == 20_000_000);
+
+    // A ticker of its own: tickers are unique per network on a book.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let ticker = format!("RT{:06X}", nanos & 0xff_ffff);
+    let issued = a.ok(
+        "issue_asset",
+        json!({ "name": "Registry Token", "ticker": ticker, "precision": 2,
+                "amount_sats": 1_000_000, "reissuance_tokens": 0 }),
+    );
+    eprintln!("[live] issue_asset: {issued}");
+    assert_eq!(issued["domain"], json!("regtest.templar.test"), "{issued}");
+    assert_eq!(issued["proof_url"], json!(""), "{issued}");
+    assert_eq!(issued["book_registered"], json!(true), "{issued}");
+    let token = issued["asset_id"].as_str().unwrap().to_string();
+    live_mine(&lab, "liquid");
+    a.wait_balance(&token, "A issued", |x| x == 1_000_000);
+    // Announcing again is idempotent.
+    let again = a.ok(
+        "reregister_asset",
+        json!({ "asset_id": token, "name": "Registry Token", "ticker": ticker,
+                "precision": 2 }),
+    );
+    eprintln!("[live] reregister_asset: {again}");
+    assert_eq!(again["book_registered"], json!(true), "{again}");
+    assert_eq!(
+        again["registered"],
+        json!(false),
+        "no public registry on regtest"
+    );
+
+    // A offers 100.00 of it for 0.01 L-BTC.
+    const OFFER: i64 = 10_000;
+    let prep = a.ok(
+        "swap_make_prepare",
+        json!({ "asset_id": token, "amount_sats": OFFER }),
+    );
+    live_mine(&lab, "liquid");
+    let utxo = {
+        let mut found = None;
+        for _ in 0..30 {
+            a.sync();
+            let utxos = a.ok("list_utxos", json!({ "chain": "liquid" }));
+            found = utxos.as_array().unwrap().iter().find_map(|u| {
+                (u["asset_id"] == json!(token)
+                    && u["amount"] == json!(OFFER)
+                    && u["outpoint"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(prep.as_str().unwrap()))
+                .then(|| u["outpoint"].as_str().unwrap().to_string())
+            });
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        found.expect("the prepared coin")
+    };
+    let offer = a.ok(
+        "swap_make",
+        json!({ "utxo": utxo, "want_asset_id": lbtc, "want_amount_sats": 1_000_000 }),
+    );
+    let proposal = offer["proposal_json"].as_str().unwrap().to_string();
+    a.env
+        .ok("swap_publish", json!({ "proposal_json": proposal }));
+
+    // B: the market row, the preview and its own summary name the token.
+    let markets = b.env.ok("list_markets", json!({}));
+    let row = markets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["proposal_json"] == json!(proposal))
+        .unwrap_or_else(|| panic!("offer not in list_markets: {markets}"))
+        .clone();
+    eprintln!("[live] B's market row: {}", row["maker_gives"]);
+    assert_eq!(row["maker_gives"]["ticker"], json!(ticker));
+    assert_eq!(row["maker_gives"]["precision"], json!(2));
+    assert_eq!(row["maker_gives"]["display_amount"], json!("100.00"));
+    assert_eq!(row["maker_gives"]["metadata_source"], json!("book"));
+    let preview = b.ok("swap_take_preview", json!({ "proposal_json": proposal }));
+    assert_eq!(preview["you_receive"]["ticker"], json!(ticker), "{preview}");
+    assert_eq!(preview["you_receive"]["display_amount"], json!("100.00"));
+    let take = b.ok("swap_take", json!({ "proposal_json": proposal }));
+    eprintln!("[live] take txid {take}");
+    live_mine(&lab, "liquid");
+    b.wait_balance(&token, "B received the token", |x| x == OFFER);
+    let dash = b.ok("get_wallet_summary", json!({}));
+    let held = dash["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["asset_id"] == json!(token))
+        .cloned()
+        .expect("B's token row");
+    eprintln!("[live] B's summary row: {held}");
+    assert_eq!(held["ticker"], json!(ticker));
+    assert_eq!(held["name"], json!("Registry Token"));
+    assert_eq!(held["precision"], json!(2));
+    assert_eq!(held["display_amount"], json!("100.00"));
+    assert_eq!(held["metadata_source"], json!("book"));
+}
+
 /// A wallet issues its own token on a running Templar testlab and sells
 /// part of it on LiquiDEX for L-BTC; then reissues and burns some. The
 /// owner's manual test in the app, through the engine: two fresh software
@@ -4143,8 +4360,12 @@ fn live_testlab_issue_token_and_sell_for_lbtc() {
             "proof_content",
         ],
     );
-    // No public registry on regtest: not attempted.
+    // No public registry on regtest: not attempted. The order book's
+    // registry is asked (best-effort): `book_registered`, or `book_error`
+    // on a book without one.
     assert_eq!(issued["registry_registered"], json!(false), "{issued}");
+    assert!(issued["book_registered"].is_boolean(), "{issued}");
+    assert_eq!(issued["proof_url"], json!(""), "no domain proof on regtest");
     let tmpl = issued["asset_id"].as_str().unwrap().to_string();
     let token = issued["token_id"]
         .as_str()
@@ -4957,6 +5178,27 @@ fn live_testlab_native_peg_in_and_out() {
     let mut w = LabWallet::join(&lab, "Live peg");
     let net = w.env.ok("get_liquid_network", json!({}));
     assert_eq!(net["peg_provider"], json!("native"), "{net}");
+    // Before any funds: both directions refused with the tag, naming the
+    // chain and the asset (nothing is paid; the orders are cancelled).
+    w.sync();
+    for (direction, payout, says) in [
+        ("in", w.address("LBTC"), "of BTC on Bitcoin regtest"),
+        ("out", w.address("BTC"), "of L-BTC on Liquid regtest"),
+    ] {
+        let order = w.ok(
+            "peg_start",
+            json!({ "direction": direction, "amount_sats": 150_000, "payout_address": payout }),
+        );
+        let oid = order["order_id"].as_str().unwrap().to_string();
+        let err = w.env.err("peg_fund", json!({ "order_id": oid }));
+        eprintln!("[live] unfunded peg-{direction}: {err}");
+        assert!(
+            err.starts_with("PEG_INSUFFICIENT_FUNDS: this wallet has 0 sat"),
+            "{err}"
+        );
+        assert!(err.contains(says), "{err}");
+        w.env.ok("peg_cancel", json!({ "order_id": oid }));
+    }
     let btc_addr = w.address("BTC");
     let lbtc_addr = w.address("LBTC");
     fund("bitcoin-regtest", &btc_addr, "0.01");

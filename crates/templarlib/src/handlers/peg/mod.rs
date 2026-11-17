@@ -490,7 +490,7 @@ pub(super) fn build_failure(
             ..
         }) => PegError::InsufficientFunds(format!(
             "this wallet has {available_sats} sat of L-BTC on {liquid}; {what} and its fee \
-             need {} sat.{}",
+             need at least {} sat.{}",
             available_sats.saturating_add(missing_sats),
             frozen(frozen_left_out)
         ))
