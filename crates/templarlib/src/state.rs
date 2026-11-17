@@ -71,6 +71,10 @@ pub struct AppState {
     pub persisted_data_dir: PathBuf,
     pub registry: WalletRegistry,
     pub asset_registry: AssetRegistry,
+    /// The active order book's asset registry (display names of assets the
+    /// wallet does not know itself), cached per book and network
+    /// (`handlers::asset_names`).
+    pub book_assets: crate::handlers::asset_names::BookAssetCache,
     /// Liquid network every Liquid wallet is opened on: testnet, or a local
     /// Elements regtest. Persisted in `AppConfig`; `TEMPLAR_LIQUID_NETWORK`
     /// overrides it for the process lifetime (`liquid_network_env_locked`).
@@ -357,6 +361,7 @@ impl AppState {
             persisted_data_dir,
             registry,
             asset_registry,
+            book_assets: Default::default(),
             liquid_network,
             liquid_network_env_locked,
             test_server,
@@ -378,6 +383,7 @@ impl AppState {
         if state.startup_error.is_none() {
             state.reconcile_regtest_cache();
         }
+        crate::handlers::asset_names::reload(&mut state);
         state
     }
 
@@ -474,6 +480,7 @@ impl AppState {
         self.liquid_network = network;
         self.asset_registry = Self::asset_registry_for(&self.liquid_network);
         let regtest_cache_reset = self.reconcile_regtest_cache();
+        crate::handlers::asset_names::reload(self);
         eprintln!(
             "[templarlib] test server → {}; Liquid network {}",
             self.test_server
@@ -525,6 +532,10 @@ impl AppState {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => eprintln!("[templarlib] could not drop {}: {e}", path.display()),
             }
+        }
+        if crate::handlers::asset_names::drop_network(&self.data_dir, "liquid-regtest") {
+            eprintln!("[templarlib] dropped the cached regtest asset registries");
+            dropped = true;
         }
         match crate::handlers::swaps::drop_offers_on(&self.data_dir, "liquid-regtest") {
             Ok(n) if n > 0 => {
@@ -621,19 +632,6 @@ impl AppState {
         self.liquid_network.is_policy_asset(asset_id)
     }
 
-    /// Refuses `what` on a regtest, where it cannot exist (the public asset
-    /// registry, the public order book). The peg has its own gate,
-    /// [`templar_core::Endpoints::peg_provider`].
-    pub fn require_liquid_testnet(&self, what: &str) -> Result<(), String> {
-        if self.liquid_network.is_regtest() {
-            return Err(format!(
-                "{what} is not available on Liquid regtest. Switch the Liquid network \
-                 to testnet in Settings to use it."
-            ));
-        }
-        Ok(())
-    }
-
     /// Switches the Liquid network: persists it, closes whatever wallet is
     /// open (its Liquid side was built on the old network) and resets the
     /// asset registry. The caller reopens and re-syncs the wallet.
@@ -661,6 +659,7 @@ impl AppState {
         }
         self.liquid_network = network;
         self.asset_registry = Self::asset_registry_for(&self.liquid_network);
+        crate::handlers::asset_names::reload(self);
         eprintln!("[templarlib] Liquid network → {}", self.liquid_network);
         Ok(())
     }
@@ -712,6 +711,7 @@ impl AppState {
             data_dir,
             registry,
             asset_registry: AssetRegistry::with_defaults(),
+            book_assets: Default::default(),
             liquid_network: LiquidNetwork::testnet(),
             liquid_network_env_locked: false,
             test_server: None,

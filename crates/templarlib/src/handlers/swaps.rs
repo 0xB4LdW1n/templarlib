@@ -27,23 +27,47 @@ use templar_core::liquid::liquidex::verify_proposal_on;
 use templar_core::{broadcast_transaction_with, proposal_utxo_unspent_with, verify_proposal_with};
 use templar_core::{
     build_cancel_tx, first_frozen, make_proposal, take_preview_excluding, take_proposal_excluding,
-    AssetRegistry, CoinChain, LiquidError, LiquidexLeg, LiquidexProposal, SwapLeg, SwapNetwork,
-    TakePreview, VerifyCheck, VerifyResult,
+    CoinChain, LiquidError, LiquidexLeg, LiquidexProposal, SwapLeg, SwapNetwork, TakePreview,
+    VerifyCheck, VerifyResult,
 };
 
+use crate::handlers::asset_names::{self, FROM_FEED, FROM_NONE};
 use crate::state::AppState;
 
 const STORE_FILE: &str = "swap_offers.json";
 
 // ── DTOs (wire shapes fixed by the host contract) ────────────────────────────
 
-/// One asset/amount side of a swap, enriched for display.
+/// One asset/amount side of a swap, enriched for display. `amount_sats`
+/// (base units) is the source of truth; the rest is how it is shown.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct SwapLegDto {
     pub asset_id: String,
     pub ticker: String,
     pub amount_sats: u64,
     pub display_amount: String,
+    /// The asset's name.
+    #[serde(default)]
+    pub name: String,
+    /// Decimal places `display_amount` uses.
+    #[serde(default = "eight")]
+    pub precision: u8,
+    /// Who named the asset: `wallet` | `book` (the active order book's
+    /// registry: show the short asset id beside it) | `feed` (the row's own
+    /// display data) | `none` (nobody: short asset id, 8 decimals).
+    #[serde(default = "from_feed")]
+    pub metadata_source: String,
+    /// The order book's own provenance of a `book` name; null otherwise.
+    #[serde(default)]
+    pub book_source: Option<String>,
+}
+
+fn eight() -> u8 {
+    8
+}
+
+fn from_feed() -> String {
+    FROM_FEED.to_string()
 }
 
 /// One order-book row, oriented for the taker: `receive` is the maker's
@@ -79,6 +103,12 @@ pub struct MarketLegDto {
     pub precision: u8,
     pub amount_sats: u64,
     pub display_amount: String,
+    /// Who named the asset (see [`SwapLegDto::metadata_source`]); a Liquid
+    /// leg the wallet or the registry knows is shown their way, never the
+    /// feed's.
+    pub metadata_source: String,
+    /// The order book's own provenance of a `book` name; null otherwise.
+    pub book_source: Option<String>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -224,7 +254,7 @@ pub fn list_swaps(state: &AppState, include_unavailable: bool) -> Result<Vec<Swa
         state.liquid_network.name(),
     ))
     .map_err(|e| e.to_string())?;
-    Ok(rows_from_entries(&entries, &state.liquid_network))
+    Ok(rows_from_entries(state, &entries))
 }
 
 /// Unified local market: real LiquiDEX and HTLC-v1 rows, plus optional legacy
@@ -242,7 +272,7 @@ pub fn list_markets(
     .map_err(|e| e.to_string())?;
     Ok(entries
         .iter()
-        .map(|entry| market_row(entry, &state.liquid_network))
+        .map(|entry| market_row(state, entry))
         .collect())
 }
 
@@ -260,7 +290,7 @@ pub fn verify(
         verify_proposal_on(&proposal, false, &state.liquid_network)
     }
     .map_err(|e| e.to_string())?;
-    Ok(analysis_dto(&state.asset_registry, &result))
+    Ok(analysis_dto(state, &result))
 }
 
 /// Deep-verifies and builds the real taker transaction (unsigned broadcast-
@@ -275,7 +305,7 @@ pub fn take_preview(
     let frozen = state.frozen_on(CoinChain::Liquid);
     let preview =
         take_preview_excluding(liq, &proposal, fee_rate, &frozen).map_err(|e| e.to_string())?;
-    Ok(preview_dto(&state.asset_registry, &preview))
+    Ok(preview_dto(state, &preview))
 }
 
 /// Takes a proposal: the engine deep-verifies internally and refuses
@@ -326,12 +356,12 @@ pub fn make(
     let offers = proposal
         .inputs
         .first()
-        .map(|l| liquidex_leg_dto(&state.asset_registry, l))
+        .map(|l| liquidex_leg_dto(state, l))
         .ok_or("Built proposal has no input leg")?;
     let wants = proposal
         .outputs
         .first()
-        .map(|l| liquidex_leg_dto(&state.asset_registry, l))
+        .map(|l| liquidex_leg_dto(state, l))
         .ok_or("Built proposal has no output leg")?;
 
     let mut store = load_store(&state.data_dir)?;
@@ -484,11 +514,18 @@ pub fn list_my_offers(state: &AppState, wallet_id: &str) -> Result<Vec<MyOfferDt
     if changed {
         save_store(&state.data_dir, &store)?;
     }
+    // Each leg is named now, not as it was when the offer was stored: the
+    // wallet's own asset store first, then the order book's registry.
     let mut out: Vec<MyOfferDto> = store
         .offers
         .into_iter()
         .filter(|o| o.wallet_id == wallet_id && o.is_on(network))
-        .map(|o| o.offer)
+        .map(|o| {
+            let mut offer = o.offer;
+            offer.offers = leg_dto(state, &offer.offers.asset_id, offer.offers.amount_sats);
+            offer.wants = leg_dto(state, &offer.wants.asset_id, offer.wants.amount_sats);
+            offer
+        })
         .collect();
     out.sort_by_key(|o| std::cmp::Reverse(o.created_at));
     Ok(out)
@@ -535,7 +572,8 @@ fn feed_url(base: &str, include_unavailable: bool, network: &str) -> String {
     url
 }
 
-fn market_row(entry: &MarketBookEntry, local: &templar_core::LiquidNetwork) -> MarketRowDto {
+fn market_row(state: &AppState, entry: &MarketBookEntry) -> MarketRowDto {
+    let local = &state.liquid_network;
     let (verified, takeable, block_reason) = if entry.settlement == "htlc-v1" {
         let network_ok = local.name() == "liquid-testnet"
             && entry.maker_gives.network.contains("testnet")
@@ -583,8 +621,8 @@ fn market_row(entry: &MarketBookEntry, local: &templar_core::LiquidNetwork) -> M
         settlement: entry.settlement.clone(),
         demo: entry.demo,
         available: entry.available,
-        maker_gives: market_leg(&entry.maker_gives),
-        maker_wants: market_leg(&entry.maker_wants),
+        maker_gives: market_leg(state, &entry.maker_gives),
+        maker_wants: market_leg(state, &entry.maker_wants),
         price_display: entry.price_display.clone(),
         note: entry.note.clone(),
         created_at: entry.created_at,
@@ -595,36 +633,58 @@ fn market_row(entry: &MarketBookEntry, local: &templar_core::LiquidNetwork) -> M
     }
 }
 
-fn market_leg(leg: &MarketBookLeg) -> MarketLegDto {
-    MarketLegDto {
-        chain: leg.chain.clone(),
-        network: leg.network.clone(),
-        asset_id: leg.asset_id.clone(),
-        ticker: leg.ticker.clone(),
-        name: leg.name.clone(),
-        precision: leg.precision,
-        amount_sats: leg.amount_sats,
-        display_amount: leg.display_amount.clone(),
+/// A markets-feed leg. A Liquid asset the wallet or the order book's
+/// registry knows is named and scaled their way (the policy asset always
+/// the wallet's); otherwise the feed's own display data is kept, printable
+/// and bounded.
+fn market_leg(state: &AppState, leg: &MarketBookLeg) -> MarketLegDto {
+    let shown_as = (leg.chain == "liquid")
+        .then(|| asset_names::display(state, &leg.asset_id))
+        .filter(|d| d.source != FROM_NONE);
+    match shown_as {
+        Some(d) => MarketLegDto {
+            chain: leg.chain.clone(),
+            network: leg.network.clone(),
+            asset_id: leg.asset_id.clone(),
+            display_amount: d.format(leg.amount_sats),
+            ticker: d.ticker,
+            name: d.name,
+            precision: d.precision,
+            amount_sats: leg.amount_sats,
+            metadata_source: d.source.to_string(),
+            book_source: d.book_source,
+        },
+        None => MarketLegDto {
+            chain: leg.chain.clone(),
+            network: leg.network.clone(),
+            asset_id: leg.asset_id.clone(),
+            ticker: printable(&leg.ticker, 24),
+            name: printable(&leg.name, 255),
+            precision: leg.precision.min(8),
+            amount_sats: leg.amount_sats,
+            display_amount: printable(&leg.display_amount, 64),
+            metadata_source: FROM_FEED.to_string(),
+            book_source: None,
+        },
     }
+}
+
+fn printable(s: &str, max: usize) -> String {
+    templar_core::http::printable(s, max)
 }
 
 /// Pure mapping + ordering (available first, then id descending) — the
 /// network fetch stays out so this is unit-testable.
-fn rows_from_entries(
-    entries: &[BookEntry],
-    network: &templar_core::LiquidNetwork,
-) -> Vec<SwapRowDto> {
-    let mut rows: Vec<SwapRowDto> = entries
-        .iter()
-        .map(|entry| book_row(entry, network))
-        .collect();
+fn rows_from_entries(state: &AppState, entries: &[BookEntry]) -> Vec<SwapRowDto> {
+    let mut rows: Vec<SwapRowDto> = entries.iter().map(|entry| book_row(state, entry)).collect();
     rows.sort_by(|a, b| b.available.cmp(&a.available).then(b.id.cmp(&a.id)));
     rows
 }
 
-fn book_row(entry: &BookEntry, local: &templar_core::LiquidNetwork) -> SwapRowDto {
-    let receive = book_leg_dto(entry.inputs.first());
-    let pay = book_leg_dto(entry.outputs.first());
+fn book_row(state: &AppState, entry: &BookEntry) -> SwapRowDto {
+    let local = &state.liquid_network;
+    let receive = book_leg_dto(state, entry.inputs.first());
+    let pay = book_leg_dto(state, entry.outputs.first());
     // Ratio is the book's own input/output price; the display convention is
     // "<price> PAY/RECEIVE" (how much of the paid asset per received unit).
     let price_display = format!("{:.8} {}/{}", entry.ratio, pay.ticker, receive.ticker);
@@ -679,72 +739,92 @@ fn first_failure_note(res: &VerifyResult) -> Option<String> {
     })
 }
 
-/// Book rows carry their own display data (mainnet assets are not in the
-/// testnet `AssetRegistry`): ticker from the book's display name, amount as
-/// published.
-fn book_leg_dto(leg: Option<&BookLeg>) -> SwapLegDto {
-    match leg {
-        Some(l) => SwapLegDto {
-            asset_id: l.asset.clone(),
-            ticker: l.ticker(),
-            amount_sats: l.sats,
-            display_amount: l.amount.clone(),
-        },
-        None => SwapLegDto {
+/// A legacy book row's leg. An asset the wallet or the order book's
+/// registry knows is shown their way; otherwise the row's own display data
+/// (ticker from the book's display name, amount as published).
+fn book_leg_dto(state: &AppState, leg: Option<&BookLeg>) -> SwapLegDto {
+    let Some(l) = leg else {
+        return SwapLegDto {
             asset_id: String::new(),
             ticker: String::new(),
             amount_sats: 0,
             display_amount: String::new(),
-        },
+            name: String::new(),
+            precision: 8,
+            metadata_source: FROM_NONE.to_string(),
+            book_source: None,
+        };
+    };
+    let known = asset_names::display(state, &l.asset);
+    if known.source != FROM_NONE {
+        return leg_dto(state, &l.asset, l.sats);
     }
-}
-
-/// Enriches an engine leg through the asset registry (testnet assets resolve
-/// to real tickers/precision; unknown assets fall back to the registry's
-/// asset-id-prefix ticker and 8-decimal formatting).
-fn registry_leg(registry: &AssetRegistry, leg: &SwapLeg) -> SwapLegDto {
+    // The published amount's decimals are the book's precision.
+    let precision = l
+        .amount
+        .split_once('.')
+        .map_or(0, |(_, frac)| frac.len().min(8) as u8);
     SwapLegDto {
-        asset_id: leg.asset_id.clone(),
-        ticker: registry.ticker(&leg.asset_id).to_string(),
-        amount_sats: leg.amount_sats,
-        display_amount: registry.format_amount_with_fallback(&leg.asset_id, leg.amount_sats),
+        asset_id: l.asset.clone(),
+        ticker: printable(&l.ticker(), 24),
+        amount_sats: l.sats,
+        display_amount: printable(&l.amount, 64),
+        name: printable(&l.name, 255),
+        precision,
+        metadata_source: FROM_FEED.to_string(),
+        book_source: None,
     }
 }
 
-fn liquidex_leg_dto(registry: &AssetRegistry, leg: &LiquidexLeg) -> SwapLegDto {
-    registry_leg(
-        registry,
-        &SwapLeg {
-            asset_id: leg.asset.clone(),
-            amount_sats: leg.amount,
-        },
-    )
+/// `amount_sats` of `asset_id`, named the wallet's way first, then the
+/// active order book's registry ([`asset_names::display`]); a short
+/// asset-id prefix with 8 decimals for an asset nobody named.
+fn leg_dto(state: &AppState, asset_id: &str, amount_sats: u64) -> SwapLegDto {
+    let shown_as = asset_names::display(state, asset_id);
+    SwapLegDto {
+        asset_id: asset_id.to_string(),
+        display_amount: shown_as.format(amount_sats),
+        ticker: shown_as.ticker,
+        amount_sats,
+        name: shown_as.name,
+        precision: shown_as.precision,
+        metadata_source: shown_as.source.to_string(),
+        book_source: shown_as.book_source,
+    }
 }
 
-fn analysis_dto(registry: &AssetRegistry, res: &VerifyResult) -> SwapAnalysisDto {
+fn registry_leg(state: &AppState, leg: &SwapLeg) -> SwapLegDto {
+    leg_dto(state, &leg.asset_id, leg.amount_sats)
+}
+
+fn liquidex_leg_dto(state: &AppState, leg: &LiquidexLeg) -> SwapLegDto {
+    leg_dto(state, &leg.asset, leg.amount)
+}
+
+fn analysis_dto(state: &AppState, res: &VerifyResult) -> SwapAnalysisDto {
     SwapAnalysisDto {
         valid: res.valid,
         checks: res.checks.clone(),
-        maker_offers: registry_leg(registry, &res.maker_offers),
-        maker_wants: registry_leg(registry, &res.maker_wants),
+        maker_offers: registry_leg(state, &res.maker_offers),
+        maker_wants: registry_leg(state, &res.maker_wants),
         network: res.network.as_str().to_string(),
         takeable: res.takeable,
         take_block_reason: res.take_block_reason.clone(),
     }
 }
 
-fn preview_dto(registry: &AssetRegistry, preview: &TakePreview) -> TakePreviewDto {
+fn preview_dto(state: &AppState, preview: &TakePreview) -> TakePreviewDto {
     TakePreviewDto {
-        you_receive: registry_leg(registry, &preview.you_receive),
-        you_pay: registry_leg(registry, &preview.you_pay),
+        you_receive: registry_leg(state, &preview.you_receive),
+        you_pay: registry_leg(state, &preview.you_pay),
         fee_sats: preview.fee_sats,
         fee_display: format!("{} sats", preview.fee_sats),
         change: preview
             .change
             .iter()
-            .map(|l| registry_leg(registry, l))
+            .map(|l| registry_leg(state, l))
             .collect(),
-        analysis: analysis_dto(registry, &preview.analysis),
+        analysis: analysis_dto(state, &preview.analysis),
     }
 }
 
@@ -860,13 +940,13 @@ fn new_offer_id(store: &SwapOfferStore) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use templar_core::verify_proposal;
 
     /// Real proposal from the liquidex.it book (offer id 9, mainnet): DBEER
     /// offered for LBTC. Offline checks pass against this genuine data.
-    const PROPOSAL_ID_9: &str = r#"{"version":0,"tx":"02000000010162457676604122dc2c3ab6b9ac5a787411cc90f07edd8651c656fd5ed5dfd45c000000001716001461362b692acf41e26c88c58abcd633cbbe06f420feffffff010b90f4a0ea769100ad4200aabb115f6ead24ba5180eea84f231f3c51c047f02f57092c307774be067befd563d6eb23ca185f963e22f9e96b3f224e94d28ed3cd2fd2020ea96dbab999be940e62be9ff1d8525f354730a3546d71a70696e1f40082996c17a914ea94f77a850e4b018d67c8c4ba087977ec63e1db8700000000000002473044022053a7107a113adffe78e556aa5fa0391b3a2301277630d77febd5398f7a834d520220484feb14c5b0b313759b79501a36d471985b5fe33a346cbcd3d059a0d32214a283210247fa74dbe2fe4f4d0d8e5cc16573f097cb9909670eedd733b50f37e343c9b08a000000","inputs":[{"asset":"002452cb8f56a0a5628240edfb3d1e966c9b1959adcfb95b5726e5e9688611bf","asset_blinder":"10abf182945667b6aae98a79535b91f2343eb6a920d8d99d3de06fa024e38c77","amount_blinder":"6cce12bfa4cd11818de662104e61f6be53275e21c343e984bb06c6749669ad2f","amount":1000}],"outputs":[{"asset":"6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d","asset_blinder":"e8bfdc63d9750f16a2934b42466c1bfd171e5f3bcd8eafcd9e3ef954cf8a6d58","amount_blinder":"8e2d5cb748d14d5edb06643da6b05208671fbca875682a67690e3436d3ceb22a","amount":1000}]}"#;
+    pub(crate) const PROPOSAL_ID_9: &str = r#"{"version":0,"tx":"02000000010162457676604122dc2c3ab6b9ac5a787411cc90f07edd8651c656fd5ed5dfd45c000000001716001461362b692acf41e26c88c58abcd633cbbe06f420feffffff010b90f4a0ea769100ad4200aabb115f6ead24ba5180eea84f231f3c51c047f02f57092c307774be067befd563d6eb23ca185f963e22f9e96b3f224e94d28ed3cd2fd2020ea96dbab999be940e62be9ff1d8525f354730a3546d71a70696e1f40082996c17a914ea94f77a850e4b018d67c8c4ba087977ec63e1db8700000000000002473044022053a7107a113adffe78e556aa5fa0391b3a2301277630d77febd5398f7a834d520220484feb14c5b0b313759b79501a36d471985b5fe33a346cbcd3d059a0d32214a283210247fa74dbe2fe4f4d0d8e5cc16573f097cb9909670eedd733b50f37e343c9b08a000000","inputs":[{"asset":"002452cb8f56a0a5628240edfb3d1e966c9b1959adcfb95b5726e5e9688611bf","asset_blinder":"10abf182945667b6aae98a79535b91f2343eb6a920d8d99d3de06fa024e38c77","amount_blinder":"6cce12bfa4cd11818de662104e61f6be53275e21c343e984bb06c6749669ad2f","amount":1000}],"outputs":[{"asset":"6f0279e9ed041c3d710a9f57d0c02928416460c4b722ae3457a11eec381c526d","asset_blinder":"e8bfdc63d9750f16a2934b42466c1bfd171e5f3bcd8eafcd9e3ef954cf8a6d58","amount_blinder":"8e2d5cb748d14d5edb06643da6b05208671fbca875682a67690e3436d3ceb22a","amount":1000}]}"#;
 
     fn fixture_entry_9() -> BookEntry {
         BookEntry {
@@ -941,6 +1021,14 @@ mod tests {
         }
     }
 
+    /// An engine on Liquid testnet with nothing open, on its own directory.
+    fn test_state() -> AppState {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let dir = test_dir(&format!("state_{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        AppState::new_for_test(dir)
+    }
+
     fn test_dir(tag: &str) -> std::path::PathBuf {
         let dir =
             std::env::temp_dir().join(format!("templar_swaps_{}_{}", tag, std::process::id()));
@@ -960,12 +1048,20 @@ mod tests {
                 ticker: "AAAAAAAA".to_string(),
                 amount_sats: 1000,
                 display_amount: "0.00001000".to_string(),
+                name: String::new(),
+                precision: 8,
+                metadata_source: FROM_NONE.to_string(),
+                book_source: None,
             },
             wants: SwapLegDto {
                 asset_id: templar_core::LBTC_TESTNET_ASSET_ID.to_string(),
                 ticker: "LBTC".to_string(),
                 amount_sats: 500,
                 display_amount: "0.00000500".to_string(),
+                name: "Liquid Bitcoin".to_string(),
+                precision: 8,
+                metadata_source: "wallet".to_string(),
+                book_source: None,
             },
             proposal_json: PROPOSAL_ID_9.to_string(),
             utxo: format!("{}:0", "cc".repeat(32)),
@@ -974,7 +1070,7 @@ mod tests {
 
     #[test]
     fn book_row_maps_real_entry() {
-        let row = book_row(&fixture_entry_9(), &templar_core::LiquidNetwork::testnet());
+        let row = book_row(&test_state(), &fixture_entry_9());
         assert_eq!(row.id, 9);
         assert!(row.available);
         // Taker orientation: receive = maker input, pay = maker output.
@@ -998,10 +1094,7 @@ mod tests {
 
     #[test]
     fn unparseable_proposal_is_listed_but_unverified() {
-        let row = book_row(
-            &broken_entry(3, true),
-            &templar_core::LiquidNetwork::testnet(),
-        );
+        let row = book_row(&test_state(), &broken_entry(3, true));
         assert!(!row.verified);
         assert!(!row.takeable);
         assert!(row.verify_note.is_some());
@@ -1021,21 +1114,16 @@ mod tests {
             fixture_entry_9(), // id 9, available
             broken_entry(11, false),
         ];
-        let ids: Vec<(u64, bool)> =
-            rows_from_entries(&entries, &templar_core::LiquidNetwork::testnet())
-                .iter()
-                .map(|r| (r.id, r.available))
-                .collect();
+        let ids: Vec<(u64, bool)> = rows_from_entries(&test_state(), &entries)
+            .iter()
+            .map(|r| (r.id, r.available))
+            .collect();
         assert_eq!(ids, vec![(9, true), (2, true), (11, false), (7, false)]);
     }
 
     #[test]
     fn swap_row_wire_shape_matches_contract_keys() {
-        let v = serde_json::to_value(book_row(
-            &fixture_entry_9(),
-            &templar_core::LiquidNetwork::testnet(),
-        ))
-        .unwrap();
+        let v = serde_json::to_value(book_row(&test_state(), &fixture_entry_9())).unwrap();
         for key in [
             "id",
             "available",
@@ -1062,10 +1150,7 @@ mod tests {
 
     #[test]
     fn cross_chain_market_demo_is_visible_but_never_takeable() {
-        let row = market_row(
-            &demo_market_entry(),
-            &templar_core::LiquidNetwork::testnet(),
-        );
+        let row = market_row(&test_state(), &demo_market_entry());
         assert!(row.demo);
         assert!(!row.verified);
         assert!(!row.takeable);
@@ -1076,11 +1161,7 @@ mod tests {
 
     #[test]
     fn market_row_wire_shape_is_stable() {
-        let value = serde_json::to_value(market_row(
-            &demo_market_entry(),
-            &templar_core::LiquidNetwork::testnet(),
-        ))
-        .unwrap();
+        let value = serde_json::to_value(market_row(&test_state(), &demo_market_entry())).unwrap();
         for key in [
             "id",
             "source_id",
@@ -1104,10 +1185,10 @@ mod tests {
 
     #[test]
     fn analysis_enriches_legs_via_registry() {
-        let registry = AssetRegistry::with_defaults();
+        let state = test_state();
         let proposal = LiquidexProposal::from_json(PROPOSAL_ID_9).unwrap();
         let result = verify_proposal(&proposal, false).unwrap();
-        let dto = analysis_dto(&registry, &result);
+        let dto = analysis_dto(&state, &result);
         assert!(dto.valid);
         assert_eq!(dto.network, "mainnet");
         assert!(!dto.takeable);
@@ -1119,7 +1200,7 @@ mod tests {
         assert_eq!(dto.maker_offers.amount_sats, 1000);
         // A testnet LBTC leg resolves through the registry defaults.
         let lbtc = registry_leg(
-            &registry,
+            &state,
             &SwapLeg {
                 asset_id: templar_core::LBTC_TESTNET_ASSET_ID.to_string(),
                 amount_sats: 12_345,

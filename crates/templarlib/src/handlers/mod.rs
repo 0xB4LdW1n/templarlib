@@ -1,3 +1,4 @@
+pub mod asset_names;
 pub mod backup;
 pub mod bitcoin;
 pub mod cross_swaps;

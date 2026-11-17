@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 
+use crate::handlers::asset_names;
 use crate::handlers::backup;
 use crate::handlers::bitcoin;
 use crate::handlers::cross_swaps;
@@ -288,6 +289,11 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
             // the call itself only fails when the wallet could not be opened.
             let btc = wallet_ops::sync_bitcoin(state);
             let liquid = wallet_ops::sync_liquid(state);
+            // The active order book's asset names, best-effort: a book
+            // without a registry, or out of reach, never fails the sync.
+            if state.liquid.is_some() {
+                asset_names::refresh(state);
+            }
             state.last_sync_btc = Some(btc.clone());
             state.last_sync_liquid = Some(liquid.clone());
             state.last_sync_at = std::time::SystemTime::now()
@@ -653,20 +659,20 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
             .map(|v| serde_json::to_value(v).unwrap())
         }
 
+        // Liquid testnet's public registry (testnet only, as before) and,
+        // on any network, the active order book's registry.
         "reregister_asset" => {
-            state.require_liquid_testnet("The Liquid asset registry")?;
             let p: ReregisterAssetParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
             ensure_wallet_open(state, &p.wallet_id)?;
-            let ok = liquid::reregister_asset(
+            Ok(liquid::reregister_asset(
                 state,
                 &p.asset_id,
                 &p.name,
                 &p.ticker,
                 p.precision,
                 &p.domain,
-            );
-            Ok(serde_json::json!({ "registered": ok }))
+            ))
         }
 
         // ── Hardware wallet ───────────────────────────────────────────────────
@@ -856,6 +862,8 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         "list_markets" => {
             let p: swaps::ListMarketsParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            // Names of the listed assets, best-effort (never fails the list).
+            asset_names::refresh(state);
             swaps::list_markets(state, p.include_unavailable)
                 .map(|v| serde_json::to_value(v).unwrap())
         }

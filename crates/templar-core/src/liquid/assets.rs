@@ -17,6 +17,21 @@ pub struct IssuanceResult {
     pub txid: String,
     /// Whether the asset contract was successfully submitted to the Liquid registry.
     pub registry_registered: bool,
+    /// The issuance contract exactly as LWK serialised it (the object the
+    /// asset id commits to); `None` for a reissuance.
+    pub contract: Option<serde_json::Value>,
+    /// The input of `txid` that carries the issuance (LWK issues on 0).
+    pub issuance_vin: u32,
+}
+
+/// Where an asset this wallet issued was issued, and the contract it
+/// committed to: what an order book's registry needs to name it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IssuanceRecord {
+    /// The contract exactly as LWK serialises it.
+    pub contract: serde_json::Value,
+    pub txid: String,
+    pub vin: u32,
 }
 
 /// Local metadata for an asset issued or tracked by this wallet.

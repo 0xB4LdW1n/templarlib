@@ -420,6 +420,15 @@ fn get_wallet_summary_matches_dart_decode_shape() {
     );
     assert_eq!(assets[0]["ticker"], json!("BTC"));
     assert_eq!(assets[0]["amount"], json!(0), "fresh wallet holds nothing");
+    // Additive: how the amount is scaled and who named the asset.
+    for a in assets {
+        assert_keys(
+            "assets[]",
+            a,
+            &["precision", "metadata_source", "book_source"],
+        );
+        assert_eq!(a["metadata_source"], json!("wallet"));
+    }
 }
 
 // ── Version handshake ────────────────────────────────────────────────────────
@@ -1989,14 +1998,30 @@ fn regtest_refuses_public_services_but_keeps_local_swaps_available() {
     );
     let listed = env.ok("peg_list", json!({ "wallet_id": id }));
     assert_eq!(listed, json!([]));
-    let err = env.err(
+    // The public registry is never asked on regtest; the order book's
+    // registry needs the issuance in this wallet's history (offline check
+    // first: nothing is sent for an asset this wallet did not issue).
+    let v = env.ok(
         "reregister_asset",
         json!({
-            "wallet_id": id, "asset_id": "aa".repeat(32), "name": "X",
-            "ticker": "X", "precision": 8, "domain": "example.com"
+            "wallet_id": id, "asset_id": "aa".repeat(32), "name": "Xyz",
+            "ticker": "XYZ", "precision": 8
         }),
     );
-    assert!(err.contains("not available on Liquid regtest"), "{err}");
+    assert_keys(
+        "reregister_asset",
+        &v,
+        &["registered", "book_registered", "book_error"],
+    );
+    assert_eq!(v["registered"], json!(false));
+    assert_eq!(v["book_registered"], json!(false));
+    assert!(
+        v["book_error"]
+            .as_str()
+            .unwrap()
+            .contains("not in this wallet's history"),
+        "{v}"
+    );
 }
 
 /// The whole regtest path the app takes, against the Templar Protocol's local node:
@@ -2109,6 +2134,11 @@ fn regtest_node_sync_and_send_end_to_end() {
 
 const LAB_POLICY: &str = "b0b2bef620ac742b2399a0085bc84e4860ae2c65b5375e3b94399debec69aa6b";
 const LAB_GENESIS: &str = "d51392db10c135e2e5f7bcfeab36e859ca4e69d6f76439ec0ebcb0a8da7be248";
+
+/// [`lab_config`] as text, for other modules' tests.
+pub(crate) fn lab_config_text(instance: &str) -> String {
+    lab_config(instance).to_string()
+}
 
 /// A version-1 `/api/config` like a local testlab's.
 fn lab_config(instance: &str) -> Value {
@@ -2537,6 +2567,177 @@ const PEG_QUOTE_KEYS: &[&str] = &[
     "confirmations_required",
     "network_fee_included",
 ];
+
+// ── Asset names from the order book's registry ──────────────────────
+
+/// An order book stub on Liquid testnet: an empty book, one market row of
+/// an unregistered token wanting the policy asset (both mis-named by the
+/// feed), and a registry naming the token (and trying to rename LBTC).
+fn registry_book(
+    registry: std::sync::Arc<std::sync::Mutex<(u16, String)>>,
+) -> crate::test_http::MockHttp {
+    use crate::test_http::{MockHttp, Reply};
+    let lbtc = templar_core::TESTNET_POLICY_ASSET;
+    let market = json!([{
+        "id": "liquidex:1", "source_id": 1, "status": "open", "settlement": "liquidex",
+        "demo": false, "available": true,
+        "maker_gives": {"chain": "liquid", "network": "liquid-testnet",
+            "asset_id": "80d249a8".repeat(8), "ticker": "80D249A8",
+            "name": "80D249A8 \u{1b}[2J Unregistered asset", "precision": 8,
+            "amount_sats": 10_000, "display_amount": "0.00010000"},
+        "maker_wants": {"chain": "liquid", "network": "liquid-testnet", "asset_id": lbtc,
+            "ticker": "FAKE", "name": "Not LBTC", "precision": 2,
+            "amount_sats": 50_000, "display_amount": "500.00"},
+        "price_display": "", "note": "", "created_at": 1, "proposal_json": "{}"
+    }])
+    .to_string();
+    MockHttp::start(move |r| {
+        if r.target.starts_with("/api/markets") {
+            Reply::json(200, market.clone())
+        } else if r.target.starts_with("/api/assets") {
+            let (status, body) = registry.lock().unwrap().clone();
+            Reply::json(status, body)
+        } else {
+            Reply::json(404, "{}")
+        }
+    })
+}
+
+fn registry_answer() -> String {
+    json!({"network": "liquid-testnet", "assets": [
+        {"asset_id": templar_core::TESTNET_POLICY_ASSET, "ticker": "LBTC",
+         "name": "Liquid Bitcoin", "precision": 8, "source": "policy"},
+        {"asset_id": "80d249a8".repeat(8), "ticker": "TMPL", "name": "Templar Token",
+         "precision": 2, "source": "contract"},
+        {"asset_id": "002452cb8f56a0a5628240edfb3d1e966c9b1959adcfb95b5726e5e9688611bf",
+         "ticker": "DBEER", "name": "Dex Beer", "precision": 2, "source": "admin"},
+        {"asset_id": "aa".repeat(32), "ticker": "L-BTC", "name": "Impostor",
+         "precision": 8, "source": "admin"}
+    ]})
+    .to_string()
+}
+
+#[test]
+fn the_order_books_registry_names_what_the_wallet_does_not_know() {
+    let registry = std::sync::Arc::new(std::sync::Mutex::new((200u16, registry_answer())));
+    let book = registry_book(registry.clone());
+    let (mut env, id) = swap_env(&book.url, MNEMONIC);
+
+    // list_markets reads the registry first (best-effort) and names the
+    // token from it; the policy asset stays the wallet's own.
+    let rows = env.ok("list_markets", json!({}));
+    let gives = &rows[0]["maker_gives"];
+    assert_keys(
+        "maker_gives",
+        gives,
+        &[
+            "ticker",
+            "name",
+            "precision",
+            "display_amount",
+            "metadata_source",
+            "book_source",
+        ],
+    );
+    assert_eq!(gives["ticker"], json!("TMPL"));
+    assert_eq!(gives["precision"], json!(2));
+    assert_eq!(gives["display_amount"], json!("100.00"));
+    assert_eq!(gives["amount_sats"], json!(10_000), "base units unchanged");
+    assert_eq!(gives["metadata_source"], json!("book"));
+    assert_eq!(gives["book_source"], json!("contract"));
+    let wants = &rows[0]["maker_wants"];
+    assert_eq!(wants["ticker"], json!("LBTC"));
+    assert_eq!(wants["precision"], json!(8));
+    assert_eq!(wants["display_amount"], json!("0.00050000"));
+    assert_eq!(wants["metadata_source"], json!("wallet"));
+    assert!(book
+        .requests()
+        .iter()
+        .any(|r| r.target == "/api/assets?network=liquid-testnet"));
+    assert!(env.dir.join("book_assets.json").is_file());
+
+    // swap_verify (offline) names a registered asset the same way.
+    let v = env.ok(
+        "swap_verify",
+        json!({ "proposal_json": crate::handlers::swaps::tests::PROPOSAL_ID_9 }),
+    );
+    let offers = &v["maker_offers"];
+    assert_keys(
+        "maker_offers",
+        offers,
+        &[
+            "asset_id",
+            "ticker",
+            "amount_sats",
+            "display_amount",
+            "name",
+            "precision",
+            "metadata_source",
+            "book_source",
+        ],
+    );
+    assert_eq!(offers["ticker"], json!("DBEER"));
+    assert_eq!(offers["display_amount"], json!("10.00"));
+    assert_eq!(offers["metadata_source"], json!("book"));
+    assert_eq!(offers["book_source"], json!("admin"));
+
+    // list_my_offers names its legs now, from the registry when the wallet
+    // does not know the asset (a closed offer: no chain is asked).
+    let stored = json!({"offers": [{
+        "wallet_id": id, "network": "liquid-testnet", "offer_id": "of_00000001",
+        "kind": "swap", "status": "closed", "created_at": 1,
+        "offers": {"asset_id": "80d249a8".repeat(8), "ticker": "80d249a8",
+                   "amount_sats": 10_000, "display_amount": "0.00010000"},
+        "wants": {"asset_id": templar_core::TESTNET_POLICY_ASSET, "ticker": "LBTC",
+                  "amount_sats": 500, "display_amount": "0.00000500"},
+        "proposal_json": "{}", "utxo": format!("{}:0", "cc".repeat(32))
+    }]});
+    std::fs::write(env.dir.join("swap_offers.json"), stored.to_string()).unwrap();
+    let mine = env.ok("list_my_offers", json!({ "wallet_id": id }));
+    assert_eq!(mine[0]["offers"]["ticker"], json!("TMPL"));
+    assert_eq!(mine[0]["offers"]["precision"], json!(2));
+    assert_eq!(mine[0]["offers"]["display_amount"], json!("100.00"));
+    assert_eq!(mine[0]["wants"]["metadata_source"], json!("wallet"));
+
+    // The book loses its registry: the list still works and keeps the names
+    // cached (and within the refresh interval nothing is asked again).
+    *registry.lock().unwrap() = (404, "not found".into());
+    let asked = book.requests().len();
+    let rows = env.ok("list_markets", json!({}));
+    assert_eq!(book.requests().len(), asked + 1, "only the markets feed");
+    assert_eq!(rows[0]["maker_gives"]["ticker"], json!("TMPL"));
+}
+
+#[test]
+fn without_a_registry_the_feed_names_stay_sanitised_and_marked() {
+    let registry = std::sync::Arc::new(std::sync::Mutex::new((
+        200u16,
+        "{\"network\": \"liquid-testnet\", \"assets\": \"garbage\"}".to_string(),
+    )));
+    let book = registry_book(registry);
+    let (mut env, _) = swap_env(&book.url, MNEMONIC);
+    let rows = env.ok("list_markets", json!({}));
+    let gives = &rows[0]["maker_gives"];
+    assert_eq!(gives["ticker"], json!("80D249A8"));
+    assert_eq!(gives["metadata_source"], json!("feed"));
+    assert!(!gives["name"].as_str().unwrap().contains('\u{1b}'));
+    assert!(gives["book_source"].is_null());
+    // The policy asset is never the feed's.
+    assert_eq!(rows[0]["maker_wants"]["ticker"], json!("LBTC"));
+}
+
+#[test]
+fn issue_asset_needs_a_domain_on_testnet_only() {
+    let mut env = TestEnv::new();
+    let id = env.create_test_wallet();
+    // No `domain` at all: refused on testnet before anything is built.
+    let err = env.err(
+        "issue_asset",
+        json!({ "wallet_id": id, "name": "Templar Token", "ticker": "TMPL",
+                "precision": 2, "amount_sats": 10_000, "reissuance_tokens": 0 }),
+    );
+    assert!(err.contains("domain is required"), "{err}");
+}
 
 // ── Test coins from a lab's faucet ──────────────────────────────────
 

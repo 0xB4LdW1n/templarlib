@@ -35,7 +35,7 @@ use crate::liquid::pset::{refuse_unsafe_signing, PsetInputInfo, PsetOutputInfo};
 /// Aliased here so callers can name one without taking a direct dependency on
 /// LWK's module layout.
 pub type Pset = lwk_wollet::elements::pset::PartiallySignedTransaction;
-use crate::liquid::assets::IssuanceResult;
+use crate::liquid::assets::{IssuanceRecord, IssuanceResult};
 use crate::liquid::pset::PsetDetails;
 
 /// Electrum server for Liquid testnet. Lives in `liquid::chain` now; kept
@@ -1524,6 +1524,10 @@ impl LiquidWalletManager {
             tx.txid()
         );
 
+        // What an order book's registry needs to name the asset: the
+        // contract as LWK serialised it when hashing it into the asset id.
+        let contract_json = serde_json::to_value(&contract).ok();
+
         // A local regtest has no public asset registry: the issuance is
         // complete as soon as it is on the node, and the metadata lives in
         // the wallet's own asset store instead.
@@ -1534,6 +1538,8 @@ impl LiquidWalletManager {
                 token_id: token_id_str,
                 txid: tx.txid().to_string(),
                 registry_registered: false,
+                contract: contract_json,
+                issuance_vin: 0,
             });
         }
 
@@ -1573,6 +1579,8 @@ impl LiquidWalletManager {
             token_id: token_id_str,
             txid: tx.txid().to_string(),
             registry_registered,
+            contract: contract_json,
+            issuance_vin: 0,
         })
     }
 
@@ -1641,6 +1649,8 @@ impl LiquidWalletManager {
             token_id: None,
             txid: tx.txid().to_string(),
             registry_registered: false,
+            contract: None,
+            issuance_vin: 0,
         })
     }
 
@@ -1708,6 +1718,72 @@ impl LiquidWalletManager {
         );
 
         Ok(tx.txid().to_string())
+    }
+
+    /// Finds where this wallet issued `asset_id`, offline, in its own
+    /// transaction history, and checks that the contract rebuilt from
+    /// `name`, `ticker`, `precision`, `domain` and the wallet's issuer key is
+    /// the one the asset id commits to. For re-announcing an issuance to an
+    /// order book's registry; nothing is signed.
+    pub fn issuance_record(
+        &self,
+        asset_id: &str,
+        name: &str,
+        ticker: &str,
+        precision: u8,
+        domain: &str,
+    ) -> Result<IssuanceRecord, TemplarError> {
+        let fail = |why: String| TemplarError::from(LiquidError::IssuanceFailed(why));
+        let signer = self
+            .signer
+            .as_ref()
+            .ok_or_else(|| fail("a watch-only wallet has no issuer key".into()))?;
+        let wanted: AssetId = asset_id
+            .parse()
+            .map_err(|e| fail(format!("Invalid asset_id: {e}")))?;
+        let contract = lwk_wollet::Contract::builder()
+            .entity(lwk_wollet::Entity::Domain(
+                domain.trim_end_matches('/').to_string(),
+            ))
+            .issuer_pubkey(issuer_pubkey_bytes(signer))
+            .name(name.to_string())
+            .precision(precision)
+            .ticker(ticker.to_string())
+            .version(0)
+            .build()
+            .map_err(|e| fail(format!("Invalid asset contract: {e}")))?;
+        contract
+            .validate()
+            .map_err(|e| fail(format!("Invalid asset contract: {e}")))?;
+        let txs = self
+            .wollet
+            .transactions()
+            .map_err(|e| fail(format!("Transactions: {e}")))?;
+        for wtx in txs {
+            for (vin, input) in wtx.tx.input.iter().enumerate() {
+                let new_issuance = input.has_issuance()
+                    && input.asset_issuance.asset_blinding_nonce
+                        == lwk_wollet::elements::AssetBlindingNonce::NEW_ISSUANCE;
+                if !new_issuance || input.issuance_ids().0 != wanted {
+                    continue;
+                }
+                lwk_wollet::asset_ids(input, &contract).map_err(|_| {
+                    fail(format!(
+                        "the name, ticker, precision or domain given are not the ones asset \
+                         {asset_id} was issued with"
+                    ))
+                })?;
+                return Ok(IssuanceRecord {
+                    contract: serde_json::to_value(&contract).map_err(|e| fail(e.to_string()))?,
+                    txid: wtx.txid.to_string(),
+                    vin: vin as u32,
+                });
+            }
+        }
+        Err(fail(format!(
+            "the issuance of asset {asset_id} is not in this wallet's history (sync the \
+             wallet, or it was issued by another wallet)"
+        )))
     }
 
     /// Re-submits the asset contract to the Liquid testnet registry.

@@ -808,7 +808,7 @@ fn leg_of(state: &AppState, chain: &str, asset_id: &str, amount: u64) -> Leg {
     if chain == "bitcoin" {
         return Leg::btc(amount);
     }
-    let info = state.asset_registry.resolve(asset_id);
+    let info = crate::handlers::asset_names::display(state, asset_id);
     Leg {
         chain: chain.to_string(),
         asset_id: asset_id.to_string(),

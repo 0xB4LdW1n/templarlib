@@ -267,7 +267,18 @@ fn resolve_liquid_outputs(
     })
 }
 
-/// Ticker and precision-aware display amount for one previewed output.
+/// Ticker and display amount for the wallet's own send preview: the
+/// wallet's name first, then the active order book's registry, as the
+/// dashboard shows the same asset ([`crate::handlers::asset_names`]).
+fn send_display(state: &AppState, asset_id: &str, amount: u64) -> (String, String, &'static str) {
+    let shown_as = crate::handlers::asset_names::display(state, asset_id);
+    let display = format!("{} {}", shown_as.format(amount), shown_as.ticker);
+    (shown_as.ticker, display, shown_as.source)
+}
+
+/// Ticker and precision-aware display amount from the wallet's own
+/// knowledge only, for reviewing a PSET built elsewhere before signing: a
+/// server's naming never reaches a signing review.
 fn asset_display(state: &AppState, asset_id: &str, amount: u64) -> (String, String) {
     if state.is_policy_asset(asset_id) {
         (
@@ -313,12 +324,12 @@ pub fn preview_send(
         .iter()
         .map(|r| {
             let amount = r.amount.unwrap_or(0);
-            let (ticker, display) = match r.asset.as_deref() {
+            let (ticker, display, source) = match r.asset.as_deref() {
                 Some(aid) => {
-                    let (t, d) = asset_display(state, aid, amount);
-                    (Some(t), Some(d))
+                    let (t, d, from) = send_display(state, aid, amount);
+                    (Some(t), Some(d), Some(from.to_string()))
                 }
-                None => (None, None),
+                None => (None, None, None),
             };
             TxIoDto {
                 outpoint: None,
@@ -328,6 +339,7 @@ pub fn preview_send(
                 asset_id: r.asset.clone(),
                 ticker,
                 amount_display: display,
+                metadata_source: source,
             }
         })
         .collect();
@@ -339,7 +351,7 @@ pub fn preview_send(
     let amount_display = if distinct_assets.len() == 1 {
         let aid = distinct_assets.iter().next().unwrap();
         let total: u64 = out_rows.iter().map(|o| o.amount_sats.max(0) as u64).sum();
-        asset_display(state, aid, total).1
+        send_display(state, aid, total).1
     } else {
         format!(
             "{} outputs · {} assets",
@@ -807,7 +819,66 @@ pub fn broadcast_pset(state: &AppState, pset_base64: &str) -> Result<String, Str
     liq.broadcast(&mut pset).map_err(|e| e.to_string())
 }
 
-/// Issue a new Liquid asset and register it with the testnet registry.
+/// The issuer domain written into an asset contract on a regtest when none
+/// is given: a domain proof means nothing on a private chain, and LWK's
+/// contract rules need a valid domain. Under `.test`, a TLD reserved for
+/// testing (RFC 2606), so it can never name a real issuer.
+pub const REGTEST_ISSUER_DOMAIN: &str = "regtest.templar.test";
+
+/// The domain of a contract on the active network: required on Liquid
+/// testnet, [`REGTEST_ISSUER_DOMAIN`] on a regtest when absent.
+fn issuer_domain(state: &AppState, given: &str) -> Result<String, String> {
+    let given = given.trim();
+    match (given.is_empty(), state.liquid_network.is_regtest()) {
+        (false, _) => Ok(given.to_string()),
+        (true, true) => Ok(REGTEST_ISSUER_DOMAIN.to_string()),
+        (true, false) => Err(
+            "A domain is required to issue an asset on Liquid testnet (its public asset \
+             registry checks a proof on it)."
+                .to_string(),
+        ),
+    }
+}
+
+/// Announces an issuance to the active order book's registry, best-effort:
+/// `(book_registered, book_error)`. A stored row is remembered at once, so
+/// this wallet shows it like any other book name.
+fn announce_to_book(
+    state: &mut AppState,
+    asset_id: &str,
+    contract: Option<&serde_json::Value>,
+    txid: &str,
+    vin: u32,
+) -> (bool, Option<String>) {
+    use templar_core::liquid::book_assets::{register_asset, BookAssetsError};
+    let Some(contract) = contract else {
+        return (
+            false,
+            Some("the issuance contract is not known".to_string()),
+        );
+    };
+    let url = state.endpoints().assets_url().value;
+    let network = state.liquid_network.name().to_string();
+    match register_asset(&url, &network, asset_id, contract, txid, vin) {
+        Ok(row) => {
+            eprintln!("[templarlib] asset {asset_id} registered with the order book");
+            crate::handlers::asset_names::remember(state, row);
+            (true, None)
+        }
+        Err(BookAssetsError::NotAvailable) => (
+            false,
+            Some("this order book has no asset registry".to_string()),
+        ),
+        Err(BookAssetsError::Failed(e)) => {
+            eprintln!("[templarlib] asset {asset_id} not registered with the order book: {e}");
+            (false, Some(e))
+        }
+    }
+}
+
+/// Issue a new Liquid asset; on Liquid testnet submit it to the public
+/// registry, and on any network announce it to the active order book's
+/// registry (best-effort, reported in `book_registered` / `book_error`).
 pub fn issue_asset(
     state: &mut AppState,
     name: &str,
@@ -821,6 +892,8 @@ pub fn issue_asset(
     if precision > 8 {
         return Err("Precision must be between 0 and 8".to_string());
     }
+    let domain = issuer_domain(state, domain)?;
+    let domain = domain.as_str();
     let frozen = state.frozen_on(CoinChain::Liquid);
     let liq = state.liquid.as_mut().ok_or("Liquid wallet not open")?;
     let result = liq
@@ -862,13 +935,27 @@ pub fn issue_asset(
     }
     persist_asset_metadata(state, &metas);
 
-    let proof_url = format!(
-        "https://{}/.well-known/liquid-asset-proof-{}",
-        domain, result.asset_id
-    );
-    let proof_content = format!(
-        "Authorize linking the domain name {} to the Liquid asset {}",
-        domain, result.asset_id
+    // A domain proof exists only for Liquid testnet's public registry.
+    let (proof_url, proof_content) = if state.liquid_network.is_regtest() {
+        (String::new(), String::new())
+    } else {
+        (
+            format!(
+                "https://{}/.well-known/liquid-asset-proof-{}",
+                domain, result.asset_id
+            ),
+            format!(
+                "Authorize linking the domain name {} to the Liquid asset {}",
+                domain, result.asset_id
+            ),
+        )
+    };
+    let (book_registered, book_error) = announce_to_book(
+        state,
+        &result.asset_id,
+        result.contract.as_ref(),
+        &result.txid,
+        result.issuance_vin,
     );
 
     Ok(IssueResultDto {
@@ -878,6 +965,9 @@ pub fn issue_asset(
         registry_registered: result.registry_registered,
         proof_url,
         proof_content,
+        book_registered,
+        book_error,
+        domain: domain.to_string(),
     })
 }
 
@@ -941,6 +1031,9 @@ pub fn reissue_asset(
         registry_registered: false,
         proof_url: String::new(),
         proof_content: String::new(),
+        book_registered: false,
+        book_error: None,
+        domain: String::new(),
     })
 }
 
@@ -956,17 +1049,196 @@ pub fn burn_asset(
         .map_err(|e| e.to_string())
 }
 
-/// Re-submit an asset contract to the Liquid registry (after domain proof is live).
+/// Re-submits an asset contract: to Liquid testnet's public registry
+/// (after the domain proof is live; unchanged, testnet only), and on any
+/// network to the active order book's registry, from the issuance found in
+/// this wallet's own history. Never fails: `{registered, book_registered,
+/// book_error}`. Nothing is signed.
 pub fn reregister_asset(
-    state: &AppState,
+    state: &mut AppState,
     asset_id: &str,
     name: &str,
     ticker: &str,
     precision: u8,
     domain: &str,
-) -> bool {
-    match state.liquid.as_ref() {
-        Some(liq) => liq.reregister_asset(asset_id, name, ticker, precision, domain),
-        None => false,
+) -> serde_json::Value {
+    let regtest = state.liquid_network.is_regtest();
+    let domain = if regtest {
+        issuer_domain(state, domain).unwrap_or_default()
+    } else {
+        domain.to_string()
+    };
+    let Some(liq) = state.liquid.as_ref() else {
+        return serde_json::json!({
+            "registered": false,
+            "book_registered": false,
+            "book_error": "Liquid wallet not open",
+        });
+    };
+    let registered = !regtest && liq.reregister_asset(asset_id, name, ticker, precision, &domain);
+    let record = liq.issuance_record(asset_id, name, ticker, precision, &domain);
+    let (book_registered, book_error) = match record {
+        Ok(r) => announce_to_book(state, asset_id, Some(&r.contract), &r.txid, r.vin),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    serde_json::json!({
+        "registered": registered,
+        "book_registered": book_registered,
+        "book_error": book_error,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_http::{MockHttp, Reply};
+
+    fn test_state(tag: &str) -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "templar_liquid_{}_{}_{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        AppState::new_for_test(dir)
+    }
+
+    /// An engine whose order book is `book` (as a joined lab would name it).
+    fn with_book(state: &mut AppState, book: &str) {
+        let mut profile = templar_core::test_server::parse_config(
+            "http://127.0.0.1:8096",
+            &crate::contract_tests::lab_config_text(&"79".repeat(32)),
+            0,
+        )
+        .unwrap();
+        profile.orderbook_url = book.to_string();
+        state.test_server = Some(profile);
+    }
+
+    #[test]
+    fn the_reserved_regtest_domain_passes_lwks_contract_rules() {
+        let contract = lwk_wollet::Contract::builder()
+            .entity(lwk_wollet::Entity::Domain(REGTEST_ISSUER_DOMAIN.into()))
+            .issuer_pubkey({
+                use bdk::bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+                let secret = SecretKey::from_slice(&[7; 32]).unwrap();
+                PublicKey::from_secret_key(&Secp256k1::new(), &secret)
+                    .serialize()
+                    .to_vec()
+            })
+            .name("Templar Token".into())
+            .precision(2)
+            .ticker("TMPL".into())
+            .version(0)
+            .build()
+            .unwrap();
+        contract.validate().unwrap();
+        // Required on testnet, defaulted on a regtest.
+        let mut state = test_state("domain");
+        assert!(issuer_domain(&state, " ").unwrap_err().contains("required"));
+        assert_eq!(issuer_domain(&state, "example.com").unwrap(), "example.com");
+        state.liquid_network = LiquidNetwork::regtest_default();
+        assert_eq!(issuer_domain(&state, "").unwrap(), REGTEST_ISSUER_DOMAIN);
+    }
+
+    #[test]
+    fn an_issuance_is_announced_to_the_books_registry_best_effort() {
+        let asset = "80d249a8".repeat(8);
+        let row = serde_json::json!({"asset_id": asset, "ticker": "TMPL",
+            "name": "Templar Token", "precision": 2, "source": "contract"});
+        let contract = serde_json::json!({"entity": {"domain": REGTEST_ISSUER_DOMAIN},
+            "issuer_pubkey": "02".to_string() + &"11".repeat(32), "name": "Templar Token",
+            "precision": 2, "ticker": "TMPL", "version": 0});
+        let answer = std::sync::Arc::new(std::sync::Mutex::new((
+            201u16,
+            None::<String>,
+            row.to_string(),
+        )));
+        let slot = answer.clone();
+        let book = MockHttp::start(move |_| {
+            let (status, retry, body) = slot.lock().unwrap().clone();
+            let reply = Reply::json(status, body);
+            match retry {
+                Some(r) => reply.with_header("Retry-After", &r),
+                None => reply,
+            }
+        });
+        let mut state = test_state("announce");
+        with_book(&mut state, &book.url);
+        state.liquid_network = state
+            .test_server
+            .as_ref()
+            .unwrap()
+            .regtest
+            .liquid_network()
+            .unwrap();
+        let txid = "cd".repeat(32);
+        assert_eq!(
+            announce_to_book(&mut state, &asset, Some(&contract), &txid, 0),
+            (true, None)
+        );
+        // Exactly the registry's request, contract as an object.
+        let sent: serde_json::Value = serde_json::from_str(&book.requests()[0].body).unwrap();
+        assert_eq!(book.requests()[0].target, "/api/assets");
+        assert_eq!(
+            sent,
+            serde_json::json!({"network": "liquid-regtest", "asset_id": asset,
+                "contract": contract, "issuance_txid": txid, "issuance_vin": 0})
+        );
+        // Remembered at once: this wallet names it like the book does.
+        let shown = crate::handlers::asset_names::display(&state, &asset);
+        assert_eq!((shown.ticker.as_str(), shown.precision), ("TMPL", 2));
+        // Already registered by the lab's admin with the same data: 200.
+        *answer.lock().unwrap() = (200, None, {
+            let mut r = row.clone();
+            r["source"] = "admin".into();
+            r.to_string()
+        });
+        assert_eq!(
+            announce_to_book(&mut state, &asset, Some(&contract), &txid, 0),
+            (true, None)
+        );
+        // Refusals are reported, never raised.
+        for (status, retry, body, want) in [
+            (
+                400,
+                None,
+                r#"{"error":"Invalid issuance contract: ticker too long"}"#,
+                "ticker too long",
+            ),
+            (
+                409,
+                None,
+                r#"{"error":"The ticker TMPL is already used"}"#,
+                "already used",
+            ),
+            (
+                429,
+                Some("60"),
+                r#"{"error":"Too many requests"}"#,
+                "60 seconds",
+            ),
+            (
+                503,
+                Some("30"),
+                r#"{"error":"Cannot reach the chain backend"}"#,
+                "30 seconds",
+            ),
+            (503, None, r#"{"error":"The registry is full"}"#, "full"),
+            (403, None, r#"{"error":"disabled"}"#, "does not register"),
+            (404, None, "not found", "no asset registry"),
+        ] {
+            *answer.lock().unwrap() = (status, retry.map(str::to_string), body.to_string());
+            let (ok, why) = announce_to_book(&mut state, &asset, Some(&contract), &txid, 0);
+            let why = why.unwrap();
+            assert!(!ok && why.contains(want), "{status}: {why}");
+        }
+        with_book(&mut state, &crate::test_http::closed_port_url());
+        let (ok, why) = announce_to_book(&mut state, &asset, Some(&contract), &txid, 0);
+        assert!(!ok && why.is_some());
     }
 }

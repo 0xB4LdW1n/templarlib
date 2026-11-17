@@ -2,6 +2,7 @@
 
 pub mod assets;
 pub mod book;
+pub mod book_assets;
 pub mod chain;
 pub mod hardware;
 pub mod liquidex;

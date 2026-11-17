@@ -8,6 +8,7 @@ use templar_core::{
     WalletProfile,
 };
 
+use crate::handlers::asset_names::{self, FROM_WALLET};
 use crate::state::{AppState, ChainSyncOutcome};
 use crate::types::{
     AddressInfoDto, AssetBalanceDto, DashboardDto, FeeBumpPreviewDto, PsbtInputDto,
@@ -50,6 +51,9 @@ pub fn get_dashboard(state: &AppState, wallet_id: &str) -> Result<DashboardDto, 
                 status: btc_status.to_string(),
                 utxo_count: mgr.list_unspent().map(|u| u.len()).unwrap_or(0),
                 is_native: true,
+                precision: 8,
+                metadata_source: FROM_WALLET.to_string(),
+                book_source: None,
             }
         } else {
             btc_zero()
@@ -106,6 +110,9 @@ pub fn get_dashboard(state: &AppState, wallet_id: &str) -> Result<DashboardDto, 
             status: liq_status.to_string(),
             utxo_count: liquid_utxo_counts.get(&policy_asset).copied().unwrap_or(0),
             is_native: false,
+            precision: 8,
+            metadata_source: FROM_WALLET.to_string(),
+            book_source: None,
         });
 
         // Track which asset IDs we've already added
@@ -120,11 +127,9 @@ pub fn get_dashboard(state: &AppState, wallet_id: &str) -> Result<DashboardDto, 
                 }
                 shown.insert(aid.clone());
                 let meta = state.asset_registry.get_local_metadata(aid);
-                let ticker = meta
-                    .and_then(|m| m.ticker.as_deref())
-                    .unwrap_or_else(|| state.asset_registry.ticker(aid))
-                    .to_string();
-                let name = meta.map(|m| m.name.as_str()).unwrap_or(&ticker).to_string();
+                // The wallet's own name first, then the active order
+                // book's registry (offline: its cached answer).
+                let shown_as = asset_names::display(state, aid);
                 let status = if meta.is_some() {
                     liq_status
                 } else {
@@ -132,18 +137,18 @@ pub fn get_dashboard(state: &AppState, wallet_id: &str) -> Result<DashboardDto, 
                 };
                 assets.push(AssetBalanceDto {
                     asset_id: aid.clone(),
-                    ticker,
-                    name,
+                    ticker: shown_as.ticker.clone(),
+                    name: shown_as.name.clone(),
                     amount: *amount as i64,
-                    // Per-asset precision from the registry (issued-asset
-                    // metadata or defaults), not a raw satoshi count.
-                    display_amount: state
-                        .asset_registry
-                        .format_amount_with_fallback(aid, *amount),
+                    // Per-asset precision, not a raw satoshi count.
+                    display_amount: shown_as.format(*amount),
                     fiat_estimate: None,
                     status: status.to_string(),
                     utxo_count: liquid_utxo_counts.get(aid).copied().unwrap_or(0),
                     is_native: false,
+                    precision: shown_as.precision,
+                    metadata_source: shown_as.source.to_string(),
+                    book_source: shown_as.book_source,
                 });
             }
         }
@@ -174,6 +179,9 @@ pub fn get_dashboard(state: &AppState, wallet_id: &str) -> Result<DashboardDto, 
                 status: status.to_string(),
                 utxo_count: liquid_utxo_counts.get(aid).copied().unwrap_or(0),
                 is_native: false,
+                precision: meta.precision,
+                metadata_source: FROM_WALLET.to_string(),
+                book_source: None,
             });
         }
     }
@@ -264,6 +272,8 @@ fn get_recent_activity(state: &AppState) -> Result<Vec<RecentActivityDto>, Strin
                 confirmations,
                 note: None,
                 counterparty: None,
+                asset_id: None,
+                metadata_source: FROM_WALLET.to_string(),
             });
         }
     }
@@ -280,7 +290,7 @@ fn get_recent_activity(state: &AppState) -> Result<Vec<RecentActivityDto>, Strin
                 // transfer must not surface as an empty/misleading LBTC row.
                 for (asset_id, delta) in liquid_delta_rows(&tx.balance, &state.policy_asset_hex()) {
                     let direction = if delta >= 0 { "incoming" } else { "outgoing" };
-                    let (ticker, amount) = liquid_delta_display(state, &asset_id, delta);
+                    let (ticker, amount, source) = liquid_delta_display(state, &asset_id, delta);
                     items.push(RecentActivityDto {
                         txid: tx.txid.clone(),
                         direction: direction.to_string(),
@@ -291,6 +301,8 @@ fn get_recent_activity(state: &AppState) -> Result<Vec<RecentActivityDto>, Strin
                         confirmations,
                         note: None,
                         counterparty: None,
+                        asset_id: Some(asset_id.clone()),
+                        metadata_source: source.to_string(),
                     });
                 }
             }
@@ -421,6 +433,8 @@ pub fn list_transactions(state: &AppState) -> Result<Vec<TransactionDto>, String
                 note: None,
                 counterparty: None,
                 fiat_estimate: None,
+                asset_id: None,
+                metadata_source: FROM_WALLET.to_string(),
             });
         }
     }
@@ -442,7 +456,7 @@ pub fn list_transactions(state: &AppState) -> Result<Vec<TransactionDto>, String
                         .enumerate()
                 {
                     let direction = if delta >= 0 { "incoming" } else { "outgoing" };
-                    let (ticker, amount) = liquid_delta_display(state, &asset_id, delta);
+                    let (ticker, amount, source) = liquid_delta_display(state, &asset_id, delta);
                     result.push(TransactionDto {
                         txid: tx.txid.clone(),
                         direction: direction.to_string(),
@@ -464,6 +478,8 @@ pub fn list_transactions(state: &AppState) -> Result<Vec<TransactionDto>, String
                         note: None,
                         counterparty: None,
                         fiat_estimate: None,
+                        asset_id: Some(asset_id.clone()),
+                        metadata_source: source.to_string(),
                     });
                 }
             }
@@ -580,21 +596,12 @@ pub fn list_utxos(state: &AppState, chain: &str) -> Result<Vec<UtxoDto>, String>
                     let outpoint = format!("{}:{}", u.outpoint.txid, u.outpoint.vout);
                     let asset_id = u.unblinded.asset.to_string();
                     let is_policy = state.is_policy_asset(&asset_id);
-                    let (ticker, display_amount) = if is_policy {
-                        (
-                            "LBTC".to_string(),
-                            format!("{:.8} LBTC", amount as f64 / 1e8),
-                        )
-                    } else {
-                        // Registry-resolved ticker + per-asset precision
-                        // (falls back to a short asset-id prefix / 8 decimals
-                        // for unknown third-party assets).
-                        let ticker = state.asset_registry.ticker(&asset_id).to_string();
-                        let value = state
-                            .asset_registry
-                            .format_amount_with_fallback(&asset_id, amount);
-                        (ticker.clone(), format!("{value} {ticker}"))
-                    };
+                    // The wallet's name first, then the order book's
+                    // registry; a short asset-id prefix / 8 decimals for an
+                    // asset nobody named.
+                    let shown_as = asset_names::display(state, &asset_id);
+                    let ticker = shown_as.ticker.clone();
+                    let display_amount = format!("{} {ticker}", shown_as.format(amount));
                     let confirmations: u32 =
                         u.height.map(|h| liq_tip.saturating_sub(h) + 1).unwrap_or(0);
                     // An incoming coin that has not confirmed is pending
@@ -622,6 +629,7 @@ pub fn list_utxos(state: &AppState, chain: &str) -> Result<Vec<UtxoDto>, String>
                         address: Some(u.address.to_string()),
                         ticker: Some(ticker),
                         asset_id: Some(asset_id),
+                        metadata_source: shown_as.source.to_string(),
                     }
                 })
                 .collect())
@@ -684,6 +692,7 @@ pub fn list_utxos(state: &AppState, chain: &str) -> Result<Vec<UtxoDto>, String>
                         address: btc.utxo_address(&u),
                         ticker: Some("BTC".to_string()),
                         asset_id: None,
+                        metadata_source: FROM_WALLET.to_string(),
                     }
                 })
                 .collect())
@@ -843,25 +852,23 @@ fn format_btc(sats: u64) -> String {
 }
 
 /// Signed, precision-aware display for one Liquid per-asset delta.
-/// Returns `(ticker, amount)`, e.g. `("LBTC", "+0.00100000 LBTC")` or
-/// `("USDT", "-12.50 USDT")` — ticker and precision resolved via the asset
-/// registry (local issued-asset metadata first).
-fn liquid_delta_display(state: &AppState, asset_id: &str, delta: i64) -> (String, String) {
+/// Returns `(ticker, amount, metadata_source)`, e.g. `("LBTC", "+0.00100000
+/// LBTC", "wallet")` or `("TMPL", "-12.50 TMPL", "book")` — the wallet's own
+/// name first, then the active order book's registry
+/// ([`asset_names::display`]).
+fn liquid_delta_display(
+    state: &AppState,
+    asset_id: &str,
+    delta: i64,
+) -> (String, String, &'static str) {
     let sign = if delta >= 0 { "+" } else { "-" };
-    let magnitude = delta.unsigned_abs();
-    if state.is_policy_asset(asset_id) {
-        (
-            "LBTC".to_string(),
-            format!("{sign}{:.8} LBTC", magnitude as f64 / 1e8),
-        )
-    } else {
-        let ticker = state.asset_registry.ticker(asset_id).to_string();
-        let value = state
-            .asset_registry
-            .format_amount_with_fallback(asset_id, magnitude);
-        let amount = format!("{sign}{value} {ticker}");
-        (ticker, amount)
-    }
+    let shown_as = asset_names::display(state, asset_id);
+    let amount = format!(
+        "{sign}{} {}",
+        shown_as.format(delta.unsigned_abs()),
+        shown_as.ticker
+    );
+    (shown_as.ticker, amount, shown_as.source)
 }
 
 /// One display row per nonzero asset delta of a Liquid transaction:
@@ -901,6 +908,7 @@ fn io_to_dto(io: templar_core::TxPreviewIo) -> TxIoDto {
         asset_id: None,
         ticker: None,
         amount_display: None,
+        metadata_source: None,
     }
 }
 
@@ -1200,6 +1208,9 @@ fn btc_zero() -> AssetBalanceDto {
         status: "not synced".to_string(),
         utxo_count: 0,
         is_native: true,
+        precision: 8,
+        metadata_source: FROM_WALLET.to_string(),
+        book_source: None,
     }
 }
 

@@ -47,6 +47,10 @@ pub struct TxIoDto {
     /// Pre-formatted amount honoring the asset's precision.
     #[serde(default)]
     pub amount_display: Option<String>,
+    /// Who named a Liquid asset (`wallet` | `book` | `none`, see
+    /// `AssetBalanceDto::metadata_source`); null for Bitcoin.
+    #[serde(default)]
+    pub metadata_source: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -55,10 +59,25 @@ pub struct IssueResultDto {
     pub token_id: Option<String>,
     pub txid: String,
     pub registry_registered: bool,
-    /// URL where the domain proof file must be placed.
+    /// URL where the domain proof file must be placed (Liquid testnet's
+    /// public registry); empty on a regtest, which has no domain proof.
     pub proof_url: String,
-    /// Content of the proof file (single line, plain text).
+    /// Content of the proof file (single line, plain text); empty on a
+    /// regtest.
     pub proof_content: String,
+    /// The active order book's registry stored the asset (`POST
+    /// …/api/assets`), so other wallets see its ticker and precision.
+    #[serde(default)]
+    pub book_registered: bool,
+    /// Why it did not, for people (no registry on that book, ticker taken,
+    /// book out of reach…); null when it did, or when nothing was asked.
+    #[serde(default)]
+    pub book_error: Option<String>,
+    /// The issuer domain written into the contract: the one given, or on a
+    /// regtest without one the reserved `regtest.templar.test`; empty for a
+    /// reissuance.
+    #[serde(default)]
+    pub domain: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -117,6 +136,9 @@ pub struct IssueAssetParams {
     pub name: String,
     pub ticker: String,
     pub precision: u8,
+    /// Required on Liquid testnet (its public registry checks a domain
+    /// proof); optional on a regtest.
+    #[serde(default)]
     pub domain: String,
     pub amount_sats: i64,
     pub reissuance_tokens: i64,
@@ -143,6 +165,8 @@ pub struct ReregisterAssetParams {
     pub name: String,
     pub ticker: String,
     pub precision: u8,
+    /// As given at issuance; on a regtest empty means the reserved domain.
+    #[serde(default)]
     pub domain: String,
 }
 
@@ -229,6 +253,27 @@ pub struct AssetBalanceDto {
     pub status: String,
     pub utxo_count: usize,
     pub is_native: bool,
+    /// Decimal places `display_amount` uses (`amount` is in base units).
+    #[serde(default = "eight")]
+    pub precision: u8,
+    /// Who named the asset: `wallet` (the policy asset, an asset this
+    /// wallet issued, the built-in table), `book` (the active order book's
+    /// registry: show the short asset id beside it), `none` (nobody: the
+    /// ticker is the short asset id, 8 decimals).
+    #[serde(default = "from_wallet")]
+    pub metadata_source: String,
+    /// The order book's own provenance of a `book` name (`admin` |
+    /// `contract` | `other`); null otherwise.
+    #[serde(default)]
+    pub book_source: Option<String>,
+}
+
+fn eight() -> u8 {
+    8
+}
+
+fn from_wallet() -> String {
+    "wallet".to_string()
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -246,6 +291,12 @@ pub struct RecentActivityDto {
     pub confirmations: u32,
     pub note: Option<String>,
     pub counterparty: Option<String>,
+    /// The Liquid asset of the row; null for Bitcoin.
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    /// Who named the asset (see `AssetBalanceDto::metadata_source`).
+    #[serde(default = "from_wallet")]
+    pub metadata_source: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -509,6 +560,12 @@ pub struct TransactionDto {
     pub note: Option<String>,
     pub counterparty: Option<String>,
     pub fiat_estimate: Option<String>,
+    /// The Liquid asset of the row; null for Bitcoin.
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    /// Who named the asset (see `AssetBalanceDto::metadata_source`).
+    #[serde(default = "from_wallet")]
+    pub metadata_source: String,
 }
 
 #[derive(Deserialize, Debug)]
@@ -563,6 +620,9 @@ pub struct UtxoDto {
     pub ticker: Option<String>,
     /// Liquid asset ID hex (None for Bitcoin UTXOs)
     pub asset_id: Option<String>,
+    /// Who named the asset (see `AssetBalanceDto::metadata_source`).
+    #[serde(default = "from_wallet")]
+    pub metadata_source: String,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

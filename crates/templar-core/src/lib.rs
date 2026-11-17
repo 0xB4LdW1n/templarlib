@@ -66,8 +66,8 @@ pub use error::{
 };
 pub use frozen::{canonical_outpoint, first_frozen, CoinChain, FrozenCoins};
 pub use liquid::assets::{
-    known_assets, AssetInfo, AssetMetadata, AssetRegistry, CachedAssets, IssuanceResult,
-    IssuedAssetInfo, LBTC_ASSET_ID, LUSDT_ASSET_ID,
+    known_assets, AssetInfo, AssetMetadata, AssetRegistry, CachedAssets, IssuanceRecord,
+    IssuanceResult, IssuedAssetInfo, LBTC_ASSET_ID, LUSDT_ASSET_ID,
 };
 pub use liquid::chain::{
     liquid_electrum_endpoint, ElementsRpcBackend, LiquidBackend, LiquidChain,
