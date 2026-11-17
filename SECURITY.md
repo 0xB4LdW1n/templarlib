@@ -37,6 +37,16 @@ Particularly interesting:
   SIGHASH_ALL, or sign a taproot input at all — the wallet does not sign
   taproot inputs on Liquid (`refuse_unsafe_signing` in
   `crates/templar-core/src/liquid/pset.rs`);
+- a Liquid input whose signature spends a coin other than the one the PSET
+  names: a key of the wallet signs a coin of the wallet only as the coin
+  its descriptor derives at that key's path, and any other key of ours
+  only a P2WPKH or P2WSH coin whose declared script is the one the
+  signature commits to (no P2SH wrapper, no P2PKH script code inside a
+  P2WSH, a `non_witness_utxo` that agrees). A wallet coin that inspection
+  does not count as the wallet's but a key of the wallet signs is a bug
+  ([Liquid signing checks](docs/ARCHITECTURE.md#liquid-signing-checks));
+- a peg-in input signed by any route but `peg_claim` for one of the
+  wallet's own orders (`LiquidWalletManager::sign_own_pegin_claim`);
 - a Templar Protocol check PSET ([docs/CONNECTOR.md §9](docs/CONNECTOR.md#9-proof-of-key--the-check-pset))
   that the wallet accepts as a proof but that can move funds, or that is
   valid for another site or challenge;

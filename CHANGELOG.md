@@ -184,6 +184,28 @@ with 0, any release may change the method contract.
 
 ### Fixed
 
+- Liquid signing refuses an input whose signature would spend a coin other
+  than the one it names. A PSET could name the wallet's own P2WPKH coin as
+  P2WSH of the P2PKH script code of its key (or wrap it in P2SH, or name
+  the key of another index): inspection did not count it as the wallet's,
+  and the signature over the declared script spent it. Now a key at a path
+  of the wallet's descriptor signs only the coin the descriptor derives
+  there (scriptPubKey, key, witness and redeem scripts), and any other key
+  of ours only a P2WPKH or P2WSH coin whose declared script is the one the
+  signature commits to; a `non_witness_utxo` must agree with the
+  `witness_utxo`. `refuse_unsafe_signing` takes the signing wallet's
+  descriptor (`LiquidWalletManager::signing_descriptor`), and so do
+  `LiquidMultisigSetup::sign_pset_with_mnemonics` and the Jade's
+  `sign_pset` (Rust API change). Errors: `Signing failed: refusing to sign
+  input <n>: …`. One refusal is new for honest PSETs too: a cosigner key
+  enrolled in two multisigs no longer signs the other multisig's coins
+  from inside this multisig wallet; sign them from the multisig they
+  belong to, or from the key's single-seed wallet.
+- No co-signing route signs a peg-in input any more (`sign_pset`,
+  `sign_pset_hw`, the multisig and Jade signers, `send_liquid`). The
+  native peg-in claim is signed by `peg_claim` alone, through
+  `LiquidWalletManager::sign_own_pegin_claim`, which checks the claim
+  against the order's own deposit, claim index and claim script.
 - Security review of the peg branch:
   - a stored test-server profile is validated again when loaded (an
     invalid one is dropped, with testnet as the fallback; it used to

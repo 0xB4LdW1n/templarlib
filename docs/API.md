@@ -896,7 +896,18 @@ others); `Signing failed: refusing to sign input <n>: it is a taproot
 input, …` (the wallet does not sign taproot inputs on Liquid);
 `Signing failed: refusing to sign input <n>: it asks for sighash type
 0x<hh>, …` (an input this wallet signs may declare no sighash type or
-SIGHASH_ALL only); `Refusing to sign: an output of this transaction claims
+SIGHASH_ALL only); `Signing failed: refusing to sign input <n>: it claims a
+peg-in, …` (no peg-in input is co-signed; the wallet's own claim is
+`peg_claim`); `Signing failed: refusing to sign input <n>: …` when an input
+this wallet signs does not name the coin the signature would spend — a
+coin of this wallet that is not the one its descriptor derives at the
+key's path (`… the coin it names is not the coin this wallet derives at
+that path`, `… its witness_script is not the one this wallet's coin
+has`, …), a P2SH-wrapped coin, a P2PKH script code as witness script, a
+P2WPKH coin of another key or with a witness script, a P2WSH coin without
+its witness script, any other script, no `witness_utxo`, or a
+`non_witness_utxo` that disagrees with it (see [Liquid signing
+checks](ARCHITECTURE.md#liquid-signing-checks)); `Refusing to sign: an output of this transaction claims
 an amount or asset its commitment does not prove, …`; a frozen input; `This wallet's key lives on a device — use the device to
 sign.`; a multisig holding no local key; a policy wallet; `No signature
 was added — …`.
@@ -1199,8 +1210,11 @@ registers a multisig on the device first.
 | `wallet_id` | string | yes |
 | `pset_base64` | string | yes |
 
-Returns: `string`, the signed PSET. Errors: as `sign_pset`'s checks;
-`This multisig wallet has no Liquid side.`; device errors.
+Returns: `string`, the signed PSET. Errors: as `sign_pset`'s checks,
+including every `Signing failed: refusing to sign input <n>: …` above (a
+multisig's inputs are judged against its own descriptor, before the
+device is asked to register it); `This multisig wallet has no Liquid
+side.`; device errors.
 
 ## Templar Protocol
 
@@ -1292,7 +1306,10 @@ the chains (*network*). Signing happens in `peg_fund` and `peg_claim`, the
 steps the user confirms; like `sign_pset` they reload the registry first
 (so a locked vault refuses: `Vault is locked …`), open the order's wallet
 and sign with its software signers, so the Liquid signing guard (SIGHASH_ALL
-only, one fee output, no taproot input) and the frozen-coin rules apply.
+only, one fee output, no taproot input, each input the coin it names) and
+the frozen-coin rules apply. `peg_claim` is the only route that signs a
+peg-in input, and only the claim it built for the order's own deposit,
+claim index and claim script.
 Each signed transaction is written to the order before its broadcast; a
 retry of the same call rebroadcasts those bytes rather than paying twice.
 

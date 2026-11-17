@@ -41,18 +41,57 @@ application state (the open wallet, the vault, the registry) goes in
 A Liquid PSET built elsewhere (a cosigner, a protocol site) passes these
 before a key touches it. The co-signing routes (`sign_pset`, `sign_pset_hw`)
 run them in `ensure_pset_signable`, before any key is unlocked:
-`inspect_pset` (network, mainnet derivation paths), exactly one fee output,
-no taproot input among the inputs this wallet signs and SIGHASH_ALL only on
-the others, outputs whose amounts the commitments prove, then the frozen
-coins. Every signer in `templar-core` —
-`LiquidWalletManager::sign`, `sign_pset_with_mnemonic`, issuance, reissuance
-and burn, `LiquidMultisigSetup::sign_pset_with_mnemonics`, the Jade's
-`sign_pset` and `sign_multisig_pset` — runs the fee and sighash rules again
-for its own key (`refuse_unsafe_signing`, `liquid/pset.rs`), so no route
-reaches a key without them. The wallet does not sign taproot inputs on
-Liquid. LWK 0.9 enforced these rules itself; 0.20 signs whatever sighash
-type an input declares, and signs taproot inputs through `tap_key_origins`
-at any path, a mainnet coin type included. LiquiDEX signs its own
+`inspect_pset` (network, mainnet derivation paths), then
+`refuse_unsafe_signing` (`liquid/pset.rs`) for every key of the open wallet,
+judged against the open wallet's descriptor, then outputs whose amounts the
+commitments prove, then the frozen coins. `refuse_unsafe_signing` refuses,
+once any key of ours signs an input:
+
+- a PSET without exactly one fee output;
+- a taproot input among the inputs this wallet signs, or one of them
+  declaring a sighash type other than SIGHASH_ALL;
+- a peg-in input anywhere in the PSET;
+- an input this wallet signs that does not name the coin the signature
+  would spend. It must carry a `witness_utxo`, and a `non_witness_utxo`,
+  when present, must be that outpoint's transaction holding that very
+  output. A key at a path of the wallet's descriptor (same master
+  fingerprint, the path the descriptor derives at the path's last index)
+  signs only the coin the descriptor derives there: the same
+  scriptPubKey, the same key, and exactly the witness and redeem scripts
+  of that coin (none for `elwpkh`, the descriptor's script for `elwsh`).
+  That is LWK's own ownership rule, so an input such a key signs is one
+  inspection counts as the wallet's: review and signature agree. Any
+  other key of ours — a loan key (`2121'`), a cosigner key of another
+  wallet, or every key when no descriptor is known — signs a P2WPKH coin
+  locked to that key with no witness script, or a P2WSH coin whose
+  witness script hashes to it and is not a P2PKH script code; never a
+  P2SH-wrapped coin or any other script. The attack this closes: the
+  wallet's own P2WPKH coin, declared as P2WSH of the P2PKH script code of
+  its key (or wrapped in P2SH, or named at another index), is not counted
+  by inspection, yet the signature over the declared script spends it.
+
+Every signer in `templar-core` runs the same check again for its own key,
+with the descriptor of the wallet it signs for — `LiquidWalletManager::sign`
+and issuance, reissuance and burn (their own descriptor),
+`LiquidMultisigSetup::sign_pset_with_mnemonics` and the Jade's `sign_pset`
+(the open wallet's `signing_descriptor`), the Jade's `sign_multisig_pset`
+(the multisig's own descriptor), `sign_pset_with_mnemonic` (no descriptor:
+the rule for keys outside one applies) — so no route reaches a key without
+it.
+
+The one peg-in the wallet signs is the claim of its own native peg-in
+order: `peg_claim` builds it from verified evidence and signs it with
+`LiquidWalletManager::sign_own_pegin_claim`, which takes the order's
+record (deposit outpoint, claim index, claim script), requires a PSET of
+exactly that one peg-in input, its outpoint the deposit, its claim script
+and coin the order's claim script, that script the wallet's external
+script at the claim index, then runs the checks above with that one input
+allowed to be a peg-in. Nothing a host sends reaches it.
+
+The wallet does not sign taproot inputs on Liquid. LWK 0.9 enforced the
+fee and sighash rules itself; 0.20 signs whatever sighash type an input
+declares, and signs taproot inputs through `tap_key_origins` at any path,
+a mainnet coin type included. LiquiDEX signs its own
 `SIGHASH_SINGLE|ANYONECANPAY` maker input without these signers.
 
 ## State
