@@ -46,8 +46,8 @@ chain.
 
 | Test | Crate | What it proves |
 |---|---|---|
-| `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC, an issued asset and regtest BTC from its public faucet; A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
-| `live_testlab_native_peg_in_and_out` | templarlib | the native Elements peg with nothing but the test-server profile: a fresh software wallet joins the lab, gets regtest BTC and L-BTC from the lab's admin API; peg-in: `peg_start` → `peg_fund` (the wallet pays the deposit from its own Bitcoin) → a claim at one confirmation is `PEG_NOT_READY` → mined to depth → `claimable` → `peg_claim` → `completed`, the L-BTC balance up by exactly the claim's output; peg-out: an over-limit peg-out refused, `peg_start` → `peg_fund` → mined → the lab's federation bot pays → `completed`, the BTC balance up by exactly the amount; an expired peg-in address (a federation change, simulated in the stored order) refused with `PEG_EXPIRED` |
+| `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC and an issued asset from the lab's admin API and regtest BTC from its public faucet (one small request); A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
+| `live_testlab_native_peg_in_and_out` | templarlib | the native Elements peg with nothing but the test-server profile: a fresh software wallet joins the lab, gets regtest BTC and L-BTC from the lab's admin API; peg-in: `peg_start`; someone else pays the address first, less than expected (20 000 sats): listed in `deposits`, not the order's own, and the order can no longer be cancelled; `peg_fund` (the wallet pays the deposit from its own Bitcoin) → a claim at one confirmation is `PEG_NOT_READY` → mined to depth → `claimable` → `peg_claim` → the early payment claimed by its `outpoint` → `completed`, the L-BTC balance up by exactly both claims; peg-out: one below the lab's `pegout_min_sat` and one over its maximum refused, `peg_start` → `peg_fund` → mined → the lab's federation bot pays → `completed`, the BTC balance up by exactly the amount; an expired peg-in address (a federation change, simulated in the stored order) refused with `PEG_EXPIRED` |
 
 The LiquiDEX test needs the Templar testlab (the `templar-testlab`
 repository) running with its order book, on loopback with no admin password (the test mines
@@ -79,7 +79,13 @@ cargo test -p templarlib live_testlab_native_peg -- --ignored --nocapture
 It funds its wallet through the lab's admin API (`POST /admin/api/send`,
 open on loopback without a password), not the public faucet, and mines
 both chains (`POST /admin/api/mine`). One run takes about 40 seconds,
-moves 0.002 BTC in and 0.0005 L-BTC out, and prints every txid.
+moves 0.0022 BTC in and 0.0015 L-BTC out, and prints every txid.
+
+Both tests mine the blocks they need through the admin API and never
+rely on the lab mining one per payment: since its hardening the lab
+confirms faucet and admin payments only in batches, and its public
+faucet takes at most 0.1 coin per request, 3 requests per address and
+10 per client an hour, within a budget shared by all testers.
 
 | Variable | Effect |
 |---|---|
@@ -87,10 +93,9 @@ moves 0.002 BTC in and 0.0005 L-BTC out, and prints every txid.
 | `TEMPLAR_LIVE_TESTLAB_ASSET` | the asset A offers (one the lab's faucet can send); default the newest in the lab's `GET /api/assets` |
 
 One run takes about a minute (most of it waiting for the book's watcher,
-which runs every 60 s) and makes four faucet requests; the lab allows ten
-per client per hour (`[faucet] per_ip_per_hour`), so restart the lab's
-server, or wait, after the second run in an hour. Each run uses throwaway
-data directories; `templar-testlab down` stops the stack.
+which runs every 60 s) and makes one public-faucet request (0.01 BTC);
+the rest comes through the admin API. Each run uses throwaway data
+directories; `templar-testlab down` stops the stack.
 
 ## Against SideSwap's public testnet API
 

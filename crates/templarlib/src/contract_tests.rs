@@ -2867,6 +2867,27 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
             json!({ "chain": "liquid", "blocks": n }),
         );
     };
+    let mine_bitcoin = |n: u32| {
+        lab_post(
+            &format!("{lab}/admin/api/mine"),
+            json!({ "chain": "bitcoin", "blocks": n }),
+        );
+    };
+    // Funding goes through the lab's admin API (open on loopback without a
+    // password): the public faucet's limits (per client, per address, per
+    // request, a shared budget) are for testers, and it no longer mines a
+    // block per payment. Blocks are mined explicitly below.
+    let admin_pay = |network: &str, address: &str, asset: &str, amount: &str| {
+        let r = lab_post(
+            &format!("{lab}/admin/api/send"),
+            json!({ "network": network, "address": address, "asset": asset, "amount": amount }),
+        );
+        eprintln!(
+            "[live] admin send {amount} {asset} → {address}: {}",
+            r["txid"]
+        );
+    };
+    // One small public-faucet payment keeps that path covered.
     let faucet_pay = |network: &str, address: &str, asset: &str, amount: &str| {
         let r = lab_post(
             &faucet,
@@ -2885,17 +2906,18 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
         json!(format!("{book}/api/offers"))
     );
 
-    // Funding through the public faucet (it mines a block after each pay).
     let a_lbtc_addr = a.address("LBTC");
     let a_asset_addr = a.address("LBTC");
     let b_lbtc_addr = b.address("LBTC");
     let b_btc_addr = b.address("BTC");
     assert!(a_lbtc_addr.starts_with("el1"), "{a_lbtc_addr}");
     assert!(b_btc_addr.starts_with("bcrt1"), "{b_btc_addr}");
-    faucet_pay("liquid-regtest", &a_lbtc_addr, "lbtc", "0.1");
-    faucet_pay("liquid-regtest", &a_asset_addr, &asset, "1000");
-    faucet_pay("liquid-regtest", &b_lbtc_addr, "lbtc", "0.5");
+    admin_pay("liquid-regtest", &a_lbtc_addr, "lbtc", "0.1");
+    admin_pay("liquid-regtest", &a_asset_addr, &asset, "1000");
+    admin_pay("liquid-regtest", &b_lbtc_addr, "lbtc", "0.5");
     faucet_pay("bitcoin-regtest", &b_btc_addr, "btc", "0.01");
+    mine(1);
+    mine_bitcoin(1);
     a.wait_balance(&lbtc, "A funded", |x| x == 10_000_000);
     let a_asset_start = a.wait_balance(&asset, "A asset", |x| x > 0);
     b.wait_balance(&lbtc, "B funded", |x| x == 50_000_000);
@@ -3151,6 +3173,9 @@ fn live_testlab_native_peg_in_and_out() {
     let lbtc_addr = w.address("LBTC");
     fund("bitcoin-regtest", &btc_addr, "0.01");
     fund("liquid-regtest", &lbtc_addr, "0.01");
+    // A newer lab confirms admin payments in batches; mine them now.
+    mine("bitcoin", 1);
+    mine("liquid", 1);
     let btc0 = w.wait_balance("BTC", "BTC funded", |x| x == 1_000_000);
     let lbtc0 = w.wait_balance(&lbtc, "L-BTC funded", |x| x == 1_000_000);
 
@@ -3175,6 +3200,27 @@ fn live_testlab_native_peg_in_and_out() {
     assert!(deposit.starts_with('2'), "P2SH-P2WSH expected: {deposit}");
     let err = w.env.err("peg_claim", json!({ "order_id": oid }));
     assert!(err.starts_with("PEG_NOT_READY:"), "{err}");
+
+    // Someone else pays the address first, less than the order expects
+    // (the lab's admin API, 20 000 sats): listed and claimable on its own,
+    // but not the order's deposit.
+    fund("bitcoin-regtest", &deposit, "0.0002");
+    mine("bitcoin", 1);
+    let early = w.wait_peg(&oid, "the early payment", |o| {
+        o["deposits"].as_array().is_some_and(|d| d.len() == 1)
+    });
+    assert_eq!(early["status"], json!("awaiting_deposit"), "{early}");
+    assert_eq!(early["deposits"][0]["primary"], json!(false), "{early}");
+    assert_eq!(early["deposits"][0]["amount_sats"], json!(20_000));
+    let extra = early["deposits"][0]["outpoint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let err = w.env.err("peg_cancel", json!({ "order_id": oid }));
+    assert!(
+        err.starts_with("PEG_NOT_READY:"),
+        "paid address cancelled: {err}"
+    );
 
     // The wallet pays the deposit from its own Bitcoin.
     let funded = w.env.ok("peg_fund", json!({ "order_id": oid }));
@@ -3204,13 +3250,34 @@ fn live_testlab_native_peg_in_and_out() {
         PEGIN - pegged
     );
     assert_eq!(claimed["status"], json!("settling"));
+    // The early, smaller payment is claimed by its outpoint.
+    let claimed_extra = w
+        .env
+        .ok("peg_claim", json!({ "order_id": oid, "outpoint": extra }));
+    let extra_row = claimed_extra["deposits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["outpoint"] == json!(extra))
+        .unwrap()
+        .clone();
+    let extra_claim = extra_row["txid_claim"].as_str().unwrap().to_string();
+    eprintln!("[live] extra deposit {extra} claim txid {extra_claim}");
     mine("liquid", 1);
     let done = w.wait_peg(&oid, "peg-in completed", |o| {
         o["status"] == json!("completed")
+            && o["deposits"]
+                .as_array()
+                .is_some_and(|d| d.iter().all(|x| x["status"] == json!("completed")))
     });
     assert_eq!(done["txid_payout"], json!(claim_txid));
-    let lbtc1 = w.wait_balance(&lbtc, "L-BTC pegged in", |x| x > lbtc0);
-    assert_eq!(lbtc1 - lbtc0, pegged as i64, "L-BTC up by the claim");
+    let lbtc1 = w.wait_balance(&lbtc, "L-BTC pegged in", |x| x > lbtc0 + pegged as i64);
+    let extra_in = lbtc1 - lbtc0 - pegged as i64;
+    eprintln!("[live] the extra deposit brought {extra_in} sats L-BTC");
+    assert!(
+        extra_in > 19_900 && extra_in < 20_000,
+        "L-BTC up by both claims: {extra_in}"
+    );
     let btc1 = w.balance("BTC");
     assert!(
         btc1 < btc0 - PEGIN as i64,
@@ -3223,7 +3290,16 @@ fn live_testlab_native_peg_in_and_out() {
     );
 
     // ── Peg-out: 0.0005 L-BTC ──────────────────────────────────────────
-    const PEGOUT: u64 = 50_000;
+    // At or above the lab's pegout_min_sat (100 000 when its config does
+    // not say): smaller outputs are never paid.
+    const PEGOUT: u64 = 150_000;
+    let below = w.address("BTC");
+    let err = w.err(
+        "peg_start",
+        json!({ "direction": "out", "amount_sats": 99_999, "payout_address": below }),
+    );
+    eprintln!("[live] peg-out below the lab's minimum refused: {err}");
+    assert!(err.contains("below the minimum"), "{err}");
     let err = w.env.err(
         "peg_quote",
         json!({ "direction": "out", "amount_sats": max + 1 }),
