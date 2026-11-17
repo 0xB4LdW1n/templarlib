@@ -381,16 +381,18 @@ fn reject_absurd_fee(
 
 /// A builder failure, with a hint when frozen coins are what made the
 /// wallet look short: the balance still counts them, the builder does not.
+/// A wallet that is short comes back as [`BitcoinError::InsufficientFunds`]
+/// (same text as before, with the amounts kept).
 fn build_error(e: bdk::Error, frozen: &BTreeSet<String>) -> TemplarError {
-    let msg = e.to_string();
-    if !frozen.is_empty() && matches!(e, bdk::Error::InsufficientFunds { .. }) {
-        return BitcoinError::TxBuildFailed(format!(
-            "{msg} — frozen coins are left out; unfreeze some on the UTXOs screen \
-             to spend them"
-        ))
+    if let bdk::Error::InsufficientFunds { needed, available } = e {
+        return BitcoinError::InsufficientFunds {
+            available,
+            needed,
+            frozen_left_out: !frozen.is_empty(),
+        }
         .into();
     }
-    BitcoinError::TxBuildFailed(msg).into()
+    BitcoinError::TxBuildFailed(e.to_string()).into()
 }
 
 /// Refuses a PSBT that spends a frozen coin. The builders already leave
@@ -2118,8 +2120,27 @@ mod tests {
 
         let err = mgr
             .create_tx_multi(&[(PAYEE.into(), 60_000, false)], 1.0, None, None, &frozen)
-            .unwrap_err()
-            .to_string();
+            .unwrap_err();
+        // Typed, with the amounts, and the same text as before.
+        let TemplarError::Bitcoin(BitcoinError::InsufficientFunds {
+            available,
+            needed,
+            frozen_left_out: true,
+        }) = &err
+        else {
+            panic!("expected InsufficientFunds, got {err:?}");
+        };
+        assert_eq!(*available, 50_000);
+        assert!(*needed > 60_000, "{needed}");
+        let err = err.to_string();
+        assert_eq!(
+            err,
+            format!(
+                "Transaction build failed: Insufficient funds: {available} sat available of \
+                 {needed} sat needed — frozen coins are left out; unfreeze some on the UTXOs \
+                 screen to spend them"
+            )
+        );
         assert!(err.contains("frozen coins are left out"), "{err}");
         // The same payment builds once the coin is unfrozen.
         mgr.create_tx_multi(

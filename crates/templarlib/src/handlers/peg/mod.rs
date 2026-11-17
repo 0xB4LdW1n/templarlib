@@ -437,6 +437,68 @@ pub fn claim(
     Ok(order.order)
 }
 
+// ── Funding refusals ─────────────────────────────────────────────────────────
+
+/// The names of the active chains, as a refusal says them: `Bitcoin
+/// regtest` / `Bitcoin testnet`, `Liquid regtest` / `Liquid testnet`.
+pub(super) fn chain_names(state: &AppState) -> (String, String) {
+    let bitcoin = match state.bitcoin_backend().network {
+        bdk::bitcoin::Network::Regtest => "Bitcoin regtest",
+        _ => "Bitcoin testnet",
+    };
+    let liquid = if state.liquid_network.is_regtest() {
+        "Liquid regtest"
+    } else {
+        "Liquid testnet"
+    };
+    (bitcoin.to_string(), liquid.to_string())
+}
+
+/// A failed build of a peg's own transaction (`what`: "the deposit", "the
+/// peg-out of N sat"). A wallet that is short becomes the tagged
+/// `PEG_INSUFFICIENT_FUNDS: …`, naming the chain, the asset, what the wallet
+/// has and what the payment and its fee need; any other failure keeps its
+/// text.
+pub(super) fn build_failure(
+    e: templar_core::TemplarError,
+    (bitcoin, liquid): &(String, String),
+    what: &str,
+) -> String {
+    use templar_core::{BitcoinError, LiquidError, TemplarError};
+    let frozen = |left_out: bool| {
+        if left_out {
+            " Frozen coins are left out; unfreeze some on the UTXOs screen to spend them."
+        } else {
+            ""
+        }
+    };
+    match e {
+        TemplarError::Bitcoin(BitcoinError::InsufficientFunds {
+            available,
+            needed,
+            frozen_left_out,
+        }) => PegError::InsufficientFunds(format!(
+            "this wallet has {available} sat of BTC on {bitcoin}; {what} and its fee need \
+             {needed} sat.{}",
+            frozen(frozen_left_out)
+        ))
+        .to_string(),
+        TemplarError::Liquid(LiquidError::InsufficientFunds {
+            missing_sats,
+            available_sats,
+            frozen_left_out,
+            ..
+        }) => PegError::InsufficientFunds(format!(
+            "this wallet has {available_sats} sat of L-BTC on {liquid}; {what} and its fee \
+             need {} sat.{}",
+            available_sats.saturating_add(missing_sats),
+            frozen(frozen_left_out)
+        ))
+        .to_string(),
+        other => other.to_string(),
+    }
+}
+
 // ── Lifecycle ────────────────────────────────────────────────────────────────
 
 fn normalize_direction(direction: &str) -> Result<&'static str, String> {
@@ -806,6 +868,87 @@ mod tests {
         }
         let listed = list(&mut state, "w").unwrap();
         assert!(listed.iter().all(|o| o.status == AWAITING_DEPOSIT));
+    }
+
+    /// The tag a host keys on when a peg cannot be funded, from the real
+    /// builders of an empty wallet (offline): the chain, the asset, what the
+    /// wallet has and what the deposit or the peg-out and its fee need.
+    #[test]
+    fn an_unfunded_peg_is_refused_with_the_tag_and_says_where() {
+        const WORDS: &str = "abandon abandon abandon abandon abandon abandon abandon \
+                             abandon abandon abandon abandon about";
+        let state = test_state("insufficient");
+        let regtest = ("Bitcoin regtest".to_string(), "Liquid regtest".to_string());
+
+        // Peg-in: a deposit of 100 000 sat from a wallet with no BTC.
+        let btc = templar_core::WalletManager::new_on(
+            &templar_core::BitcoinBackend::regtest("tcp://127.0.0.1:1"),
+            &state.data_dir,
+            WORDS,
+        )
+        .unwrap();
+        let to = btc.get_fresh_address().unwrap().address.to_string();
+        let e = btc
+            .create_tx_multi(
+                &[(to, 100_000, false)],
+                1.0,
+                None,
+                None,
+                &Default::default(),
+            )
+            .unwrap_err();
+        let msg = build_failure(e, &regtest, "the deposit");
+        assert!(
+            msg.starts_with(&format!(
+                "{}: this wallet has 0 sat of BTC on Bitcoin regtest; the deposit and its fee \
+                 need ",
+                templar_core::ERR_PEG_INSUFFICIENT_FUNDS
+            )),
+            "{msg}"
+        );
+        let needed: u64 = msg
+            .rsplit("need ")
+            .next()
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert!(needed > 100_000, "{msg}");
+
+        // Peg-out: 100 000 sat of L-BTC from a wallet with none.
+        let liq = templar_core::LiquidWalletManager::from_mnemonic_with_persist_on(
+            &templar_core::LiquidNetwork::regtest_default(),
+            WORDS,
+            None,
+        )
+        .unwrap();
+        let script = {
+            use lwk_wollet::elements::bitcoin::{hashes::Hash, BlockHash, ScriptBuf, WPubkeyHash};
+            templar_core::peg::pegout_script(
+                &BlockHash::all_zeros(),
+                &ScriptBuf::new_p2wpkh(&WPubkeyHash::all_zeros()),
+            )
+        };
+        let e = liq
+            .create_pegout(100_000, script, &Default::default())
+            .unwrap_err();
+        let msg = build_failure(e, &regtest, "the peg-out of 100000 sat");
+        assert!(
+            msg.starts_with(
+                "PEG_INSUFFICIENT_FUNDS: this wallet has 0 sat of L-BTC on Liquid regtest; the \
+                 peg-out of 100000 sat and its fee need "
+            ),
+            "{msg}"
+        );
+
+        // Any other failure keeps its own text.
+        let other = templar_core::TemplarError::from(templar_core::BitcoinError::TxBuildFailed(
+            "No recipients".into(),
+        ));
+        assert_eq!(
+            build_failure(other, &regtest, "the deposit"),
+            "Transaction build failed: No recipients"
+        );
+        assert_eq!(chain_names(&state).1, "Liquid testnet");
     }
 
     #[test]

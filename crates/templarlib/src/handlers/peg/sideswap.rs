@@ -560,7 +560,7 @@ pub(super) fn fund(
                     None,
                     &state.frozen_on(CoinChain::Bitcoin),
                 )
-                .map_err(s)?;
+                .map_err(|e| super::build_failure(e, &super::chain_names(state), "the deposit"))?;
             if !btc.sign(&mut psbt).map_err(s)? {
                 return Err("The deposit could not be fully signed by this wallet.".into());
             }
@@ -597,7 +597,13 @@ pub(super) fn fund(
                     None,
                     &state.frozen_on(CoinChain::Liquid),
                 )
-                .map_err(s)?;
+                .map_err(|e| {
+                    super::build_failure(
+                        e,
+                        &super::chain_names(state),
+                        &format!("the deposit of {amount} sat to SideSwap"),
+                    )
+                })?;
             if !pset
                 .outputs()
                 .iter()

@@ -61,8 +61,8 @@ pub use derivation::{
 pub use endpoints::{Endpoints, NativePegTerms, PegProvider, Resolved, Source};
 pub use error::{
     BitcoinError, HardwareError, LiquidError, PegError, PolicyError, StorageError, TemplarError,
-    TemplarResult, TestServerError, VaultError, ERR_PEG_EXPIRED, ERR_PEG_NOT_READY,
-    ERR_PEG_PROOF_REJECTED, ERR_PEG_UNAVAILABLE,
+    TemplarResult, TestServerError, VaultError, ERR_PEG_EXPIRED, ERR_PEG_INSUFFICIENT_FUNDS,
+    ERR_PEG_NOT_READY, ERR_PEG_PROOF_REJECTED, ERR_PEG_UNAVAILABLE,
 };
 pub use frozen::{canonical_outpoint, first_frozen, CoinChain, FrozenCoins};
 pub use liquid::assets::{

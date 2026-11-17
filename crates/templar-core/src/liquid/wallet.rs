@@ -755,9 +755,47 @@ impl LiquidWalletManager {
         }
         let pset = builder
             .finish()
-            .map_err(|e| frozen_hint(LiquidError::PsetBuildFailed, "Build PSET", e, frozen))?;
+            .map_err(|e| self.pset_build_error("Build PSET", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, only_lbtc)?;
         Ok(pset)
+    }
+
+    /// A failed PSET build: a wallet that is short comes back as
+    /// [`LiquidError::InsufficientFunds`] (same text as before, with what it
+    /// could spend of that asset), anything else as `PsetBuildFailed`.
+    fn pset_build_error(
+        &self,
+        what: &str,
+        e: lwk_wollet::Error,
+        frozen: &BTreeSet<String>,
+    ) -> TemplarError {
+        if let lwk_wollet::Error::InsufficientFunds {
+            missing_sats,
+            asset_id,
+        } = &e
+        {
+            let available_sats = self
+                .wollet
+                .utxos()
+                .map(|coins| {
+                    coins
+                        .iter()
+                        .filter(|u| u.unblinded.asset == *asset_id)
+                        .filter(|u| !frozen.contains(&u.outpoint.to_string()))
+                        .map(|u| u.unblinded.value)
+                        .sum()
+                })
+                .unwrap_or(0);
+            return LiquidError::InsufficientFunds {
+                context: what.to_string(),
+                asset_id: asset_id.to_string(),
+                missing_sats: *missing_sats,
+                available_sats,
+                frozen_left_out: !frozen.is_empty(),
+            }
+            .into();
+        }
+        frozen_hint(LiquidError::PsetBuildFailed, what, e, frozen)
     }
 
     /// The wallet's LBTC coins minus the frozen ones, for LWK's manual
@@ -875,7 +913,7 @@ impl LiquidWalletManager {
         }
         let pset = builder
             .finish()
-            .map_err(|e| frozen_hint(LiquidError::PsetBuildFailed, "Build peg-out", e, frozen))?;
+            .map_err(|e| self.pset_build_error("Build peg-out", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, true)?;
         let pegouts: Vec<_> = pset
             .outputs()

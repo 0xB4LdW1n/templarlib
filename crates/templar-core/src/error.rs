@@ -41,6 +41,22 @@ pub const ERR_PEG_NOT_READY: &str = "PEG_NOT_READY";
 pub const ERR_PEG_EXPIRED: &str = "PEG_EXPIRED";
 /// Tag of [`PegError::ProofRejected`]: the evidence for a peg-in claim did not verify.
 pub const ERR_PEG_PROOF_REJECTED: &str = "PEG_PROOF_REJECTED";
+/// Tag of [`PegError::InsufficientFunds`]: the wallet cannot pay a peg's own
+/// transaction (the deposit or the peg-out) and its fee.
+pub const ERR_PEG_INSUFFICIENT_FUNDS: &str = "PEG_INSUFFICIENT_FUNDS";
+
+/// What a builder adds when frozen coins were left out of a payment that
+/// came up short: the balance still counts them, the builder does not.
+pub const FROZEN_LEFT_OUT_HINT: &str =
+    " — frozen coins are left out; unfreeze some on the UTXOs screen to spend them";
+
+fn frozen_hint(frozen_left_out: bool) -> &'static str {
+    if frozen_left_out {
+        FROZEN_LEFT_OUT_HINT
+    } else {
+        ""
+    }
+}
 
 /// A peg-in / peg-out step that cannot go ahead. The first four variants
 /// start with a stable tag hosts key on; the text after it may change.
@@ -64,6 +80,12 @@ pub enum PegError {
     /// peg-in claim did not verify against the wallet's own chain view.
     #[error("PEG_PROOF_REJECTED: {0}")]
     ProofRejected(String),
+
+    /// The wallet holds too little of the asset a peg's own transaction
+    /// spends (BTC for a peg-in deposit, L-BTC for a peg-out); the text
+    /// names the chain, the asset, what it has and what is needed.
+    #[error("PEG_INSUFFICIENT_FUNDS: {0}")]
+    InsufficientFunds(String),
 
     /// A chain server or the provider could not be read.
     #[error("Peg chain access failed: {0}")]
@@ -143,6 +165,23 @@ pub enum BitcoinError {
     #[error("Transaction build failed: {0}")]
     TxBuildFailed(String),
 
+    /// The wallet's spendable coins do not cover the payment and its fee.
+    /// The text is the one [`BitcoinError::TxBuildFailed`] carried for it;
+    /// the amounts are there for a caller that explains it better.
+    #[error(
+        "Transaction build failed: Insufficient funds: {available} sat available of {needed} \
+         sat needed{}",
+        frozen_hint(*frozen_left_out)
+    )]
+    InsufficientFunds {
+        /// What the builder could spend (frozen coins left out), in sat.
+        available: u64,
+        /// The payment and its fee, in sat.
+        needed: u64,
+        /// Frozen coins were left out of the selection.
+        frozen_left_out: bool,
+    },
+
     #[error("Invalid descriptor: {0}")]
     InvalidDescriptor(String),
 
@@ -176,6 +215,27 @@ pub enum LiquidError {
 
     #[error("PSET build failed: {0}")]
     PsetBuildFailed(String),
+
+    /// The wallet's coins of `asset_id` do not cover a payment and its fee.
+    /// The text is the one [`LiquidError::PsetBuildFailed`] carried for it.
+    #[error(
+        "PSET build failed: {context}: Insufficient funds: missing {missing_sats} units for \
+         asset {asset_id}{}",
+        frozen_hint(*frozen_left_out)
+    )]
+    InsufficientFunds {
+        /// The builder step (`Build PSET`, `Build peg-out`).
+        context: String,
+        /// The asset that is short (hex).
+        asset_id: String,
+        /// How much more of it the payment and its fee need.
+        missing_sats: u64,
+        /// The wallet's coins of that asset the builder could spend
+        /// (frozen coins left out).
+        available_sats: u64,
+        /// Frozen coins were left out of the selection.
+        frozen_left_out: bool,
+    },
 
     #[error("PSET inspection failed: {0}")]
     PsetInspectionFailed(String),

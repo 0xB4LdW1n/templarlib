@@ -841,7 +841,7 @@ fn fund_pegin(state: &AppState, o: &mut StoredOrder, fee_rate: Option<f32>) -> R
                 None,
                 &frozen,
             )
-            .map_err(s)?;
+            .map_err(|e| super::build_failure(e, &super::chain_names(state), "the deposit"))?;
         if !btc.sign(&mut psbt).map_err(s)? {
             return Err("The deposit could not be fully signed by this wallet.".into());
         }
@@ -906,7 +906,13 @@ fn fund_pegout(state: &AppState, t: &NativePegTerms, o: &mut StoredOrder) -> Res
         let frozen = state.frozen_on(CoinChain::Liquid);
         let mut pset = liq
             .create_pegout(amount, script.clone(), &frozen)
-            .map_err(s)?;
+            .map_err(|e| {
+                super::build_failure(
+                    e,
+                    &super::chain_names(state),
+                    &format!("the peg-out of {amount} sat"),
+                )
+            })?;
         liq.sign(&mut pset).map_err(s)?;
         let tx = liq.finalize(&mut pset).map_err(s)?;
         check_pegout_tx(&tx, &script, amount, &genesis, &dest, &liq.policy_asset())?;
