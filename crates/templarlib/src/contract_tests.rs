@@ -3818,18 +3818,30 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
     let regtest = &config["networks"]["liquid-regtest"];
     let lbtc = regtest["policy_asset"].as_str().unwrap().to_string();
     let book = config["orderbook_url"].as_str().unwrap().to_string();
-    let faucet = regtest["faucet_url"].as_str().unwrap().to_string();
-    // The asset A offers: TEMPLAR_LIVE_TESTLAB_ASSET, else the lab's newest.
+    // The asset A offers: TEMPLAR_LIVE_TESTLAB_ASSET, else a lab asset its
+    // faucet lists (the lab keeps paying those), else the lab's newest (a
+    // smoke-test token may be spent out).
     let asset = std::env::var("TEMPLAR_LIVE_TESTLAB_ASSET").unwrap_or_else(|_| {
-        let assets = lab_get(&format!("{lab}/api/assets"));
-        assets["assets"]
-            .as_array()
-            .unwrap()
-            .last()
-            .expect("the lab has issued an asset")["asset_id"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        let listed = regtest["faucet"].as_array().and_then(|list| {
+            list.iter()
+                .find(|a| {
+                    a["network"] == json!("liquid-regtest")
+                        && a["asset"] != json!("lbtc")
+                        && a["asset_id"].is_string()
+                })
+                .map(|a| a["asset_id"].as_str().unwrap().to_string())
+        });
+        listed.unwrap_or_else(|| {
+            let assets = lab_get(&format!("{lab}/api/assets"));
+            assets["assets"]
+                .as_array()
+                .unwrap()
+                .last()
+                .expect("the lab has issued an asset")["asset_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
     });
     let mine = |n: u32| {
         lab_post(
@@ -3857,14 +3869,6 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
             r["txid"]
         );
     };
-    // One small public-faucet payment keeps that path covered.
-    let faucet_pay = |network: &str, address: &str, asset: &str, amount: &str| {
-        let r = lab_post(
-            &faucet,
-            json!({ "network": network, "address": address, "asset": asset, "amount": amount }),
-        );
-        eprintln!("[live] faucet {amount} {asset} → {address}: {}", r["txid"]);
-    };
 
     let mut a = LabWallet::join(&lab, "Live maker");
     let mut b = LabWallet::join(&lab, "Live taker");
@@ -3885,7 +3889,10 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
     admin_pay("liquid-regtest", &a_lbtc_addr, "lbtc", "0.1");
     admin_pay("liquid-regtest", &a_asset_addr, &asset, "1000");
     admin_pay("liquid-regtest", &b_lbtc_addr, "lbtc", "0.5");
-    faucet_pay("bitcoin-regtest", &b_btc_addr, "btc", "0.01");
+    // Admin API, not the public faucet: its per-client limit is shared by
+    // everyone on this host (`live_testlab_wallet_funds_itself_from_the_faucet`
+    // covers the faucet).
+    admin_pay("bitcoin-regtest", &b_btc_addr, "btc", "0.01");
     mine(1);
     mine_bitcoin(1);
     a.wait_balance(&lbtc, "A funded", |x| x == 10_000_000);
@@ -4123,7 +4130,22 @@ fn live_testlab_wallet_funds_itself_from_the_faucet() {
     assert_eq!(ts["faucet"]["assets_source"], json!("profile"), "{ts}");
     assert_eq!(ts["faucet"]["available"], json!(true), "{ts}");
 
-    let lbtc_paid = w.ok("test_server_faucet", json!({ "asset": "lbtc" }));
+    // The lab's per-client limit (10 requests an hour) is shared by every
+    // tester on this host: a refusal for it is the engine's tag, checked,
+    // and the payment itself cannot be tested now.
+    let first = w.env.call(
+        "test_server_faucet",
+        json!({ "wallet_id": w.id, "asset": "lbtc" }),
+    );
+    if let Some(err) = first["err"].as_str() {
+        assert!(err.starts_with("FAUCET_RATE_LIMITED: "), "{err}");
+        eprintln!(
+            "[live] SKIPPED: the lab's faucet refused this client for its limit ({err}); \
+             the tag was checked, the payment was not exercised"
+        );
+        return;
+    }
+    let lbtc_paid = first["ok"].clone();
     eprintln!("[live] faucet L-BTC: {lbtc_paid}");
     assert_eq!(lbtc_paid["network"], json!("liquid-regtest"));
     assert!(lbtc_paid["address"].as_str().unwrap().starts_with("el1"));
@@ -5378,9 +5400,15 @@ fn live_testlab_native_peg_in_and_out() {
     let pegout_txid = sent["txid_deposit"].as_str().unwrap().to_string();
     eprintln!("[live] peg-out {out_id} txid {pegout_txid}");
     mine("liquid", 2);
+    // The lab's bot mines a Bitcoin block right after it pays (its payment
+    // is in a block 1-3 s later), so one status check may already see the
+    // payout confirmed: `settling` with the payout and `completed` are
+    // both the federation's payment, found.
     let paid = w.wait_peg(&out_id, "federation payment", |o| {
-        o["status"] == json!("settling") && !o["txid_payout"].is_null()
+        !o["txid_payout"].is_null()
+            && (o["status"] == json!("settling") || o["status"] == json!("completed"))
     });
+    eprintln!("[live] payout found while {}", paid["status"]);
     let payout_txid = paid["txid_payout"].as_str().unwrap().to_string();
     eprintln!("[live] federation payout txid {payout_txid}");
     mine("bitcoin", 1);

@@ -46,12 +46,12 @@ chain.
 
 | Test | Crate | What it proves |
 |---|---|---|
-| `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC and an issued asset from the lab's admin API and regtest BTC from its public faucet (one small request); A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
+| `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC, a lab asset and regtest BTC from the lab's admin API; A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
 | `live_testlab_issue_token_and_sell_for_lbtc` | templarlib | a user's own token sold for L-BTC, the manual test in the app: two fresh software wallets join the lab and get L-BTC through the admin API (A 0.01 for fees, B 0.5 to pay); A issues "Templar Token" (`TMPL`, precision 2, domain `templar.red`, 1 000 000 base units = 10 000.00 TMPL, one reissuance token) with `issue_asset` — no registry call on regtest (`registry_registered: false`) — and its dashboard names it `TMPL` / `Templar Token`; A prepares an exact 100.00 TMPL coin, offers it for 0.05 L-BTC and publishes it; B finds it verified and takeable in `list_markets`, verifies it deep, previews and takes it; A is paid exactly the price and gives exactly the coin, B pays the price plus the previewed fee; A then reissues 5 000.00 TMPL (`reissue_asset`) and burns 10.00 (`burn_asset`), each mined and checked; the book's watcher closes the offer |
 | `live_testlab_wallet_created_before_joining_sees_its_regtest_funds` | templarlib | the manual tester's order in one engine: a wallet created and synced on Liquid testnet (needs the public testnet Electrum servers), then the lab joined, the wallet reopened, regtest BTC sent through the admin API and mined; a sync in the same engine shows it. The lab's Electrum sees a new block about 5–7 s after bitcoind, and until then a sync answers `ok` with the old balance, so the test syncs until the funds show (it prints after how long) |
 | `live_testlab_native_peg_in_and_out` | templarlib | the native Elements peg with nothing but the test-server profile: a fresh software wallet joins the lab; before any funds, a peg-in and a peg-out are refused by `peg_fund` with `PEG_INSUFFICIENT_FUNDS` naming the chain and the asset (orders cancelled); it gets regtest BTC and L-BTC from the lab's admin API; peg-in: `peg_start`; someone else pays the address first, less than expected (20 000 sats): listed in `deposits`, not the order's own, and the order can no longer be cancelled; `peg_fund` (the wallet pays the deposit from its own Bitcoin) → a claim at one confirmation is `PEG_NOT_READY` → mined to depth → `claimable` → `peg_claim` → the early payment claimed by its `outpoint` → `completed`, the L-BTC balance up by exactly both claims; peg-out: one below the lab's `pegout_min_sat` and one over its maximum refused, `peg_start` → `peg_fund` → mined → the lab's federation bot pays → `completed`, the BTC balance up by exactly the amount; an expired peg-in address (a federation change, simulated in the stored order) refused with `PEG_EXPIRED` |
 
-| `live_testlab_wallet_funds_itself_from_the_faucet` | templarlib | `test_server_faucet`: a fresh wallet asks the lab's public faucet for L-BTC and BTC (two requests), each paid to a fresh address of its own on the right chain; after one block each, the balances are exactly what the faucet reported; on testnet the call is refused. **Skips** (prints `SKIPPED`) when the lab's `/api/config` has no `faucet` list |
+| `live_testlab_wallet_funds_itself_from_the_faucet` | templarlib | `test_server_faucet`: a fresh wallet asks the lab's public faucet for L-BTC and BTC (two requests), each paid to a fresh address of its own on the right chain; after one block each, the balances are exactly what the faucet reported; on testnet the call is refused. **Skips** (prints `SKIPPED`) when the lab's `/api/config` has no `faucet` list, or when the lab refuses this client for its hourly limit (the `FAUCET_RATE_LIMITED` tag is checked) |
 | `live_testlab_registered_token_is_named_for_another_wallet` | templarlib | the order book's asset registry: A issues a token with no domain (regtest), the engine announces it (`book_registered: true`; `reregister_asset` again is idempotent), A offers 100.00 of it; B's `list_markets` row, take preview and, after the take, its summary row show the ticker, the name and precision 2 (`100.00`), marked `metadata_source: "book"`. **Skips** when the book has no `/api/assets` |
 
 The LiquiDEX test needs the Templar testlab (the `templar-testlab`
@@ -95,16 +95,22 @@ faucet takes at most 0.1 coin per request, 3 requests per address and
 | Variable | Effect |
 |---|---|
 | `TEMPLAR_LIVE_TESTLAB_URL` | the lab's base URL; default `http://127.0.0.1:8096` |
-| `TEMPLAR_LIVE_TESTLAB_ASSET` | the asset A offers (one the lab's faucet can send); default the newest in the lab's `GET /api/assets` — set it to the issued test asset when `templar-testlab smoke` has issued newer tokens the lab can no longer pay out (`elementsd sendtoaddress: Insufficient funds`) |
+| `TEMPLAR_LIVE_TESTLAB_ASSET` | the asset A offers (one the lab can send); default a Liquid asset the lab's `/api/config` faucet list names (other than L-BTC), else the newest in the lab's `GET /api/assets` — set it when the lab can no longer pay that one out (`elementsd sendtoaddress: Insufficient funds`, e.g. a spent-out `templar-testlab smoke` token) |
 
 One run takes about a minute (most of it waiting for the book's watcher,
-which runs every 60 s) and makes one public-faucet request (0.01 BTC);
-the rest comes through the admin API. Each run uses throwaway data
+which runs every 60 s); every coin comes through the admin API, so the
+public faucet's limits are left to the faucet test. Each run uses throwaway data
 directories; `templar-testlab down` stops the stack.
 
+The lab's federation bot mines a Bitcoin block right after it pays a
+peg-out, so the peg test accepts the payout found either while the order
+is `settling` or already `completed`.
+
 The faucet test needs a lab whose `/api/config` lists its faucet; it makes
-two public-faucet requests (within the per-address and per-client
-limits). The registry test needs an order book with the asset registry
+two public-faucet requests. The lab allows 10 an hour per client, shared
+by everyone on the host: when the first request is refused for that limit
+the test checks the `FAUCET_RATE_LIMITED` tag, prints `SKIPPED`, and the
+payment is not exercised. The registry test needs an order book with the asset registry
 (`/api/assets`) and a chain backend for its regtest; it funds through the
 admin API. Run them with
 
@@ -114,8 +120,10 @@ cargo test -p templarlib live_testlab_registered_token -- --ignored --nocapture
 ```
 
 On 2026-11-17 the owner's lab still ran the older binaries (no faucet
-list, no `/api/assets`): both skipped, and neither was run against the
-new pieces.
+list, no `/api/assets`): both skipped there. Against a lab with both, the
+whole `live_testlab` sequence (`--test-threads=1`) passed twice in a row;
+the faucet's payments were exercised in an earlier run of the same day,
+then refused for the shared hourly limit (tag checked, `SKIPPED`).
 
 The issuance test needs the stack and its order book, but no issued
 asset and no public faucet (everything comes through the admin API); it
