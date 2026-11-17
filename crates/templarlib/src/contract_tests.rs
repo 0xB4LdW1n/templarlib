@@ -3333,10 +3333,11 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
 
 impl LabWallet {
     /// Polls `peg_status` until `pred` holds (Electrum indexes a block, and
-    /// the lab's federation bot pays, a few seconds after the fact).
+    /// the lab's federation bot pays, a few seconds after the fact — longer
+    /// on a busy shared lab).
     fn wait_peg(&mut self, order_id: &str, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
         let mut last = Value::Null;
-        for _ in 0..60 {
+        for _ in 0..180 {
             last = self.env.ok("peg_status", json!({ "order_id": order_id }));
             if pred(&last) {
                 return last;

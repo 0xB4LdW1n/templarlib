@@ -90,7 +90,7 @@ faucet takes at most 0.1 coin per request, 3 requests per address and
 | Variable | Effect |
 |---|---|
 | `TEMPLAR_LIVE_TESTLAB_URL` | the lab's base URL; default `http://127.0.0.1:8096` |
-| `TEMPLAR_LIVE_TESTLAB_ASSET` | the asset A offers (one the lab's faucet can send); default the newest in the lab's `GET /api/assets` |
+| `TEMPLAR_LIVE_TESTLAB_ASSET` | the asset A offers (one the lab's faucet can send); default the newest in the lab's `GET /api/assets` — set it to the issued test asset when `templar-testlab smoke` has issued newer tokens the lab can no longer pay out (`elementsd sendtoaddress: Insufficient funds`) |
 
 One run takes about a minute (most of it waiting for the book's watcher,
 which runs every 60 s) and makes one public-faucet request (0.01 BTC);
