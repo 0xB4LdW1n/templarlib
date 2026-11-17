@@ -158,11 +158,16 @@ pub struct BitcoinChainView {
 }
 
 impl BitcoinChainView {
-    /// Connects to `electrum_url` (`tcp://host:port` or `ssl://host:port`,
-    /// the format of [`crate::BitcoinBackend::electrum_url`]; no scheme =
-    /// `tcp`). TLS certificates are validated against the host.
-    pub fn connect(electrum_url: &str) -> Result<Self, TemplarError> {
-        Self::connect_with(electrum_url, ELECTRUM_BUDGET)
+    /// Connects to `backend`'s Electrum server and checks it is on the
+    /// backend's chain (its block 0 is that network's genesis,
+    /// [`crate::bitcoin::wallet::require_genesis`]). TLS certificates are
+    /// validated against the host.
+    pub fn connect(backend: &crate::BitcoinBackend) -> Result<Self, TemplarError> {
+        let view = Self::connect_with(&backend.electrum_url, ELECTRUM_BUDGET)?;
+        let got = view.block_hash_at(0)?.to_string();
+        crate::bitcoin::wallet::require_genesis(backend.network, &got)
+            .map_err(|e| chain_err("Bitcoin Electrum", e))?;
+        Ok(view)
     }
 
     /// [`Self::connect`] with explicit budgets (tests use short ones).
@@ -708,6 +713,21 @@ mod tests {
         );
         assert!(BitcoinChainView::connect_with("udp://h:1", short).is_err());
         assert!(BitcoinChainView::connect_with("tcp://nohostport", short).is_err());
+    }
+
+    #[test]
+    fn the_chain_view_refuses_a_server_on_another_chain() {
+        use bdk::bitcoin::Network;
+        let testnet_server = crate::bitcoin::wallet::mock_electrum(Network::Testnet);
+        let err = BitcoinChainView::connect(&crate::BitcoinBackend::regtest(&testnet_server))
+            .err()
+            .expect("a testnet server for a regtest wallet")
+            .to_string();
+        assert!(err.contains("not on Bitcoin regtest"), "{err}");
+        let regtest_server = crate::bitcoin::wallet::mock_electrum(Network::Regtest);
+        assert!(
+            BitcoinChainView::connect(&crate::BitcoinBackend::regtest(&regtest_server)).is_ok()
+        );
     }
 
     #[test]

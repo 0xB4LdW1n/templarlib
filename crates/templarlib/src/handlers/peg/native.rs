@@ -551,7 +551,7 @@ fn refresh_pegin(state: &AppState, t: &NativePegTerms, o: &mut StoredOrder) -> R
         AWAITING_DEPOSIT | DEPOSIT_SEEN | CONFIRMING | CLAIMABLE | SETTLING | COMPLETED => {}
         _ => return Ok(()),
     }
-    let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+    let view = BitcoinChainView::connect(&state.bitcoin_backend()).map_err(s)?;
     let spk = deposit_script(o)?;
     let history = view.history(&spk).map_err(s)?;
     let tip = view.tip_height().map_err(s)?;
@@ -744,7 +744,7 @@ fn find_payout(
 ) -> Result<(), String> {
     let n = native_of(o)?;
     let spk = bitcoin_script(hex_field(&n.payout_script_hex, "payout script")?)?;
-    let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+    let view = BitcoinChainView::connect(&state.bitcoin_backend()).map_err(s)?;
     let history = view.history(&spk).map_err(s)?;
     let amount = o.order.deposit_expected_sats;
     let recorded = o.order.txid_payout.clone();
@@ -824,7 +824,7 @@ pub(super) fn fund(
 
 /// Pays the peg-in address from the wallet's own Bitcoin.
 fn fund_pegin(state: &AppState, o: &mut StoredOrder, fee_rate: Option<f32>) -> Result<(), String> {
-    let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+    let view = BitcoinChainView::connect(&state.bitcoin_backend()).map_err(s)?;
     if let Some(raw) = native_of(o)?.pending_deposit_tx.clone() {
         // Signed before but not seen on chain: the same bytes again.
         let bytes = hex::decode(raw).map_err(|e| format!("Stored deposit: {e}"))?;
@@ -889,7 +889,7 @@ fn fund_pegout(state: &AppState, t: &NativePegTerms, o: &mut StoredOrder) -> Res
         let dest = bitcoin_script(hex_field(&n.payout_script_hex, "payout script")?)?;
         let script = liquid_script(hex_field(&n.pegout_script_hex, "peg-out script")?)?;
         let genesis = state.liquid_network.elements().parent_genesis_hash();
-        let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+        let view = BitcoinChainView::connect(&state.bitcoin_backend()).map_err(s)?;
         if view.block_hash_at(0).map_err(s)? != genesis {
             return Err(PegError::Build(
                 "the Bitcoin chain's genesis is not the one this Liquid chain is pegged to".into(),
@@ -1044,7 +1044,7 @@ pub(super) fn claim(
         .find(|d| d.outpoint() == target)
         .ok_or_else(|| not_ready(format!("no deposit {target} on this order.")))?
         .clone();
-    let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+    let view = BitcoinChainView::connect(&state.bitcoin_backend()).map_err(s)?;
     let tip = view.tip_height().map_err(s)?;
     match claim_step(&d, tip, t.pegin_confirmations)? {
         ClaimStep::Build => build_claim(state, t, o, &d, &view),

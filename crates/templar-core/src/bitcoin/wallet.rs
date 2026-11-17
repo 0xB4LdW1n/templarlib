@@ -186,6 +186,47 @@ fn make_electrum_blockchain(url: &str) -> Result<ElectrumBlockchain, TemplarErro
     .map_err(|e| BitcoinError::SyncFailed(format!("Electrum connection failed: {e}")).into())
 }
 
+/// Genesis block hash (display hex) of `network`: what a server for it
+/// must have at height 0.
+pub fn genesis_hash_hex(network: Network) -> String {
+    bdk::bitcoin::blockdata::constants::genesis_block(network)
+        .block_hash()
+        .to_string()
+}
+
+/// Refuses a server whose block 0 (`got`, display hex) is not `network`'s
+/// genesis. Regtest and testnet wallets derive the same keys and scripts:
+/// a regtest wallet pointed at a testnet server (`TEMPLAR_ELECTRUM_URL`)
+/// would otherwise see, and could spend, real testnet coins — and the
+/// reverse.
+pub fn require_genesis(network: Network, got: &str) -> Result<(), String> {
+    let want = genesis_hash_hex(network);
+    if !got.eq_ignore_ascii_case(&want) {
+        let name = match network {
+            Network::Regtest => "Bitcoin regtest",
+            _ => "Bitcoin testnet",
+        };
+        return Err(format!(
+            "the Bitcoin Electrum server is not on {name}: its block 0 is {got}, not {want}"
+        ));
+    }
+    Ok(())
+}
+
+/// An Electrum client for `backend`, after checking the server is on the
+/// backend's chain ([`require_genesis`]). Every sync, broadcast and lookup
+/// of a [`WalletManager`] goes through here.
+fn electrum_for(backend: &BitcoinBackend) -> Result<ElectrumBlockchain, TemplarError> {
+    let chain = make_electrum_blockchain(&backend.electrum_url)?;
+    let got = chain
+        .block_header(0)
+        .map_err(|e| BitcoinError::SyncFailed(format!("Electrum genesis check: {e}")))?
+        .block_hash()
+        .to_string();
+    require_genesis(backend.network, &got).map_err(BitcoinError::SyncFailed)?;
+    Ok(chain)
+}
+
 /// Maps a sled open failure to an actionable message. The raw sled text for a
 /// held lock ("could not acquire lock") used to surface as "Invalid
 /// descriptor", sending users down the wrong path entirely.
@@ -292,8 +333,11 @@ fn vsize_from_target(fee_sats: u64, fee_rate: f32) -> usize {
 /// Resolve an incoming transaction's fee from its prevouts. BDK cannot know
 /// this from a wallet-only sync because the sender's inputs are foreign. This
 /// network lookup runs only when the user opens a CPFP preview.
-fn transaction_fee_from_electrum(tx: &Transaction, url: &str) -> Result<u64, TemplarError> {
-    let chain = make_electrum_blockchain(url)?;
+fn transaction_fee_from_electrum(
+    tx: &Transaction,
+    backend: &BitcoinBackend,
+) -> Result<u64, TemplarError> {
+    let chain = electrum_for(backend)?;
     let mut input_total = 0u64;
     for input in &tx.input {
         let previous = chain
@@ -692,7 +736,7 @@ impl WalletManager {
         // Connect on demand: the wallet must open (and derive addresses) fully
         // offline, so the Electrum connection only exists while syncing. A
         // fresh connection per sync also survives servers dropping idle links.
-        let blockchain = make_electrum_blockchain(&self.backend.electrum_url)?;
+        let blockchain = electrum_for(&self.backend)?;
         let this = std::panic::AssertUnwindSafe(self);
         catch_bdk(move || {
             this.wallet
@@ -1130,7 +1174,7 @@ impl WalletManager {
 
     /// Broadcasts a signed transaction.
     pub fn broadcast(&self, tx: Transaction) -> Result<Txid, TemplarError> {
-        make_electrum_blockchain(&self.backend.electrum_url)?
+        electrum_for(&self.backend)?
             .broadcast(&tx)
             .map_err(|e| BitcoinError::BroadcastFailed(e.to_string()))?;
         Ok(tx.txid())
@@ -1140,7 +1184,7 @@ impl WalletManager {
     /// Electrum server. Cross-chain swaps use this to verify the counterparty's
     /// HTLC funding output instead of trusting localhost coordinator state.
     pub fn fetch_transaction(&self, txid: &Txid) -> Result<Option<Transaction>, TemplarError> {
-        make_electrum_blockchain(&self.backend.electrum_url)?
+        electrum_for(&self.backend)?
             .get_tx(txid)
             .map_err(|e| BitcoinError::SyncFailed(format!("Fetch transaction: {e}")).into())
     }
@@ -1376,7 +1420,7 @@ impl WalletManager {
             .ok_or_else(|| BitcoinError::TxBuildFailed("Raw transaction unavailable".into()))?;
         let parent_fee = match details.fee {
             Some(fee) => fee,
-            None => transaction_fee_from_electrum(parent, &self.backend.electrum_url)?,
+            None => transaction_fee_from_electrum(parent, &self.backend)?,
         };
         let old_rate = parent_fee as f32 / caps.vsize as f32;
         require_higher_fee_rate(target_fee_rate, old_rate)?;
@@ -1691,8 +1735,82 @@ impl WalletManager {
 }
 
 #[cfg(test)]
+use serde_json::json;
+
+/// A loopback Electrum server whose chain is `network`'s: it answers
+/// `server.version` and `blockchain.block.header` (with that network's
+/// genesis header for every height) and refuses the rest. Returns
+/// `tcp://127.0.0.1:port`.
+#[cfg(test)]
+pub(crate) fn mock_electrum(network: Network) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let header = bdk::bitcoin::consensus::encode::serialize_hex(
+        &bdk::bitcoin::blockdata::constants::genesis_block(network).header,
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("tcp://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let header = header.clone();
+            std::thread::spawn(move || {
+                let mut out = stream.try_clone().unwrap();
+                for line in BufReader::new(stream).lines() {
+                    let Ok(line) = line else { return };
+                    let Ok(req) = serde_json::from_str::<serde_json::Value>(&line) else {
+                        return;
+                    };
+                    let id = req["id"].clone();
+                    let answer = match req["method"].as_str() {
+                        Some("server.version") => {
+                            json!({"jsonrpc":"2.0","id":id,"result":["mock","1.4"]})
+                        }
+                        Some("blockchain.block.header") => {
+                            json!({"jsonrpc":"2.0","id":id,"result":header})
+                        }
+                        _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":"no"}}),
+                    };
+                    if writeln!(out, "{answer}").is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    const ABANDON: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+                           abandon abandon abandon about";
+
+    /// Regtest and testnet derive the same scripts: a regtest wallet must
+    /// never sync or broadcast through a testnet server (nor the reverse).
+    #[test]
+    fn a_server_on_another_bitcoin_chain_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let testnet_server = mock_electrum(Network::Testnet);
+        let regtest = BitcoinBackend::regtest(&testnet_server);
+        let w = WalletManager::new_on(&regtest, dir.path(), ABANDON).unwrap();
+        let err = w.sync().unwrap_err().to_string();
+        assert!(err.contains("not on Bitcoin regtest"), "{err}");
+        let tx = Transaction {
+            version: 2,
+            lock_time: bdk::bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let err = w.broadcast(tx).unwrap_err().to_string();
+        assert!(err.contains("not on Bitcoin regtest"), "{err}");
+        // The genesis check itself.
+        assert!(require_genesis(Network::Regtest, &genesis_hash_hex(Network::Regtest)).is_ok());
+        let err =
+            require_genesis(Network::Testnet, &genesis_hash_hex(Network::Regtest)).unwrap_err();
+        assert!(err.contains("not on Bitcoin testnet"), "{err}");
+    }
 
     // 12-word test vectors (BIP39 "abandon…about" and a second fixed phrase).
     const MN_A: &str =

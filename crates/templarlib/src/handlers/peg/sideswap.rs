@@ -238,7 +238,7 @@ pub(super) fn start(
     } else {
         let spk =
             core_peg::bitcoin_script_for(n.payout_address, bitcoin::Network::Testnet).map_err(s)?;
-        BitcoinChainView::connect(&state.bitcoin_backend().electrum_url)
+        BitcoinChainView::connect(&state.bitcoin_backend())
             .and_then(|v| v.history(&spk))
             .map_err(s)?
             .into_iter()
@@ -468,7 +468,7 @@ fn payout_verified(
     } else {
         let spk = core_peg::bitcoin_script_for(&o.order.payout_address, bitcoin::Network::Testnet)
             .map_err(s)?;
-        let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+        let view = BitcoinChainView::connect(&state.bitcoin_backend()).map_err(s)?;
         let Some(item) = view
             .history(&spk)
             .map_err(s)?
@@ -545,7 +545,7 @@ pub(super) fn fund(
     open_software_wallet(state, &o.order.wallet_id)?;
     let pending = state_of(o)?.pending_deposit_tx.clone();
     if o.order.direction == "in" {
-        let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+        let view = BitcoinChainView::connect(&state.bitcoin_backend()).map_err(s)?;
         if let Some(raw) = pending {
             let bytes = hex::decode(raw).map_err(|e| format!("Stored deposit: {e}"))?;
             view.broadcast_raw(&bytes).map_err(s)?;
