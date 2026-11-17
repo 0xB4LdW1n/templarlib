@@ -540,11 +540,14 @@ pub fn list_my_offers(state: &AppState, wallet_id: &str) -> Result<Vec<MyOfferDt
 pub fn cancel(state: &AppState, wallet_id: &str, offer_id: &str) -> Result<String, String> {
     let liq = state.liquid.as_ref().ok_or("Liquid wallet not open")?;
     let mut store = load_store(&state.data_dir)?;
+    // Only an offer of the active network: another network's coin cannot
+    // be spent on this chain.
+    let network = state.liquid_network.name();
     let stored = store
         .offers
         .iter_mut()
-        .find(|o| o.wallet_id == wallet_id && o.offer.offer_id == offer_id)
-        .ok_or_else(|| format!("Unknown swap offer: {offer_id}"))?;
+        .find(|o| o.wallet_id == wallet_id && o.offer.offer_id == offer_id && o.is_on(network))
+        .ok_or_else(|| format!("Unknown swap offer on {network}: {offer_id}"))?;
     if stored.offer.status != "open" {
         return Err(format!(
             "Offer can no longer be cancelled (status: {})",

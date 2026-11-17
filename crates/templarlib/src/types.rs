@@ -311,6 +311,10 @@ pub struct DashboardDto {
     /// this wallet is open on.
     #[serde(default)]
     pub liquid_network: String,
+    /// `bitcoin-testnet` | `bitcoin-regtest` — the network the Bitcoin side
+    /// of this wallet is open on (regtest beside a lab's Liquid regtest).
+    #[serde(default)]
+    pub bitcoin_network: String,
 }
 
 /// The active Liquid network and how the chain is reached.

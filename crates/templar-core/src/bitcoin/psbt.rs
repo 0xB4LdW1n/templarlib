@@ -169,6 +169,17 @@ pub fn inspect_psbt(
     psbt_base64: &str,
     wallet: Option<&WalletManager>,
 ) -> Result<PsbtInspectionResult, TemplarError> {
+    inspect_psbt_on(psbt_base64, wallet, Network::Testnet)
+}
+
+/// [`inspect_psbt`], with outputs rendered on `network` when no wallet is
+/// given (with one, on the wallet's own network).
+pub fn inspect_psbt_on(
+    psbt_base64: &str,
+    wallet: Option<&WalletManager>,
+    network: Network,
+) -> Result<PsbtInspectionResult, TemplarError> {
+    let fallback_network = network;
     let psbt = WalletManager::psbt_from_base64(psbt_base64)?;
 
     // Inputs, priced the way the signer prices them.
@@ -200,7 +211,7 @@ pub fn inspect_psbt(
         .output
         .iter()
         .map(|out| {
-            let network = wallet.map_or(Network::Testnet, |w| w.network());
+            let network = wallet.map_or(fallback_network, |w| w.network());
             let address = Address::from_script(&out.script_pubkey, network)
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "undecodable script".to_string());
@@ -567,6 +578,19 @@ mod tests {
         let b64 = WalletManager::psbt_to_base64(&psbt);
         let seen = inspect_psbt(&b64, None).unwrap();
         assert_eq!(seen.utxo_check, UtxoStatus::Missing);
+        // With no wallet, outputs read on the network asked for: testnet by
+        // default, Bitcoin regtest beside a lab.
+        assert!(
+            seen.outputs[0].address.starts_with("tb1"),
+            "{}",
+            seen.outputs[0].address
+        );
+        let on_regtest = inspect_psbt_on(&b64, None, Network::Regtest).unwrap();
+        assert!(
+            on_regtest.outputs[0].address.starts_with("bcrt1"),
+            "{}",
+            on_regtest.outputs[0].address
+        );
         assert_eq!(seen.fee_sats, None);
         assert!(check_input_utxos(&psbt).is_err());
 

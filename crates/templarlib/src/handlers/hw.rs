@@ -302,7 +302,7 @@ pub fn import_hw_wallet(
         entry = entry.with_liquid_descriptor(desc);
     }
 
-    let summary = summary_of(&entry);
+    let summary = summary_of(state.wallet_network_label(), &entry);
     state.registry.add(entry);
     state.save_registry()?;
 
@@ -373,6 +373,7 @@ pub fn add_liquid_to_wallet(
     let descriptor =
         templar_core::validate_ct_descriptor(&descriptor).map_err(|e| e.to_string())?;
 
+    let network = state.wallet_network_label();
     let stored = state
         .registry
         .find_mut(wallet_id)
@@ -383,7 +384,7 @@ pub fn add_liquid_to_wallet(
         asset_metadata: Vec::new(),
     });
     stored.liquid_enabled = true;
-    let summary = summary_of(stored);
+    let summary = summary_of(network, stored);
     state.save_registry()?;
     Ok(summary)
 }
@@ -394,7 +395,7 @@ pub fn add_liquid_to_wallet(
 /// network flags and the type label have to agree with what was actually
 /// persisted, and hand-written copies of them are how a wallet ended up
 /// advertising a Liquid side it did not have.
-fn summary_of(entry: &WalletEntry) -> WalletSummaryDto {
+fn summary_of(network: &str, entry: &WalletEntry) -> WalletSummaryDto {
     let device_model = match &entry.profile {
         WalletProfile::HardwareWallet { device_model, .. } => Some(device_model.clone()),
         _ => None,
@@ -413,7 +414,7 @@ fn summary_of(entry: &WalletEntry) -> WalletSummaryDto {
         id: entry.id.clone(),
         name: entry.name.clone(),
         wallet_type: "watch_only".to_string(),
-        network: "testnet".to_string(),
+        network: network.to_string(),
         balance_sats: 0,
         tx_count: 0,
         last_sync_at: unix_now(),
@@ -502,7 +503,7 @@ pub fn create_watch_only_wallet(
     if let Some(descriptor) = liquid_ct {
         entry = entry.with_liquid_descriptor(descriptor);
     }
-    let summary = summary_of(&entry);
+    let summary = summary_of(state.wallet_network_label(), &entry);
     state.registry.add(entry);
     state.save_registry()?;
 
@@ -614,8 +615,13 @@ pub fn import_jade_liquid_wallet(
     let entry =
         WalletEntry::new(name.trim().to_string(), String::new(), profile).with_liquid_enabled(true);
     let summary = WalletSummaryDto {
-        network: "liquid_testnet".to_string(),
-        ..summary_of(&entry)
+        network: if state.liquid_network.is_regtest() {
+            "liquid_regtest"
+        } else {
+            "liquid_testnet"
+        }
+        .to_string(),
+        ..summary_of(state.wallet_network_label(), &entry)
     };
     state.registry.add(entry);
     state.save_registry()?;
@@ -727,7 +733,7 @@ mod tests {
             },
         )
         .with_liquid_enabled(true);
-        let summary = summary_of(&entry);
+        let summary = summary_of(st.wallet_network_label(), &entry);
         assert!(
             !summary.bitcoin_enabled,
             "a ct() profile has no Bitcoin side to show"

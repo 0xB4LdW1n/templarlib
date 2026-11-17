@@ -2392,6 +2392,56 @@ fn joining_a_lab_applies_its_regtest_and_order_book_only() {
     assert!(!cfg.contains("test_server"), "{cfg}");
 }
 
+/// On a lab's regtest every method that names a network says regtest, and
+/// nothing testnet-only is offered or contacted.
+#[test]
+fn on_a_labs_regtest_every_network_name_is_regtest() {
+    let mut env = TestEnv::new();
+    let id = env.create_test_wallet();
+    let wallets = env.ok("list_wallets", json!({}));
+    assert_eq!(wallets[0]["network"], json!("testnet"));
+    let info = env.ok("get_wallet_info", json!({ "wallet_id": id }));
+    assert_eq!(info["network"], json!("Testnet"));
+
+    let (lab, _) = lab_server(&"66".repeat(32));
+    env.ok("set_test_server", json!({ "url": lab }));
+    let wallets = env.ok("list_wallets", json!({}));
+    assert_eq!(wallets[0]["network"], json!("regtest"));
+    let info = env.ok("get_wallet_info", json!({ "wallet_id": id }));
+    assert_eq!(info["network"], json!("Regtest"));
+    assert_eq!(info["liquid_network"], json!("liquid-regtest"));
+    let dash = env.ok("get_wallet_summary", json!({ "wallet_id": id }));
+    assert_eq!(dash["bitcoin_network"], json!("bitcoin-regtest"));
+    assert_eq!(dash["liquid_network"], json!("liquid-regtest"));
+    let lbtc = dash["assets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["ticker"] == json!("LBTC"))
+        .expect("an LBTC row");
+    assert_eq!(lbtc["asset_id"], json!(LAB_POLICY));
+    // Testnet-only services: empty or refused, nothing contacted.
+    assert_eq!(
+        env.ok("atomic_swap_list", json!({ "wallet_id": id })),
+        json!([])
+    );
+    let err = env.err(
+        "atomic_swap_create",
+        json!({ "wallet_id": id, "direction": "btc-to-liquid", "btc_amount_sats": 1,
+                "liquid_asset_id": LAB_POLICY, "liquid_ticker": "LBTC",
+                "liquid_name": "x", "liquid_amount_sats": 1 }),
+    );
+    assert!(err.contains("require Liquid testnet"), "{err}");
+    let net = env.ok("get_liquid_network", json!({}));
+    assert_eq!(net["peg_provider"], json!("native"));
+    // Back on testnet, testnet again.
+    env.ok("set_liquid_network", json!({ "network": "testnet" }));
+    let dash = env.ok("get_wallet_summary", json!({ "wallet_id": id }));
+    assert_eq!(dash["bitcoin_network"], json!("bitcoin-testnet"));
+    let wallets = env.ok("list_wallets", json!({}));
+    assert_eq!(wallets[0]["network"], json!("testnet"));
+}
+
 /// A wallet created and opened on testnet BEFORE the engine joins a lab
 /// (the order a manual tester takes) must come back, in the same engine,
 /// entirely on the lab's chains: Bitcoin regtest with its own database

@@ -4,8 +4,8 @@ use std::str::FromStr;
 
 use templar_core::bitcoin::wallet::refuse_frozen_inputs;
 use templar_core::{
-    check_input_utxos, inspect_psbt, public_descriptor, BitcoinTxid, CoinChain, WalletManager,
-    WalletProfile,
+    check_input_utxos, inspect_psbt, inspect_psbt_on, public_descriptor, BitcoinTxid, CoinChain,
+    WalletManager, WalletProfile,
 };
 
 use crate::handlers::asset_names::{self, FROM_WALLET};
@@ -207,6 +207,7 @@ pub fn get_dashboard(state: &AppState, wallet_id: &str) -> Result<DashboardDto, 
         assets,
         recent_activity,
         liquid_network: state.liquid_network.name().to_string(),
+        bitcoin_network: state.bitcoin_backend().network_name().to_string(),
     })
 }
 
@@ -825,7 +826,13 @@ pub fn get_wallet_info(state: &AppState, wallet_id: &str) -> Result<WalletInfoDt
     Ok(WalletInfoDto {
         id: entry.id.clone(),
         name: entry.name.clone(),
-        network: "Testnet".to_string(),
+        // The Bitcoin network the wallet runs on now (keys are the same).
+        network: if state.bitcoin_backend().network == bdk::bitcoin::Network::Regtest {
+            "Regtest"
+        } else {
+            "Testnet"
+        }
+        .to_string(),
         master_fingerprint: fingerprint,
         derivation_path: path,
         script_type,
@@ -1316,7 +1323,14 @@ pub fn inspect_psbt_handler(
     state: &AppState,
     psbt_base64: &str,
 ) -> Result<PsbtInspectionDto, String> {
-    let result = inspect_psbt(psbt_base64, state.bitcoin.as_ref()).map_err(|e| e.to_string())?;
+    // With no wallet open, addresses are still those of the active Bitcoin
+    // network (bcrt1… beside a lab's regtest).
+    let result = inspect_psbt_on(
+        psbt_base64,
+        state.bitcoin.as_ref(),
+        state.bitcoin_backend().network,
+    )
+    .map_err(|e| e.to_string())?;
 
     let inputs = result
         .inputs

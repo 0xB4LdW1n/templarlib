@@ -39,8 +39,8 @@ pub use bitcoin::multisig::{
     MultisigSetupInfo,
 };
 pub use bitcoin::psbt::{
-    check_input_utxos, inspect_psbt, PsbtInputInfo, PsbtInspectionResult, PsbtOutputInfo,
-    PsbtSignerInfo, UtxoStatus,
+    check_input_utxos, inspect_psbt, inspect_psbt_on, PsbtInputInfo, PsbtInspectionResult,
+    PsbtOutputInfo, PsbtSignerInfo, UtxoStatus,
 };
 pub use bitcoin::wallet::{
     BitcoinBackend, FeeBumpCapabilities, FeeBumpPlan, TxPreviewIo, WalletManager,

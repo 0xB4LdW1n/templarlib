@@ -426,6 +426,16 @@ impl AppState {
         self.endpoints().bitcoin_backend(&self.liquid_network).value
     }
 
+    /// The test network a wallet opens on now, as wallet summaries name it:
+    /// `regtest` beside a lab's regtest (Bitcoin regtest), else `testnet`.
+    pub fn wallet_network_label(&self) -> &'static str {
+        if self.bitcoin_backend().network == bdk::bitcoin::Network::Regtest {
+            "regtest"
+        } else {
+            "testnet"
+        }
+    }
+
     /// Loads this session's config (or seeds one), applies `change` and
     /// saves it. Seeds with the folder the config *should* name, never a
     /// `TEMPLAR_DATA_DIR` scratch folder.
