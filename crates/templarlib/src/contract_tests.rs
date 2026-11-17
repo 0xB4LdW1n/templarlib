@@ -2749,13 +2749,40 @@ fn the_order_books_registry_names_what_the_wallet_does_not_know() {
     assert_eq!(mine[0]["offers"]["display_amount"], json!("100.00"));
     assert_eq!(mine[0]["wants"]["metadata_source"], json!("wallet"));
 
-    // The book loses its registry: the list still works and keeps the names
-    // cached (and within the refresh interval nothing is asked again).
+    // The book loses its registry: the list still works (it asked again)
+    // and keeps the names cached.
     *registry.lock().unwrap() = (404, "not found".into());
     let asked = book.requests().len();
     let rows = env.ok("list_markets", json!({}));
-    assert_eq!(book.requests().len(), asked + 1, "only the markets feed");
+    assert_eq!(
+        book.requests().len(),
+        asked + 2,
+        "the registry, then the feed"
+    );
     assert_eq!(rows[0]["maker_gives"]["ticker"], json!("TMPL"));
+    assert_eq!(rows[0]["maker_gives"]["metadata_source"], json!("book"));
+}
+
+/// The live failure, offline: a token registered after the last read of
+/// the registry (the buyer synced before the issuer issued) must be named
+/// from the registry by the very next `list_markets`, not left to the
+/// feed's text. Precedence: the wallet, then the registry, then the feed.
+#[test]
+fn list_markets_names_an_asset_registered_seconds_ago_from_the_registry() {
+    let empty = json!({"network": "liquid-testnet", "assets": []}).to_string();
+    let registry = std::sync::Arc::new(std::sync::Mutex::new((200u16, empty)));
+    let book = registry_book(registry.clone());
+    let (mut env, _) = swap_env(&book.url, MNEMONIC);
+    let rows = env.ok("list_markets", json!({}));
+    assert_eq!(rows[0]["maker_gives"]["metadata_source"], json!("feed"));
+    assert_eq!(rows[0]["maker_gives"]["ticker"], json!("80D249A8"));
+    // Registered now; listed again at once.
+    *registry.lock().unwrap() = (200, registry_answer());
+    let rows = env.ok("list_markets", json!({}));
+    let gives = &rows[0]["maker_gives"];
+    assert_eq!(gives["metadata_source"], json!("book"), "{gives}");
+    assert_eq!(gives["ticker"], json!("TMPL"));
+    assert_eq!(gives["display_amount"], json!("100.00"));
 }
 
 #[test]

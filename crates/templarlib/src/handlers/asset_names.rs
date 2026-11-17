@@ -239,17 +239,29 @@ fn store(state: &mut AppState, key: String, assets: Vec<BookAsset>) {
     state.book_assets.key = Some(key);
 }
 
-/// Reads the active book's registry again, best-effort: a book without one,
-/// an unreachable book or a garbage answer keeps what is cached and is only
-/// logged. Asks at most once per [`REFRESH_EVERY`] per book. Network paths
-/// only (`sync_wallet`, `list_markets`).
+/// Reads the active book's registry again for `sync_wallet`, best-effort:
+/// a book without one, an unreachable book or a garbage answer keeps what
+/// is cached and is only logged. Asks at most once per [`REFRESH_EVERY`]
+/// per book (a sync loop does not hammer the book).
 pub fn refresh(state: &mut AppState) {
+    read_registry(state, true);
+}
+
+/// [`refresh`] without the interval, for `list_markets`: the rows it is
+/// about to name may carry an asset registered seconds ago (a token just
+/// issued and offered), and a cached list from the last sync would leave
+/// it to the feed's own text.
+pub fn refresh_now(state: &mut AppState) {
+    read_registry(state, false);
+}
+
+fn read_registry(state: &mut AppState, throttled: bool) {
     let key = current_key(state);
     if state.book_assets.key.as_deref() != Some(key.as_str()) {
         reload(state);
     }
     if let Some((last, at)) = &state.book_assets.last_attempt {
-        if *last == key && at.elapsed() < REFRESH_EVERY {
+        if throttled && *last == key && at.elapsed() < REFRESH_EVERY {
             return;
         }
     }
@@ -430,9 +442,12 @@ mod tests {
         refresh(&mut state);
         assert_eq!(display(&state, &tmpl).ticker, "TMPL");
         assert_eq!(display(&state, &policy).precision, 8, "never re-scaled");
-        // Within the refresh interval nothing is asked again.
+        // Within the refresh interval a sync asks nothing again; a market
+        // listing always asks.
         refresh(&mut state);
         assert_eq!(book.requests().len(), 1);
+        refresh_now(&mut state);
+        assert_eq!(book.requests().len(), 2);
         let raw = std::fs::read_to_string(state.data_dir.join(CACHE_FILE)).unwrap();
         assert!(
             raw.contains("TMPL") && !raw.contains("Renamed policy"),
@@ -447,7 +462,7 @@ mod tests {
         again.test_server = Some(profile);
         reload(&mut again);
         assert_eq!(display(&again, &tmpl).ticker, "TMPL");
-        assert_eq!(book.requests().len(), 1);
+        assert_eq!(book.requests().len(), 2, "nothing asked by the reload");
         // A tampered cache is checked like an answer.
         let mut file = load_file(&again.data_dir);
         for b in file.books.values_mut() {

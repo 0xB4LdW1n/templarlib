@@ -862,8 +862,10 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         "list_markets" => {
             let p: swaps::ListMarketsParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
-            // Names of the listed assets, best-effort (never fails the list).
-            asset_names::refresh(state);
+            // Names of the listed assets, read now (an asset registered
+            // since the last sync is named from the registry, not the
+            // feed); best-effort, never fails the list.
+            asset_names::refresh_now(state);
             swaps::list_markets(state, p.include_unavailable)
                 .map(|v| serde_json::to_value(v).unwrap())
         }

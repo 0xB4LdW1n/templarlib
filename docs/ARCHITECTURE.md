@@ -240,14 +240,15 @@ hand) > **default**.
   nothing is contacted.
 - **Asset registry** (`templar_core::liquid::book_assets`,
   `handlers::asset_names`). The active book's `GET …/api/assets` is read in
-  the network paths only (`sync_wallet`, `list_markets`; 6 s, 1 MiB, at
-  most every 20 s), best-effort, and cached on disk so offline calls keep
-  the names. It is display metadata from an untrusted server: at most
+  the network paths only (`list_markets` every time, `sync_wallet` at most
+  every 20 s; 6 s, 1 MiB), best-effort, and cached on disk so offline
+  calls keep the names. It is display metadata from an untrusted server: at most
   2 000 entries, 64-hex ids, tickers and names bounded and printable,
   precision 0–8; an entry for the policy asset, or calling another asset
   `BTC`/`LBTC`, is dropped. One resolver names every asset: the wallet's
   own knowledge (policy asset, its issuances, the built-in table), then
-  the registry (`metadata_source: "book"`), else the short id. A PSET
+  the registry (`metadata_source: "book"`), then a feed row's own text
+  (`feed`), else the short id. A PSET
   review before co-signing uses the wallet's own names only. After
   `issue_asset` the engine announces the asset (`POST …/api/assets`, the
   contract as LWK hashed it, the issuance txid and input); the book checks

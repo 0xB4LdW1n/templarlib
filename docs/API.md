@@ -174,7 +174,8 @@ table), then the active order book's public registry (`GET
 per book and network, so offline calls keep the names), else the asset
 id's first 8 hex digits with 8 decimals. A registry entry never renames or
 re-scales the policy asset, never calls another asset `BTC`/`LBTC`, and
-never overrides the wallet. Objects that name assets carry, additively,
+never overrides the wallet. Precedence: the wallet's own knowledge, then
+the book's registry, then a feed row's own text. Objects that name assets carry, additively,
 `metadata_source`: `wallet` | `book` (from the registry: show the short
 asset id beside it) | `feed` (a market or book row's own display data,
 when neither knows the asset) | `none`; where there is room also
@@ -712,8 +713,8 @@ other.
 Returns: `{btc: string, liquid: string}`, each `"ok"`, `"skipped"` (no
 side on that chain) or `"error: <reason>"`. Errors: only when the wallet
 cannot be opened. With a Liquid side it also reads the active order
-book's asset registry ([Asset names](#asset-names)), best-effort: a book
-without one, or out of reach, changes nothing.
+book's asset registry ([Asset names](#asset-names)), best-effort and at
+most every 20 s: a book without one, or out of reach, changes nothing.
 
 ### `get_wallet_summary`
 
@@ -1694,8 +1695,9 @@ u64, proposal_json, verified: bool, takeable: bool, block_reason:
 string?}]`, where `Leg` = `{chain, network, asset_id, ticker, name,
 precision: u8, amount_sats: u64, display_amount, metadata_source,
 book_source: string?}`. It first reads the active order book's asset
-registry (best-effort, at most every 20 s; never fails the list): a
-Liquid leg the wallet or the registry knows is named and scaled their way
+registry, every time (best-effort; never fails the list), so an asset
+registered seconds ago is already named from it: a Liquid leg the wallet
+or the registry knows is named and scaled their way
 (the policy asset is always `LBTC`, 8 decimals, whatever the feed says),
 otherwise the feed's own values are kept, printable and bounded, with
 `metadata_source: "feed"`. Rows with `demo: true` are display data only.
