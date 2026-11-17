@@ -130,43 +130,34 @@ pub struct MarketBookEntry {
     pub proposal_json: String,
 }
 
+/// Whole-request bound of an order-book call.
+const BOOK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Largest book or markets feed read: thousands of offers.
+pub const MAX_BOOK_BYTES: u64 = 8 * 1024 * 1024;
+/// Largest answer to a publish.
+const MAX_PUBLISH_ANSWER_BYTES: u64 = 64 * 1024;
+
+/// GETs `url` through [`crate::http`]: no redirects, bounded.
+fn get_feed(url: &str) -> Result<String, BookError> {
+    let client = crate::http::client(BOOK_TIMEOUT).map_err(BookError::Network)?;
+    let answer = crate::http::send(client.get(url), MAX_BOOK_BYTES).map_err(BookError::Network)?;
+    if !answer.status.is_success() {
+        return Err(BookError::Http(answer.status.as_u16()));
+    }
+    Ok(answer.body)
+}
+
 /// Fetches and parses the order book at `url` (10 s timeout).
 ///
 /// The caller decides the URL — `TEMPLAR_SWAP_BOOK_URL` override and the
 /// `?all` suffix for unavailable offers are the FFI layer's concern.
 pub fn fetch_book(url: &str) -> Result<Vec<BookEntry>, BookError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| BookError::Network(e.to_string()))?;
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| BookError::Network(e.to_string()))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(BookError::Http(status.as_u16()));
-    }
-    let body = resp.text().map_err(|e| BookError::Network(e.to_string()))?;
-    parse_book(&body)
+    parse_book(&get_feed(url)?)
 }
 
 /// Fetches the unified localhost markets feed.
 pub fn fetch_markets(url: &str) -> Result<Vec<MarketBookEntry>, BookError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| BookError::Network(e.to_string()))?;
-    let resp = client
-        .get(url)
-        .send()
-        .map_err(|e| BookError::Network(e.to_string()))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(BookError::Http(status.as_u16()));
-    }
-    let body = resp.text().map_err(|e| BookError::Network(e.to_string()))?;
-    parse_markets(&body)
+    parse_markets(&get_feed(url)?)
 }
 
 pub fn parse_markets(raw: &str) -> Result<Vec<MarketBookEntry>, BookError> {
@@ -194,42 +185,23 @@ pub fn publish_offer(
     proposal_json: &str,
     note: &str,
 ) -> Result<u64, BookError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| BookError::Network(e.to_string()))?;
-    let resp = client
-        .post(url)
-        .json(&PublishRequest {
-            network,
-            proposal_json,
-            note,
-        })
-        .send()
-        .map_err(|e| BookError::Network(e.to_string()))?;
-    let status = resp.status();
-    let retry_after = resp
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().parse::<u64>().ok());
-    let body = resp.text().map_err(|e| BookError::Network(e.to_string()))?;
+    let client = crate::http::client(BOOK_TIMEOUT).map_err(BookError::Network)?;
+    let request = client.post(url).json(&PublishRequest {
+        network,
+        proposal_json,
+        note,
+    });
+    let answer =
+        crate::http::send(request, MAX_PUBLISH_ANSWER_BYTES).map_err(BookError::Network)?;
+    let status = answer.status;
+    let body = answer.body;
     if !status.is_success() {
-        let message = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|value| value["error"].as_str().map(str::to_string))
-            .unwrap_or_else(|| body.trim().to_string());
         // The book's text ends up in an error string the UI shows: printable
         // characters only, bounded.
-        let message: String = message
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(240)
-            .collect();
         return Err(BookError::Rejected {
             status: status.as_u16(),
-            message,
-            retry_after,
+            message: crate::http::excerpt(&body),
+            retry_after: answer.retry_after,
         });
     }
     serde_json::from_str::<PublishResponse>(&body)
@@ -369,6 +341,46 @@ impl Default for Loose {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::http::tests::serve_raw;
+
+    #[test]
+    fn the_book_is_read_bounded_and_never_redirected() {
+        let redirect = serve_raw(
+            b"HTTP/1.1 301 Moved\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n"
+                .to_vec(),
+        );
+        let err = fetch_book(&redirect).unwrap_err().to_string();
+        assert!(err.contains("redirects"), "{err}");
+        let err = fetch_markets(&redirect).unwrap_err().to_string();
+        assert!(err.contains("redirects"), "{err}");
+        let huge = serve_raw(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_BOOK_BYTES + 1
+            )
+            .into_bytes(),
+        );
+        let err = fetch_book(&huge).unwrap_err().to_string();
+        assert!(err.contains("larger than"), "{err}");
+        // A refusal's body reaches the error only as a short printable excerpt.
+        let body = format!("\u{1b}[2J{}", "A".repeat(10_000));
+        let refuse = serve_raw(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        );
+        match publish_offer(&refuse, "liquid-testnet", "{}", "") {
+            Err(BookError::Rejected {
+                status, message, ..
+            }) => {
+                assert_eq!(status, 400);
+                assert!(message.len() <= 240 && !message.contains('\u{1b}'));
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        }
+    }
 
     /// Trimmed live capture of `https://liquidex.it/api/book` (entries 9 and
     /// 10, `qr` field dropped). Entry 10's embedded proposal ends in a

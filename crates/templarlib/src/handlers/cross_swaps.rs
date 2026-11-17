@@ -861,50 +861,43 @@ fn fetch(state: &AppState, id: u64) -> Result<AtomicSwapRow, String> {
     get_json(&format!("{}/{id}", api(state)))
 }
 
+/// Largest coordinator answer read (a swap row with two funding
+/// transactions is a few kB).
+const MAX_COORDINATOR_BYTES: u64 = 1024 * 1024;
+
 fn client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())
+    templar_core::http::client(std::time::Duration::from_secs(15))
 }
-fn response<T: for<'de> Deserialize<'de>>(r: reqwest::blocking::Response) -> Result<T, String> {
-    let status = r.status();
-    let body = r.text().map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        let msg = serde_json::from_str::<serde_json::Value>(&body)
-            .ok()
-            .and_then(|v| v["error"].as_str().map(str::to_string))
-            .unwrap_or(body);
-        return Err(format!("Order book HTTP {}: {msg}", status.as_u16()));
+/// Sends a coordinator request through `templar_core::http` (no redirects,
+/// bounded body, no URL or unbounded body in errors) and decodes the JSON.
+fn response<T: for<'de> Deserialize<'de>>(
+    request: reqwest::blocking::RequestBuilder,
+) -> Result<T, String> {
+    let answer = templar_core::http::send(request, MAX_COORDINATOR_BYTES)
+        .map_err(|e| format!("Order book: {e}"))?;
+    if !answer.status.is_success() {
+        return Err(format!(
+            "Order book HTTP {}: {}",
+            answer.status.as_u16(),
+            templar_core::http::excerpt(&answer.body)
+        ));
     }
-    serde_json::from_str(&body).map_err(|e| format!("Order book response: {e}"))
+    serde_json::from_str(&answer.body).map_err(|e| format!("Order book response: {e}"))
 }
 fn get_json<T: for<'de> Deserialize<'de>>(url: &str) -> Result<T, String> {
-    response(client()?.get(url).send().map_err(|e| e.to_string())?)
+    response(client()?.get(url))
 }
 fn post_json<T: for<'de> Deserialize<'de>>(
     url: &str,
     body: &serde_json::Value,
 ) -> Result<T, String> {
-    response(
-        client()?
-            .post(url)
-            .json(body)
-            .send()
-            .map_err(|e| e.to_string())?,
-    )
+    response(client()?.post(url).json(body))
 }
 fn put_json<T: for<'de> Deserialize<'de>>(
     url: &str,
     body: &serde_json::Value,
 ) -> Result<T, String> {
-    response(
-        client()?
-            .put(url)
-            .json(body)
-            .send()
-            .map_err(|e| e.to_string())?,
-    )
+    response(client()?.put(url).json(body))
 }
 
 fn store_path(state: &AppState) -> std::path::PathBuf {

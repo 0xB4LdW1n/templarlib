@@ -55,8 +55,7 @@ pub const ELECTRUM_BUDGET: ElectrumBudget = ElectrumBudget {
     connect: Duration::from_secs(10),
     call: Duration::from_secs(10),
 };
-/// Esplora connect and whole-request bounds.
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Esplora whole-request bound (connect: [`crate::http`]'s).
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 /// Largest raw transaction read from Esplora (hex characters): a standard
 /// transaction is at most 400 000 weight units, 400 kB, 800 000 hex.
@@ -288,36 +287,17 @@ impl BitcoinChainView {
 /// characters and decodes it. No redirects; bounded in time and size.
 fn esplora_hex(base: &str, path: &str, max_chars: u64) -> Result<Vec<u8>, TemplarError> {
     let url = format!("{}{path}", base.trim_end_matches('/'));
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .timeout(HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| chain_err("Esplora client", e))?;
-    let resp = client
-        .get(&url)
-        .send()
+    let client = crate::http::client(HTTP_TIMEOUT).map_err(|e| chain_err("Esplora client", e))?;
+    let answer = crate::http::send(client.get(&url), max_chars)
         .map_err(|e| chain_err("Esplora request", e))?;
-    let status = resp.status();
-    if !status.is_success() {
+    if !answer.status.is_success() {
         return Err(chain_err(
             "Esplora request",
-            format!("HTTP {} for {path}", status.as_u16()),
+            format!("HTTP {} for {path}", answer.status.as_u16()),
         ));
     }
-    if resp.content_length().is_some_and(|n| n > max_chars) {
-        return Err(chain_err("Esplora request", format!("{path} is too large")));
-    }
-    let mut body = Vec::new();
-    resp.take(max_chars + 1)
-        .read_to_end(&mut body)
-        .map_err(|e| chain_err("Esplora request", e))?;
-    if body.len() as u64 > max_chars {
-        return Err(chain_err("Esplora request", format!("{path} is too large")));
-    }
-    let text = std::str::from_utf8(&body)
-        .map_err(|_| chain_err("Esplora request", format!("{path} is not text")))?;
-    hex::decode(text.trim()).map_err(|_| chain_err("Esplora request", format!("{path} is not hex")))
+    hex::decode(answer.body.trim())
+        .map_err(|_| chain_err("Esplora request", format!("{path} is not hex")))
 }
 
 /// The raw deposit transaction and its merkle-block proof (bitcoind's

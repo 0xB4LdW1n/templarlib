@@ -10,6 +10,7 @@ pub mod derivation;
 pub mod endpoints;
 pub mod error;
 pub mod frozen;
+pub mod http;
 pub mod liquid;
 pub(crate) mod net;
 pub mod peg;

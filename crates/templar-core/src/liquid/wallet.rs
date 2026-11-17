@@ -153,21 +153,19 @@ fn register_asset_contract(asset_id: &str, contract: &lwk_wollet::Contract) -> b
         serde_json::to_string(&contract_value).unwrap_or_default()
     );
 
-    match reqwest::blocking::Client::new()
-        .post(url)
-        .json(&body)
-        .send()
-    {
-        Ok(resp) if resp.status().is_success() => {
+    let sent = crate::http::client(REGISTRY_TIMEOUT)
+        .and_then(|c| crate::http::send(c.post(url).json(&body), MAX_REGISTRY_BYTES));
+    match sent {
+        Ok(answer) if answer.status.is_success() => {
             eprintln!("[Registry] Asset {} registered successfully", asset_id);
             true
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let body_text = resp.text().unwrap_or_default();
+        Ok(answer) => {
             eprintln!(
                 "[Registry] Registration failed for {}: HTTP {} — {}",
-                asset_id, status, body_text
+                asset_id,
+                answer.status,
+                crate::http::excerpt(&answer.body)
             );
             false
         }
@@ -187,12 +185,19 @@ fn register_asset_contract(asset_id: &str, contract: &lwk_wollet::Contract) -> b
 fn fetch_asset_contract_testnet(asset_id: &str) -> Result<serde_json::Value, String> {
     let url = format!("https://assets-testnet.blockstream.info/{}", asset_id);
     eprintln!("[Registry] Fetching asset: {}", url);
-    let resp = reqwest::blocking::get(&url).map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("registry fetch failed: HTTP {}", resp.status()));
+    let answer = crate::http::client(REGISTRY_TIMEOUT)
+        .and_then(|c| crate::http::send(c.get(&url), MAX_REGISTRY_BYTES))?;
+    if !answer.status.is_success() {
+        return Err(format!("registry fetch failed: HTTP {}", answer.status));
     }
-    resp.json::<serde_json::Value>().map_err(|e| e.to_string())
+    serde_json::from_str(&answer.body).map_err(|e| e.to_string())
 }
+
+/// Whole-request bound of a registry call (it had none: a stalled server
+/// held the engine).
+const REGISTRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Largest registry answer read: one asset's contract.
+const MAX_REGISTRY_BYTES: u64 = 256 * 1024;
 
 /// Fetches asset metadata from the Liquid testnet registry for a given asset_id.
 ///
