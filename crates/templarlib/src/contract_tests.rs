@@ -3452,6 +3452,294 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
     );
 }
 
+/// A wallet issues its own token on a running Templar testlab and sells
+/// part of it on LiquiDEX for L-BTC; then reissues and burns some. The
+/// owner's manual test in the app, through the engine: two fresh software
+/// wallets join the lab, A gets L-BTC for fees and B L-BTC to pay (admin
+/// API); A issues "Templar Token" (`TMPL`, precision 2) with one
+/// reissuance token, prepares an exact 100.00 TMPL coin, offers it for
+/// 0.05 L-BTC and publishes it; B finds it in `list_markets`, verifies it
+/// deep, previews and takes it; both balances move by exactly the offer and
+/// the price; the book closes the offer; A reissues and burns. See
+/// docs/guides/LIVE_TESTS.md.
+#[test]
+#[ignore = "needs a running Templar testlab with its order book (TEMPLAR_LIVE_TESTLAB_URL)"]
+fn live_testlab_issue_token_and_sell_for_lbtc() {
+    let lab = std::env::var("TEMPLAR_LIVE_TESTLAB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8096".to_string());
+    let lab = lab.trim_end_matches('/').to_string();
+    let config = lab_get(&format!("{lab}/api/config"));
+    let lbtc = config["networks"]["liquid-regtest"]["policy_asset"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let book = config["orderbook_url"].as_str().unwrap().to_string();
+    let mine = || {
+        lab_post(
+            &format!("{lab}/admin/api/mine"),
+            json!({ "chain": "liquid", "blocks": 1 }),
+        );
+    };
+    let admin_pay = |address: &str, amount: &str| {
+        let r = lab_post(
+            &format!("{lab}/admin/api/send"),
+            json!({ "network": "liquid-regtest", "address": address, "asset": "lbtc",
+                    "amount": amount }),
+        );
+        eprintln!(
+            "[live] admin send {amount} L-BTC → {address}: {}",
+            r["txid"]
+        );
+    };
+    // The summary row of `asset_id` (null when absent), after a sync.
+    let summary_row = |w: &mut LabWallet, asset_id: &str| -> Value {
+        w.sync();
+        let dash = w.ok("get_wallet_summary", json!({}));
+        dash["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["asset_id"] == json!(asset_id))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+
+    let mut a = LabWallet::join(&lab, "Live issuer");
+    let mut b = LabWallet::join(&lab, "Live buyer");
+    let a_addr = a.address("LBTC");
+    let b_addr = b.address("LBTC");
+    admin_pay(&a_addr, "0.01");
+    admin_pay(&b_addr, "0.5");
+    mine();
+    a.wait_balance(&lbtc, "A funded", |x| x == 1_000_000);
+    b.wait_balance(&lbtc, "B funded", |x| x == 50_000_000);
+
+    // ── Issue: 10 000.00 TMPL and one reissuance token ─────────────────
+    const SUPPLY: i64 = 1_000_000;
+    let issued = a.ok(
+        "issue_asset",
+        json!({
+            "name": "Templar Token",
+            "ticker": "TMPL",
+            "precision": 2,
+            "domain": "templar.red",
+            "amount_sats": SUPPLY,
+            "reissuance_tokens": 1,
+        }),
+    );
+    eprintln!("[live] issue_asset: {issued}");
+    assert_keys(
+        "issue_asset",
+        &issued,
+        &[
+            "asset_id",
+            "token_id",
+            "txid",
+            "registry_registered",
+            "proof_url",
+            "proof_content",
+        ],
+    );
+    // No public registry on regtest: not attempted.
+    assert_eq!(issued["registry_registered"], json!(false), "{issued}");
+    let tmpl = issued["asset_id"].as_str().unwrap().to_string();
+    let token = issued["token_id"]
+        .as_str()
+        .expect("a reissuance token")
+        .to_string();
+    mine();
+    a.wait_balance(&tmpl, "A issued", |x| x == SUPPLY);
+    a.wait_balance(&token, "A holds the reissuance token", |x| x == 1);
+    let a_row = summary_row(&mut a, &tmpl);
+    eprintln!("[live] A's TMPL row: {a_row}");
+    assert_eq!(a_row["ticker"], json!("TMPL"), "{a_row}");
+    assert_eq!(a_row["name"], json!("Templar Token"), "{a_row}");
+    assert_eq!(a_row["display_amount"], json!("10000.00"), "{a_row}");
+    eprintln!("[live] A's token row: {}", summary_row(&mut a, &token));
+    let a_lbtc_issued = a.balance(&lbtc);
+    eprintln!(
+        "[live] A L-BTC after the issuance: {a_lbtc_issued} (fee {})",
+        1_000_000 - a_lbtc_issued
+    );
+
+    // ── Make: an exact 100.00 TMPL coin, offered for 0.05 L-BTC ─────────
+    const OFFER: i64 = 10_000;
+    const PRICE: i64 = 5_000_000;
+    let prep = a.ok(
+        "swap_make_prepare",
+        json!({ "asset_id": tmpl, "amount_sats": OFFER }),
+    );
+    eprintln!("[live] make_prepare txid {prep}");
+    mine();
+    let utxo = {
+        let mut found = None;
+        for _ in 0..30 {
+            a.sync();
+            let utxos = a.ok("list_utxos", json!({ "chain": "liquid" }));
+            found = utxos.as_array().unwrap().iter().find_map(|u| {
+                (u["asset_id"] == json!(tmpl)
+                    && u["amount"] == json!(OFFER)
+                    && u["outpoint"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with(prep.as_str().unwrap()))
+                .then(|| u["outpoint"].as_str().unwrap().to_string())
+            });
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        found.expect("the prepared coin")
+    };
+    let a_tmpl_before = a.balance(&tmpl);
+    let a_lbtc_before = a.balance(&lbtc);
+    assert_eq!(a_tmpl_before, SUPPLY, "a preparation keeps the supply");
+    eprintln!(
+        "[live] A before the take: L-BTC {a_lbtc_before} (preparation fee {}), TMPL {a_tmpl_before}",
+        a_lbtc_issued - a_lbtc_before
+    );
+    let offer = a.ok(
+        "swap_make",
+        json!({ "utxo": utxo, "want_asset_id": lbtc, "want_amount_sats": PRICE }),
+    );
+    let proposal = offer["proposal_json"].as_str().unwrap().to_string();
+    let book_id = a.env.ok(
+        "swap_publish",
+        json!({ "proposal_json": proposal, "note": "Templar Token live test" }),
+    );
+    eprintln!("[live] published as book offer {book_id}");
+
+    // ── How the offer is named: B's market feed and the book ───────────
+    let markets = b.env.ok("list_markets", json!({}));
+    let row = markets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["proposal_json"] == json!(proposal))
+        .unwrap_or_else(|| panic!("offer not in list_markets: {markets}"))
+        .clone();
+    eprintln!(
+        "[live] B's list_markets row: gives {} wants {} price {} verified {} takeable {}",
+        row["maker_gives"],
+        row["maker_wants"],
+        row["price_display"],
+        row["verified"],
+        row["takeable"]
+    );
+    assert_eq!(row["verified"], json!(true), "{row}");
+    assert_eq!(row["takeable"], json!(true), "{row}");
+    assert_eq!(row["maker_gives"]["asset_id"], json!(tmpl), "{row}");
+    assert_eq!(row["maker_gives"]["amount_sats"], json!(OFFER), "{row}");
+    assert_eq!(row["maker_wants"]["amount_sats"], json!(PRICE), "{row}");
+    let book_rows = lab_get(&format!("{book}/api/book?network=liquid-regtest"));
+    let entry = &book_rows[book_id.to_string().trim_matches('"')];
+    eprintln!(
+        "[live] /api/book entry {book_id}: input {} output {}",
+        entry["input"], entry["output"]
+    );
+    assert_eq!(entry["input"][0]["asset"], json!(tmpl), "{entry}");
+
+    // ── Take ───────────────────────────────────────────────────────────
+    let analysis = b.env.ok(
+        "swap_verify",
+        json!({ "proposal_json": proposal, "deep": true }),
+    );
+    assert_eq!(analysis["valid"], json!(true), "{analysis}");
+    assert_eq!(analysis["takeable"], json!(true), "{analysis}");
+    assert_eq!(analysis["network"], json!("regtest"), "{analysis}");
+    let preview = b.ok("swap_take_preview", json!({ "proposal_json": proposal }));
+    eprintln!("[live] take preview: {preview}");
+    assert_eq!(preview["you_receive"]["asset_id"], json!(tmpl));
+    assert_eq!(preview["you_receive"]["amount_sats"], json!(OFFER));
+    assert_eq!(preview["you_pay"]["amount_sats"], json!(PRICE));
+    let fee = preview["fee_sats"].as_i64().unwrap();
+    let take_txid = b.ok("swap_take", json!({ "proposal_json": proposal }));
+    eprintln!("[live] take txid {take_txid}");
+    mine();
+
+    b.wait_balance(&tmpl, "B received TMPL", |x| x == OFFER);
+    let b_lbtc = b.wait_balance(&lbtc, "B paid", |x| x < 50_000_000);
+    eprintln!(
+        "[live] B paid {} (price {PRICE} + preview fee {fee})",
+        50_000_000 - b_lbtc
+    );
+    assert!(
+        (50_000_000 - PRICE - fee - b_lbtc).abs() <= 10,
+        "B L-BTC {b_lbtc}, fee {fee}"
+    );
+    a.wait_balance(&tmpl, "A gave TMPL", |x| x == a_tmpl_before - OFFER);
+    let a_lbtc = a.wait_balance(&lbtc, "A was paid", |x| x > a_lbtc_before);
+    assert_eq!(a_lbtc, a_lbtc_before + PRICE, "A is paid exactly the price");
+    let b_row = summary_row(&mut b, &tmpl);
+    eprintln!("[live] B's TMPL row: {b_row}");
+    eprintln!(
+        "[live] after the take: A L-BTC {a_lbtc}, TMPL {}; B L-BTC {b_lbtc}, TMPL {OFFER}",
+        a_tmpl_before - OFFER
+    );
+
+    // ── Reissue 5 000.00 TMPL, then burn 10.00 ─────────────────────────
+    const REISSUE: i64 = 500_000;
+    const BURN: i64 = 1_000;
+    let reissued = a.ok(
+        "reissue_asset",
+        json!({ "asset_id": tmpl, "amount_sats": REISSUE }),
+    );
+    eprintln!("[live] reissue_asset: {reissued}");
+    assert_eq!(reissued["asset_id"], json!(tmpl), "{reissued}");
+    mine();
+    let after_reissue = SUPPLY - OFFER + REISSUE;
+    a.wait_balance(&tmpl, "A reissued", |x| x == after_reissue);
+    a.wait_balance(&token, "A keeps the reissuance token", |x| x == 1);
+    let a_lbtc_reissued = a.balance(&lbtc);
+    eprintln!(
+        "[live] after the reissuance: TMPL {after_reissue}, L-BTC {a_lbtc_reissued} (fee {})",
+        a_lbtc - a_lbtc_reissued
+    );
+
+    let burn_txid = a.ok(
+        "burn_asset",
+        json!({ "asset_id": tmpl, "amount_sats": BURN }),
+    );
+    eprintln!("[live] burn txid {burn_txid}");
+    mine();
+    a.wait_balance(&tmpl, "A burned", |x| x == after_reissue - BURN);
+    let a_lbtc_burned = a.balance(&lbtc);
+    eprintln!(
+        "[live] after the burn: TMPL {}, L-BTC {a_lbtc_burned} (fee {})",
+        after_reissue - BURN,
+        a_lbtc_reissued - a_lbtc_burned
+    );
+
+    // ── The book's watcher closes the taken offer (every minute) ───────
+    let mut status = String::new();
+    for _ in 0..40 {
+        let rows = lab_get(&format!("{book}/api/markets?network=liquid-regtest&all"));
+        status = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["source_id"] == book_id
+                    && r["settlement"]
+                        .as_str()
+                        .is_some_and(|s| s.starts_with("liquidex"))
+            })
+            .map(|r| r["status"].as_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        if !status.is_empty() && status != "open" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+    eprintln!("[live] book status after the watcher: {status:?}");
+    // On regtest the book cannot see who spent a coin: `cancelled` too.
+    assert!(
+        status == "filled" || status == "cancelled",
+        "taken offer is {status:?} in the book"
+    );
+}
+
 // ── Live: LiquiDEX on public Liquid testnet ────────────────────────
 
 /// The public Liquid testnet faucet (liquidtestnet.com, OpenAPI at

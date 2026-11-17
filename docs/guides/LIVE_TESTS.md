@@ -1,6 +1,6 @@
 # Running the ignored tests
 
-`cargo test --workspace` is offline and is the gate. Twelve tests are
+`cargo test --workspace` is offline and is the gate. Thirteen tests are
 `#[ignore]`d because they need something the gate does not have: a local
 Elements regtest node, a running Templar testlab, a running Templar
 Protocol site, a public Electrum server, a public faucet, or time. This guide says what each one needs and how to run it.
@@ -47,6 +47,7 @@ chain.
 | Test | Crate | What it proves |
 |---|---|---|
 | `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC and an issued asset from the lab's admin API and regtest BTC from its public faucet (one small request); A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
+| `live_testlab_issue_token_and_sell_for_lbtc` | templarlib | a user's own token sold for L-BTC, the manual test in the app: two fresh software wallets join the lab and get L-BTC through the admin API (A 0.01 for fees, B 0.5 to pay); A issues "Templar Token" (`TMPL`, precision 2, domain `templar.red`, 1 000 000 base units = 10 000.00 TMPL, one reissuance token) with `issue_asset` — no registry call on regtest (`registry_registered: false`) — and its dashboard names it `TMPL` / `Templar Token`; A prepares an exact 100.00 TMPL coin, offers it for 0.05 L-BTC and publishes it; B finds it verified and takeable in `list_markets`, verifies it deep, previews and takes it; A is paid exactly the price and gives exactly the coin, B pays the price plus the previewed fee; A then reissues 5 000.00 TMPL (`reissue_asset`) and burns 10.00 (`burn_asset`), each mined and checked; the book's watcher closes the offer |
 | `live_testlab_wallet_created_before_joining_sees_its_regtest_funds` | templarlib | the manual tester's order in one engine: a wallet created and synced on Liquid testnet (needs the public testnet Electrum servers), then the lab joined, the wallet reopened, regtest BTC sent through the admin API and mined; a sync in the same engine shows it. The lab's Electrum sees a new block about 5–7 s after bitcoind, and until then a sync answers `ok` with the old balance, so the test syncs until the funds show (it prints after how long) |
 | `live_testlab_native_peg_in_and_out` | templarlib | the native Elements peg with nothing but the test-server profile: a fresh software wallet joins the lab, gets regtest BTC and L-BTC from the lab's admin API; peg-in: `peg_start`; someone else pays the address first, less than expected (20 000 sats): listed in `deposits`, not the order's own, and the order can no longer be cancelled; `peg_fund` (the wallet pays the deposit from its own Bitcoin) → a claim at one confirmation is `PEG_NOT_READY` → mined to depth → `claimable` → `peg_claim` → the early payment claimed by its `outpoint` → `completed`, the L-BTC balance up by exactly both claims; peg-out: one below the lab's `pegout_min_sat` and one over its maximum refused, `peg_start` → `peg_fund` → mined → the lab's federation bot pays → `completed`, the BTC balance up by exactly the amount; an expired peg-in address (a federation change, simulated in the stored order) refused with `PEG_EXPIRED` |
 
@@ -97,6 +98,24 @@ One run takes about a minute (most of it waiting for the book's watcher,
 which runs every 60 s) and makes one public-faucet request (0.01 BTC);
 the rest comes through the admin API. Each run uses throwaway data
 directories; `templar-testlab down` stops the stack.
+
+The issuance test needs the stack and its order book, but no issued
+asset and no public faucet (everything comes through the admin API); it
+runs alone with
+
+```bash
+cargo test -p templarlib live_testlab_issue -- --ignored --nocapture
+```
+
+On 2026-11-17 it passed in about 67 s and printed every txid. Fees seen:
+41 sats for the issuance, 40 for the preparation, 377 for the take (the
+taker pays it), 47 for the reissuance, 38 for the burn. Only the issuer
+knows the token's name: neither the taker's engine nor the order book
+reads the contract committed in the issuance, and regtest has no
+registry, so the book names it `Unregistered asset` with the asset id's
+first 8 hex digits as ticker (e.g. `80D249A8`) and precision 8, and the
+taker's dashboard shows the asset id's prefix as name and ticker. Amounts
+are right in base units, but 100.00 TMPL shows as `0.00010000` there.
 
 ## Against SideSwap's public testnet API
 
