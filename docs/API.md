@@ -6,13 +6,13 @@ Every method `TemplarLib::call` accepts, read from
 `crates/templarlib/src/types.rs`. When this page and the code disagree, the
 code is right and this page has a bug.
 
-**102 methods** with the default features (`METHODS` in
+**103 methods** with the default features (`METHODS` in
 `crates/templarlib/src/lib.rs`, also `TemplarLib::methods()`):
 
-- 99 always present;
+- 100 always present;
 - 3 only with the `protocol` feature, marked **[protocol]**: without it they
   are absent from `METHODS` and answer `Unknown method`;
-- 14 of the 99 marked **[hardware]** need the `hardware` feature: without it
+- 14 of the 100 marked **[hardware]** need the `hardware` feature: without it
   they stay in `METHODS` and answer `HW_UNSUPPORTED: Hardware wallets over
   USB are not available on this platform. Use a QR air-gap wallet to sign
   instead.`
@@ -48,6 +48,33 @@ one). An unknown id then fails with `Wallet not found: <id>`.
 `elementsd` node, the order book service or a device, and hold the engine
 for as long as that takes. Everything else is local.
 
+### Liquid testnet and a lab's regtest
+
+Joining a Templar test server (`set_test_server`) puts the engine on the
+lab's Liquid regtest beside its Bitcoin regtest; `set_liquid_network
+testnet` goes back to the public testnets. What changes with the network:
+
+| Method | Liquid testnet (Bitcoin testnet) | A lab's regtest (Bitcoin regtest) |
+|---|---|---|
+| `get_liquid_network`, `get_test_server` | testnet ids and public servers | the lab's policy asset, Electrum servers, order book; `active.protocol` and `faucet.available` |
+| `list_wallets`, `create_*`, `import_*`, `repair_multisig_wallet` | summaries say `network: "testnet"` | `"regtest"` |
+| `get_wallet_info` | `network: "Testnet"` | `"Regtest"` |
+| `get_wallet_summary` | `liquid_network`/`bitcoin_network` testnet | regtest; the L-BTC row is the lab's policy asset |
+| `generate_receive_address`, `list_previous_addresses` | `tb1…` / `tlq1…` | `bcrt1…` / `el1…` |
+| `open_wallet`, `sync_wallet`, sends, PSBT/PSET, `list_*` reads | public Electrum servers | the lab's servers, Bitcoin data under `bitcoin-regtest/` |
+| `inspect_psbt` with no wallet open | `tb1…` outputs | `bcrt1…` outputs |
+| `test_server_faucet` | `FAUCET_UNAVAILABLE` (never asked) | the lab's faucet |
+| `issue_asset` | `domain` required, public registry + domain proof, book announcement | `domain` optional, no public registry, no proof, book announcement |
+| `reregister_asset` | public registry and the book's registry | the book's registry only |
+| `list_markets`, `list_swaps`, `swap_*`, `list_my_offers` | the book with `network=liquid-testnet` | the lab's book with `network=liquid-regtest`; HTLC rows never takeable |
+| `swap_cancel` | testnet offers only | regtest offers only |
+| `peg_*` | SideSwap when the lab names it, else `PEG_UNAVAILABLE` | the lab's native Elements peg |
+| `atomic_swap_*` | available | list `[]`; the steps refuse (`… require Liquid testnet`) |
+| `protocol_check_pset`, `protocol_is_check_pset`, `inspect_pset` | testnet policy asset | the lab's policy asset |
+
+Never contacted on a lab's regtest: the public asset registry, SideSwap,
+the HTLC coordinator, public Electrum servers.
+
 ### Errors every method can return
 
 | Error | When |
@@ -58,8 +85,9 @@ for as long as that takes. Everything else is local.
 | `Vault is locked — unlock with your passphrase first` | A vault exists and is locked, and the method reads a secret or saves the registry. |
 | `Wallet not found` / `Wallet not found: <id>` | Unknown `wallet_id`. |
 | `Bitcoin wallet not open` / `Liquid wallet not open` | The wallet has no side on that chain (a Bitcoin-only wallet asked for Liquid, a Liquid-only device entry asked for Bitcoin). |
-| `<feature> is not available on Liquid regtest. Switch the Liquid network to testnet in Settings to use it.` | The public asset registry on regtest. |
-| Peg tags `PEG_UNAVAILABLE`, `PEG_NOT_READY`, `PEG_EXPIRED`, `PEG_PROOF_REJECTED` | Prefixes of peg refusals ([Peg-in / peg-out](#peg-in--peg-out)). |
+| `Cross-chain swaps v1 require Liquid testnet` | An HTLC swap step off Liquid testnet ([Bitcoin ↔ Liquid HTLC swaps](#bitcoin--liquid-htlc-swaps)). |
+| Peg tags `PEG_UNAVAILABLE`, `PEG_NOT_READY`, `PEG_EXPIRED`, `PEG_PROOF_REJECTED`, `PEG_INSUFFICIENT_FUNDS` | Prefixes of peg refusals ([Peg-in / peg-out](#peg-in--peg-out)). |
+| Faucet tags `FAUCET_UNAVAILABLE`, `FAUCET_RATE_LIMITED`, `FAUCET_REFUSED`, `FAUCET_UNREACHABLE` | Prefixes of `test_server_faucet` refusals ([`test_server_faucet`](#test_server_faucet)). |
 | `HW_UNSUPPORTED: …` | A [hardware] method in a build without `hardware`. |
 | `LIQUID_HW_UNSUPPORTED: …` | A Liquid asset on a Bitcoin-only hardware or air-gap path. |
 | Hardware tags `HWI_MISSING`, `HWI_PERMISSION`, `DEVICE_NOT_READY`, `DEVICE_NOT_FOUND`, `SIGNING_FAILED` | Prefixes of device errors; the text after the tag explains. |
@@ -74,7 +102,8 @@ type`; optional ones may be `null`.
 
 **WalletSummary** (`WalletSummaryDto`): `id: string`, `name: string`,
 `wallet_type: "singlesig" | "multisig" | "watch_only" | "policy"`,
-`network: string`, `balance_sats: int`, `tx_count: usize`,
+`network: string` (the test network the wallet opens on now: `regtest`
+beside a joined lab's regtest, else `testnet`), `balance_sats: int`, `tx_count: usize`,
 `last_sync_at: int` (Unix s), `is_watch_only: bool`, `type_label: string`,
 `liquid_enabled: bool`, `bitcoin_enabled: bool`, `device_model: string?`,
 `master_fingerprint: string?`, `xpub: string?`, `required_sigs: usize?`,
@@ -90,7 +119,8 @@ type`; optional ones may be `null`.
 `total_display`, `fee_rate: f64` (0 on Liquid), `vsize_est: int`,
 `inputs: [TxIo]`, `outputs: [TxIo]`. **TxIo**: `outpoint: string?` (inputs
 only), `address`, `amount_sats: int`, `is_change: bool`, `asset_id?`,
-`ticker?`, `amount_display?`.
+`ticker?`, `amount_display?`, `metadata_source?` (Liquid outputs of a
+send preview: who named the asset, see [Asset names](#asset-names)).
 
 **Partial send**: a send that this device cannot finish alone (multisig
 below threshold) returns, instead of a txid string,
@@ -128,7 +158,31 @@ wallet gains, negative = pays), `net_change_lines: [{asset_id, ticker,
 amount_sats: int, display_amount}]`.
 
 **IssueResult** (`IssueResultDto`): `asset_id`, `token_id: string?`,
-`txid`, `registry_registered: bool`, `proof_url`, `proof_content`.
+`txid`, `registry_registered: bool` (Liquid testnet's public registry),
+`proof_url`, `proof_content` (the testnet domain proof; empty on a
+regtest and for a reissuance), `book_registered: bool` (the active order
+book's registry stored the asset), `book_error: string?` (why not, for
+people: no registry on that book, ticker taken, book out of reach…; null
+when stored or not asked), `domain` (the issuer domain in the contract;
+empty for a reissuance).
+
+**Asset names.** Wherever the engine names a Liquid asset it resolves it
+the same way: the wallet's own knowledge first (the network's policy asset,
+always `LBTC` with 8 decimals; assets this wallet issued; the built-in
+table), then the active order book's public registry (`GET
+…/api/assets`, read by `sync_wallet` and `list_markets` and cached on disk
+per book and network, so offline calls keep the names), else the asset
+id's first 8 hex digits with 8 decimals. A registry entry never renames or
+re-scales the policy asset, never calls another asset `BTC`/`LBTC`, and
+never overrides the wallet. Objects that name assets carry, additively,
+`metadata_source`: `wallet` | `book` (from the registry: show the short
+asset id beside it) | `feed` (a market or book row's own display data,
+when neither knows the asset) | `none`; where there is room also
+`precision: u8` (the decimals `display_amount` uses) and `book_source:
+string?` (the book's own provenance of a `book` name: `admin` |
+`contract` | `other`). Amounts in base units (`amount`, `amount_sats`)
+are the source of truth everywhere. The review of a PSET built elsewhere
+(`inspect_pset`) uses the wallet's own names only.
 
 **LiquidNetwork** (`LiquidNetworkDto`): `network` (`liquid-testnet` |
 `liquid-regtest`), `short_name` (`testnet` | `regtest`), `policy_asset`
@@ -153,7 +207,16 @@ methods:
   u32?, pegout_confirmations: u32?, pegout_max_sat: u64?, pegout_min_sat:
   u64?}}` (confirmations are at most 1000; `pegout_min_sat` absent means
   100 000),
-  `testnet: {faucet_url: string?, peg: {provider, …}?}?` (display only).
+  `testnet: {faucet_url: string?, peg: {provider, …}?}?` (display only),
+  and, optional in version 1 and null on older labs: `protocol_url:
+  string?` (the lab's Templar Protocol site, http(s) without credentials)
+  and `regtest.faucet: [FaucetAsset]?` (what the faucet pays, as the lab
+  lists it: at most 32 entries; `asset` (the faucet's name for it: `btc`,
+  `lbtc`, a lab ticker), `network` (`bitcoin-regtest` |
+  `liquid-regtest`), `ticker`, `name`, `precision: u8` (0–8), `asset_id:
+  string?` (Liquid), `default_sat: u64?`, `max_sat: u64?`; entries of
+  networks this wallet does not know are ignored, one that renames BTC or
+  the chain's L-BTC refuses the config).
 - `check: {reachable: bool, error: string?, server_instance_id: string?,
   stale: bool}?`: a live look at the server (`set_test_server`, and
   `get_test_server` with `check: true`). `stale` = the server now says
@@ -167,12 +230,22 @@ methods:
 - `active`: the servers in use now, each with where it came from
   (`env` | `profile` | `setting` | `default`):
   `{liquid_network, env_locked: bool,
-  orderbook: {origin, book, markets, publish, atomic_swaps} (each {url,
-  source}), liquid: {network, policy_asset, genesis_hash: string? (a
+  orderbook: {origin, book, markets, publish, atomic_swaps, assets} (each
+  {url, source}; `assets` is the book's public asset registry), liquid: {network, policy_asset, genesis_hash: string? (a
   custom regtest genesis), params_source, backend (`electrum` |
   `elements_rpc`), backend_description, backend_source}, bitcoin:
   {network (`bitcoin-testnet` | `bitcoin-regtest`), electrum_url,
-  source}}`. No credentials appear.
+  source}, protocol: {url, source}?}`: `protocol` is the joined lab's
+  `protocol_url` (`source: "profile"`) while the active network is the
+  lab's own regtest, null otherwise. Today the protocol runs on a test
+  regtest; in beta it will run on a server of ours; then Liquid mainnet.
+  No credentials appear.
+- `faucet: {url, assets_source, assets: [FaucetAsset], available:
+  bool}?`: the joined lab's faucet, null when no lab is joined.
+  `assets_source` is `profile` when the lab lists its faucet, `default`
+  for an older lab (then `btc` and `lbtc` only); `available` is true when
+  the active network is the lab's own regtest, so `test_server_faucet` may
+  ask it.
 
 **PegOrder** (`PegOrderDto`): `order_id`, `wallet_id`, `direction` (`in` =
 BTC → L-BTC, `out` = L-BTC → BTC), `status` (see
@@ -210,7 +283,8 @@ than once is `unclaimable` (LWK claims only a transaction paying it once);
 the test server's operator can recover it.
 
 **SwapLeg** (`SwapLegDto`): `asset_id`, `ticker`, `amount_sats: u64`,
-`display_amount`.
+`display_amount`, and ([Asset names](#asset-names)) `name`, `precision:
+u8`, `metadata_source`, `book_source: string?`.
 
 **SwapAnalysis** (`SwapAnalysisDto`): `valid: bool`, `checks: [{name, ok:
 bool?, note: string?}]`, `maker_offers: SwapLeg`, `maker_wants: SwapLeg`,
@@ -224,7 +298,12 @@ bool`, `take_block_reason: string?`.
 **AtomicSwap** (`MyAtomicSwap`): `offer_id: u64`, `wallet_id`, `role`,
 `key_index: u32`, `row: {id: u64, network, status, state, created_at,
 updated_at}`, `next_action`, `can_fund: bool`, `can_claim: bool`,
-`can_refund: bool`. `row.state` carries both legs (`offered_*`,
+`can_refund: bool`, `availability` (`live` | `not_on_this_book` |
+`book_mismatch` | `other_book` | `book_unreachable`, see
+[`atomic_swap_list`](#atomic_swap_list)), `availability_note: string?`
+(why the row is not live, for people), `coordinator: string?` (the
+coordinator the stored record names, credentials masked; null for a
+record written before coordinators were kept). `row.state` carries both legs (`offered_*`,
 `wanted_*`: chain, asset id, ticker, name, precision, amount), the
 `payment_hash`, both parties' keys and timeouts, contract addresses and
 scripts, funding, claim and refund txids, `preimage_hex` once published,
@@ -314,6 +393,33 @@ backends return to the environment and defaults, a Liquid network on the
 lab's regtest returns to testnet, the open wallet is closed and the lab's
 regtest caches are dropped. Params: none. Returns: **TestServer**. Errors:
 `Could not save the settings: …`.
+
+### `test_server_faucet`
+
+*opens*, *network*. Test coins from the joined lab's public faucet, paid
+to this wallet: the engine derives a fresh receive address of the wallet on
+the asset's chain (Bitcoin regtest for `btc`, Liquid regtest otherwise) and
+POSTs `{network, address, asset}` — nothing else, no amount (the faucet's
+default) — to the profile's `faucet_url`, bounded (20 s, 64 KiB, no
+redirect). Only on the lab's own regtest: never on testnet. Nothing is
+signed. The lab confirms faucet payments in batches; the coins show after
+its next block and a sync.
+
+| Param | Type | Req. | Notes |
+|---|---|---|---|
+| `wallet_id` | string | yes | |
+| `asset` | string | yes | `btc`, `lbtc`, or the ticker, faucet name or asset id of an asset in `TestServer.faucet.assets` (any case) |
+
+Returns: `{txid, asset (the faucet's name for it), network
+("bitcoin-regtest" | "liquid-regtest"), amount_sat: u64, address,
+ticker, precision: u8, asset_id: string?}`. Errors, tagged:
+
+| Tag | When |
+|---|---|
+| `FAUCET_UNAVAILABLE:` | no test server joined; the active network is not the lab's regtest (testnet included); the faucet does not pay that asset (an older lab: `btc` and `lbtc` only) or pays nothing; the wallet has no side on that chain; the faucet answered 404/405/421/501, 5xx (its node refused) or something unreadable. Checked before the wallet is opened where possible. |
+| `FAUCET_RATE_LIMITED:` | 429: a limit is reached (per client, per address, the lab's budget); the text gives the faucet's reason and `Try again in N seconds.` from `Retry-After`, else `Try again later.` |
+| `FAUCET_REFUSED:` | 400 or another 4xx, or `ok: false`: the faucet's reason, printable and at most 240 characters |
+| `FAUCET_UNREACHABLE:` | no answer: connection refused, timeout, redirect, oversize answer |
 
 ## Vault
 
@@ -605,7 +711,9 @@ other.
 
 Returns: `{btc: string, liquid: string}`, each `"ok"`, `"skipped"` (no
 side on that chain) or `"error: <reason>"`. Errors: only when the wallet
-cannot be opened.
+cannot be opened. With a Liquid side it also reads the active order
+book's asset registry ([Asset names](#asset-names)), best-effort: a book
+without one, or out of reach, changes nothing.
 
 ### `get_wallet_summary`
 
@@ -618,10 +726,14 @@ cannot be opened.
 Returns: `{wallet_id, wallet_name, total_balance_display, sync_state:
 "never" | "synced" | "partial" | "error", assets: [{asset_id, ticker,
 name, amount: int, display_amount, fiat_estimate: string?, status,
-utxo_count: usize, is_native: bool}], recent_activity: [{txid, direction:
-"incoming" | "outgoing" | "self", chain: "bitcoin" | "liquid", amount,
-ticker, timestamp: int, confirmations: u32, note?, counterparty?}],
-liquid_network}`. Errors: the common ones.
+utxo_count: usize, is_native: bool, precision: u8, metadata_source,
+book_source: string?}], recent_activity: [{txid, direction: "incoming" |
+"outgoing" | "self", chain: "bitcoin" | "liquid", amount, ticker,
+timestamp: int, confirmations: u32, note?, counterparty?, asset_id:
+string? (Liquid rows), metadata_source}], liquid_network, bitcoin_network
+("bitcoin-testnet" | "bitcoin-regtest")}`. Offline: an asset the wallet
+does not know is named from the cached registry ([Asset
+names](#asset-names)). Errors: the common ones.
 
 ### `get_wallet_info`
 
@@ -631,7 +743,8 @@ liquid_network}`. Errors: the common ones.
 |---|---|---|
 | `wallet_id` | string | yes |
 
-Returns: `{id, name, network, master_fingerprint, derivation_path,
+Returns: `{id, name, network ("Testnet" | "Regtest": the Bitcoin network
+the wallet runs on now), master_fingerprint, derivation_path,
 script_type, xpub, receive_descriptor, change_descriptor,
 multipath_descriptor: string?, liquid_descriptor: string?,
 master_blinding_key: string?, has_seed: bool, has_passphrase: bool,
@@ -674,7 +787,8 @@ Returns: `[{txid, direction, chain, amount, ticker, timestamp: int,
 confirmations: u32, fee: string?, fee_sats: int?, fee_rate: f64?, vsize:
 int, is_replaceable: bool, can_rbf: bool, can_cpfp: bool, can_cancel: bool,
 fee_bump_unavailable_reason: string?, note?, counterparty?,
-fiat_estimate?}]`. Errors: the common ones.
+fiat_estimate?, asset_id: string? (Liquid rows), metadata_source}]`.
+Errors: the common ones.
 
 ### `get_balance_history`
 
@@ -701,7 +815,7 @@ common ones.
 
 Returns: `[{outpoint, amount: int, display_amount, confirmations: u32,
 state: "available" | "frozen" | "dusty" | "unconfirmed", label?, address?,
-ticker?, asset_id?}]`. `address` is the address the coin sits on, on both
+ticker?, asset_id?, metadata_source}]`. `address` is the address the coin sits on, on both
 chains and in the wallet's network encoding (absent only for a script with
 no address form): coins that share one are linked on-chain, and a host
 groups them by it. Errors: the chain's side is missing.
@@ -824,7 +938,9 @@ Returns: `string`, the txid. Errors: not finalizable; broadcast errors.
 ### `inspect_psbt`
 
 Decode a PSBT. Uses the open Bitcoin wallet, if any, to mark own inputs and
-outputs; opens nothing.
+outputs; opens nothing. Output addresses are rendered on the open
+wallet's network, else on the active Bitcoin network (`bcrt1…` beside a
+lab's regtest).
 
 | Param | Type | Req. |
 |---|---|---|
@@ -971,25 +1087,30 @@ UR.
 
 ### `issue_asset`
 
-*opens*, *network*. Issue an asset and submit it to the testnet asset
-registry.
+*opens*, *network*. Issue an asset. On Liquid testnet submit it to the
+public asset registry (unchanged). On any network, right after the
+broadcast, announce it to the active order book's registry (`POST
+…/api/assets` with the contract exactly as LWK hashed it, the issuance
+txid and input 0), best-effort, so other wallets and the book name it.
 
 | Param | Type | Req. | Notes |
 |---|---|---|---|
 | `wallet_id` | string | yes | |
 | `name` | string | yes | |
-| `ticker` | string | yes | |
+| `ticker` | string | yes | 3–24 of `A-Z a-z 0-9 . -` (LWK); an order book may accept fewer (the Templar book: 16) |
 | `precision` | u8 | yes | |
-| `domain` | string | yes | the issuer's domain, for the registry proof |
+| `domain` | string | testnet | the issuer's domain, for the registry proof. Required on Liquid testnet; optional on a regtest, where an absent one is the reserved `regtest.templar.test` (a domain proof means nothing on a private chain) |
 | `amount_sats` | int | yes | > 0 |
 | `reissuance_tokens` | int | yes | ≥ 0 |
 
 Returns: **IssueResult**. `registry_registered` is false when the
 submission did not go through (on regtest it is not attempted); publish
-`proof_content` at `proof_url` and call `reregister_asset`. Errors: `The
-amount must be a positive number`; `The reissuance tokens cannot be
-negative`; `Precision must be between 0 and 8`; build and broadcast
-errors.
+`proof_content` at `proof_url` and call `reregister_asset`.
+`book_registered` / `book_error` report the order book's answer; a
+refusal there never fails the issuance. Errors: `A domain is required to
+issue an asset on Liquid testnet …`; `The amount must be a positive
+number`; `The reissuance tokens cannot be negative`; `Precision must be
+between 0 and 8`; build and broadcast errors.
 
 ### `reissue_asset`
 
@@ -1018,20 +1139,27 @@ Returns: `string`, the txid. Errors: insufficient balance; as above.
 
 ### `reregister_asset`
 
-*opens*, *network*. Submit an issued asset to the testnet registry again.
-Refused on regtest.
+*opens*, *network*. Submit an issued asset again: on Liquid testnet to the
+public registry (as before), and on any network to the active order
+book's registry. For the book, the issuance is found offline in the
+wallet's own history (sync first) and the contract rebuilt from the
+parameters and the wallet's issuer key must be the one the asset id
+commits to; nothing is signed.
 
-| Param | Type | Req. |
-|---|---|---|
-| `wallet_id` | string | yes |
-| `asset_id` | string | yes |
-| `name` | string | yes |
-| `ticker` | string | yes |
-| `precision` | u8 | yes |
-| `domain` | string | yes |
+| Param | Type | Req. | Notes |
+|---|---|---|---|
+| `wallet_id` | string | yes | |
+| `asset_id` | string | yes | |
+| `name` | string | yes | as issued |
+| `ticker` | string | yes | as issued |
+| `precision` | u8 | yes | as issued |
+| `domain` | string | no | as issued; on a regtest an empty one is `regtest.templar.test` |
 
-Returns: `{registered: bool}`. Errors: `The Liquid asset registry is not
-available on Liquid regtest. …`.
+Returns: `{registered: bool, book_registered: bool, book_error: string?}`
+(`registered` is always false on a regtest). Never an error beyond the
+common ones: a watch-only wallet, an asset not issued by this wallet (`…
+is not in this wallet's history …`), parameters that do not match the
+issuance, or a book refusal land in `book_error`.
 
 ## Hardware, watch-only and air-gap
 
@@ -1439,8 +1567,12 @@ deposit from its own wallet.
 Returns: **PegOrder** in `deposit_seen` with `txid_deposit`. Errors:
 `PEG_NOT_READY` (already funded, cancelled), `PEG_EXPIRED`,
 `PEG_UNAVAILABLE` (no provider, a simulated order, another chain or
-provider), the
-limits, builder errors (insufficient funds, frozen coins), signing and
+provider), `PEG_INSUFFICIENT_FUNDS` (the wallet cannot pay the deposit or
+the peg-out and its fee: `PEG_INSUFFICIENT_FUNDS: this wallet has 0 sat of
+BTC on Bitcoin regtest; the deposit and its fee need 100043 sat.` — the
+chain, the asset (BTC for a peg-in, L-BTC for a peg-out), what it has and
+what is needed (for L-BTC "at least"), and a note when frozen coins were
+left out; both providers), the limits, other builder errors, signing and
 broadcast errors, `Vault is locked …`.
 
 ### `peg_claim`
@@ -1543,8 +1675,10 @@ maker's wallet may then not see the payment).
 
 Returns: `[{id: u64, available: bool, receive: SwapLeg, pay: SwapLeg,
 price: f64, price_display, created, verified: bool, verify_note: string?,
-proposal_json, network, takeable: bool, kind}]`. Errors: the book cannot be
-reached or parsed.
+proposal_json, network, takeable: bool, kind}]`. A leg whose asset the
+wallet or the registry knows is named their way; otherwise the row's own
+display data (`metadata_source: "feed"`, `precision` from the published
+amount's decimals). Errors: the book cannot be reached or parsed.
 
 ### `list_markets`
 
@@ -1558,8 +1692,14 @@ Returns: `[{id, source_id: u64, status, settlement, demo: bool, available:
 bool, maker_gives: Leg, maker_wants: Leg, price_display, note, created_at:
 u64, proposal_json, verified: bool, takeable: bool, block_reason:
 string?}]`, where `Leg` = `{chain, network, asset_id, ticker, name,
-precision: u8, amount_sats: u64, display_amount}`. Rows with `demo: true`
-are display data only. Errors: as `list_swaps`.
+precision: u8, amount_sats: u64, display_amount, metadata_source,
+book_source: string?}`. It first reads the active order book's asset
+registry (best-effort, at most every 20 s; never fails the list): a
+Liquid leg the wallet or the registry knows is named and scaled their way
+(the policy asset is always `LBTC`, 8 decimals, whatever the feed says),
+otherwise the feed's own values are kept, printable and bounded, with
+`metadata_source: "feed"`. Rows with `demo: true` are display data only.
+Errors: as `list_swaps`.
 
 ### `swap_verify`
 
@@ -1657,7 +1797,9 @@ a best-effort status refresh (*network*).
 |---|---|---|
 | `wallet_id` | string | yes |
 
-Returns: `[MyOffer]`. Errors: the store cannot be read.
+Returns: `[MyOffer]`, each leg named now ([Asset names](#asset-names): the
+wallet's own asset store first, then the registry), not as it was stored.
+Errors: the store cannot be read.
 
 ### `swap_cancel`
 
@@ -1670,15 +1812,16 @@ the signed offer).
 | `wallet_id` | string | yes |
 | `offer_id` | string | yes |
 
-Returns: `string`, the txid. Errors: unknown or closed offer; broadcast
-errors.
+Returns: `string`, the txid. Errors: `Unknown swap offer on <network>: …`
+(an unknown offer, or one of the other Liquid network); a closed offer;
+broadcast errors.
 
 ## Bitcoin ↔ Liquid HTLC swaps
 
 Testnet only, software wallets with both chains. The order book service
 (`active.orderbook.atomic_swaps`) coordinates the public state; keys and the maker's preimage are
-derived from the seed and never sent. All six are *opens* and *network*,
-and fail with `Cross-chain swaps v1 require Liquid testnet`, `Cross-chain
+derived from the seed and never sent. The five steps are *opens* and
+*network*, and fail with `Cross-chain swaps v1 require Liquid testnet`, `Cross-chain
 swaps v1 currently require a software wallet` or `Open a wallet with both
 Bitcoin and Liquid enabled` when those conditions are not met.
 
@@ -1733,7 +1876,27 @@ create a fresh offer`; the service refusing.
 |---|---|---|
 | `wallet_id` | string | yes |
 
-Returns: `[AtomicSwap]`, this wallet's swaps.
+Returns: `[AtomicSwap]`, this wallet's swaps. Off Liquid testnet (a lab's
+regtest, any regtest): `[]` at once — no wallet opened, no server
+contacted, no stored record read. On testnet (*opens*, *network*) each
+stored record is judged on its own and one record never fails the list:
+
+| Record | Listed as |
+|---|---|
+| names another coordinator | `availability: "other_book"`, built from the stored terms; not contacted |
+| the active coordinator's row is this wallet's swap (the accepted terms hold, or for a record without terms the row carries this wallet's key) | `live`: the coordinator's row, as before |
+| 404, or the row with that id is someone else's swap | `not_on_this_book` when the record kept its terms; **left out** when it kept none (no terms: no contract to rebuild, so nothing to fund, claim or refund) |
+| the row contradicts the accepted terms | `book_mismatch` (nothing would be signed against it) |
+| no answer, timeout, 5xx, an unreadable answer | `book_unreachable` (terms or not: it may be live); after a connection failure the remaining records are not tried again |
+| a record this engine cannot read | left out (it has no usable key index or swap id) |
+
+A row that is not `live` has `row.status: "unavailable"`, `created_at` and
+`updated_at` 0, legs from the stored terms (empty for a record without
+terms), every `can_*` false and `next_action: "wait"`. Listing never
+writes: no record is deleted or rewritten (one may hold the key index
+needed to refund a funded HTLC), and a record that cannot be read is kept
+byte for byte when the store is written by another step. Swap ids are per
+coordinator: joining and saving match a record by coordinator too.
 
 ### `atomic_swap_fund`
 

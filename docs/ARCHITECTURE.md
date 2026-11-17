@@ -108,6 +108,7 @@ One `AppState` per engine, created by `TemplarLib::new()` or
 | `last_sync_btc`, `last_sync_liquid`, `last_sync_at` | Per-chain outcome of the last `sync_wallet`, cleared on open. |
 | `liquid_network`, `liquid_network_env_locked` | Liquid testnet or regtest (with its policy asset); locked when set by `TEMPLAR_LIQUID_NETWORK`. |
 | `asset_registry` | Known Liquid assets for the active network. |
+| `book_assets` | The active order book's asset registry (display names), loaded from `book_assets.json` when the book or the network changes (`handlers::asset_names`). |
 | `startup_error` | A fatal init condition: another process holds the data directory, or the registry cannot be read. Every call except `version` fails with it, so nothing can save over the data on disk. |
 | `verify_failures`, `verify_lockout_until` | The throttle on `verify_vault_passphrase`. |
 | `_instance_lock` | An exclusive advisory lock on `<data_dir>/app.lock`, held for the engine's lifetime. |
@@ -155,6 +156,7 @@ Everything lives under the data directory. Which directory:
 | `bdk_sw_<fingerprint>/`, `bdk_ms_<wallet id>/`, `bdk_hw_db/`, `bdk_watchonly_db/` | BDK sled databases (addresses, transactions, sync state). | no |
 | LWK cache directories | `Wollet` persistence per network and descriptor; a cache, rebuilt when inconsistent. | no |
 | `peg_orders.json`, `swap_offers.json`, `atomic_swaps.json` | Peg orders (addresses, txids, a peg-in's claim script and derivation index, signed transactions kept until they are seen on chain), the wallet's own LiquiDEX offers, HTLC swap records. | no keys (swap keys and the maker's preimage are re-derived from the seed when needed) |
+| `book_assets.json` | The asset registries of the order books this engine has read (ticker, name, precision per asset id), keyed by book origin and network, at most 16; re-checked like a fresh answer when loaded; regtest entries dropped with a lab reset. | no |
 | `hwi/`, `venv/` | An HWI binary or virtualenv a host installed (with `hardware`). | no |
 
 Writes of the registry and the JSON stores go through a temporary file and
@@ -193,8 +195,9 @@ hand) > **default**.
   both.
 - Order book and HTLC coordination: the order book service
   (`services/orderbook` in templar-protocol): its routes `…/api/book`,
-  `…/api/markets`, `POST …/api/offers` (publish) and `…/api/atomic-swaps`
-  on the lab's `orderbook_url`, else `http://127.0.0.1:3210`;
+  `…/api/markets`, `POST …/api/offers` (publish), `…/api/atomic-swaps`
+  and the asset registry `GET`/`POST …/api/assets` on the lab's
+  `orderbook_url`, else `http://127.0.0.1:3210`;
   `TEMPLAR_SWAP_BOOK_URL`, `TEMPLAR_SWAP_MARKETS_URL`,
   `TEMPLAR_SWAP_ADMIN_URL` (publish, for old admin-route setups) override
   single routes.
@@ -217,7 +220,8 @@ hand) > **default**.
   use it. Name resolution is outside it. The BDK and LWK Electrum clients
   still carry per-read timeouts only.
 - **HTTP.** `templar_core::http` is how the engine reads the order book,
-  the HTLC coordinator, the asset registry and the peg's Esplora: no
+  the HTLC coordinator, the asset registries, a lab's faucet and the peg's
+  Esplora: no
   redirects, connect and whole-request timeouts, bounded bodies, error
   texts without the URL and reduced to a printable excerpt.
 - **Chain identity.** Bitcoin regtest and testnet wallets derive the same
@@ -227,7 +231,27 @@ hand) > **default**.
 - **Swap coordinator.** Cross-chain swaps keep the terms the wallet
   created or accepted and rebuild both HTLCs from them on every step; a
   coordinator row that disagrees is refused, so a coordinator can stall a
-  swap but not redirect a payment.
+  swap but not redirect a payment. Swap ids are per coordinator: records
+  are matched by coordinator when joining, saving and listing, and the
+  list judges each record alone (`availability`), so one stale record (a
+  book whose database is gone) never hides the others. Records this engine
+  cannot read are kept verbatim and still reserve their key index. The
+  swaps exist on Liquid testnet only; elsewhere the list is empty and
+  nothing is contacted.
+- **Asset registry** (`templar_core::liquid::book_assets`,
+  `handlers::asset_names`). The active book's `GET …/api/assets` is read in
+  the network paths only (`sync_wallet`, `list_markets`; 6 s, 1 MiB, at
+  most every 20 s), best-effort, and cached on disk so offline calls keep
+  the names. It is display metadata from an untrusted server: at most
+  2 000 entries, 64-hex ids, tickers and names bounded and printable,
+  precision 0–8; an entry for the policy asset, or calling another asset
+  `BTC`/`LBTC`, is dropped. One resolver names every asset: the wallet's
+  own knowledge (policy asset, its issuances, the built-in table), then
+  the registry (`metadata_source: "book"`), else the short id. A PSET
+  review before co-signing uses the wallet's own names only. After
+  `issue_asset` the engine announces the asset (`POST …/api/assets`, the
+  contract as LWK hashed it, the issuance txid and input); the book checks
+  the contract against the chain itself.
 
 ### Test servers
 
@@ -239,8 +263,18 @@ the app config (`AppConfig.test_server`). Only its `liquid-regtest` block
 and `orderbook_url` are applied. `<data_dir>/regtest_instance` records the
 lab `instance_id` the regtest data was synced against; when it differs
 (the lab reset its chains, or the wallet joined or left a lab) the regtest
-chain caches (`liquid-regtest/`, `bitcoin-regtest/`) and regtest swap
-offers are dropped, never keys or the registry.
+chain caches (`liquid-regtest/`, `bitcoin-regtest/`), regtest swap offers
+and the cached regtest asset registries are dropped, never keys or the
+registry.
+
+Two optional fields of version 1 are read too, with the same rules: the
+faucet's asset list (`networks["liquid-regtest"].faucet`: at most 32
+entries; one renaming BTC or the chain's L-BTC refuses the config; an
+older lab offers `btc` and `lbtc`) and `protocol_url` (the lab's Templar
+Protocol site, shown as `active.protocol` on its own regtest).
+`test_server_faucet` posts `{network, address, asset}` to the lab's
+`faucet_url` (20 s, 64 KiB, no redirect) for a fresh address of the open
+wallet, only while the active network is the lab's own regtest.
 
 No chain client is built when a wallet is opened, only when a method syncs
 or broadcasts.

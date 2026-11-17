@@ -7,6 +7,66 @@ with 0, any release may change the method contract.
 
 ## [Unreleased]
 
+### Added
+
+- `test_server_faucet {wallet_id, asset}`: test coins from the joined
+  lab's public faucet, paid to a fresh receive address of the wallet on
+  the asset's chain (Bitcoin regtest for `btc`, Liquid regtest otherwise).
+  Only the network, the address and the asset are sent; never on testnet;
+  nothing is signed. Refusals are tagged `FAUCET_UNAVAILABLE`,
+  `FAUCET_RATE_LIMITED` (with when to retry), `FAUCET_REFUSED` and
+  `FAUCET_UNREACHABLE`.
+- A lab's `/api/config` may list what its faucet pays
+  (`networks["liquid-regtest"].faucet`) and name its Templar Protocol site
+  (`protocol_url`); both optional, validated like every other field. The
+  TestServer object gains `faucet` (`url`, `assets`, `assets_source`,
+  `available`), `active.protocol` (`{url, source}` on the lab's own
+  regtest, else null) and `active.orderbook.assets`.
+- Asset names from the active order book's public registry (`GET
+  …/api/assets`), read by `sync_wallet` and `list_markets` (best-effort)
+  and cached per book and network in `book_assets.json`, so a buyer sees
+  `100.00 TMPL` instead of `0.00010000 80d249a8`. The wallet's own
+  knowledge always wins and the policy asset is never renamed. Additive
+  keys: `precision`, `metadata_source` (`wallet` | `book` | `feed` |
+  `none`) and `book_source` on summary assets and swap / market legs;
+  `asset_id` and `metadata_source` on activity rows; `metadata_source` on
+  Liquid UTXOs and send-preview outputs; `name` and `precision` on swap
+  legs, so `list_my_offers` finally carries a precision.
+- `issue_asset` announces the new asset to the active order book's
+  registry right after the broadcast and reports `book_registered` /
+  `book_error` (and the contract's `domain`); Liquid testnet's public
+  registry flow is unchanged. On a regtest `domain` is optional (the
+  reserved `regtest.templar.test`) and no domain proof is returned.
+- `reregister_asset` works on a regtest: it re-announces the issuance to
+  the order book's registry (found in the wallet's own history, checked
+  against the asset id) and answers `{registered, book_registered,
+  book_error}` instead of failing.
+- `PEG_INSUFFICIENT_FUNDS`: `peg_fund` on a wallet that cannot pay the
+  deposit (BTC) or the peg-out (L-BTC) and its fee says on which chain,
+  of which asset, how much it has and how much is needed; both providers.
+- `get_wallet_summary` gains `bitcoin_network`.
+
+### Fixed
+
+- `atomic_swap_list` no longer fails as a whole on one record: a record
+  the order book does not know (`Order book HTTP 404: Unknown atomic swap:
+  1`), one of another book, an unreachable book or an unreadable record
+  yields the rest of the list, with an additive `availability` (`live` |
+  `not_on_this_book` | `book_mismatch` | `other_book` |
+  `book_unreachable`), `availability_note` and `coordinator` per row; a
+  record with no terms that the book does not know is left out. Off Liquid
+  testnet the list is `[]` at once, with nothing contacted. Stored records
+  are never deleted or rewritten by listing; unreadable ones are kept
+  verbatim and keep their key index; swap ids are matched per coordinator.
+- On a lab's regtest every network name is regtest: wallet summaries say
+  `regtest`, `get_wallet_info` says `Regtest`, `inspect_psbt` with no
+  wallet open renders `bcrt1…` outputs, a Jade Liquid import says
+  `liquid_regtest`, and `swap_cancel` only finds offers of the active
+  network.
+- `list_markets` no longer shows the feed's name or precision for the
+  policy asset or an asset the wallet knows; feed text is made printable
+  and bounded.
+
 ## [0.2.0] — 2026-11-17
 
 ### Repository

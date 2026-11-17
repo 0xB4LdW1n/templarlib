@@ -143,8 +143,9 @@ impl<'a> Endpoints<'a> {
     }
 
     /// The Templar Protocol (lending) site of the network `liquid`: the
-    /// joined lab's `protocol_url` on its own regtest; none otherwise (the
-    /// protocol runs on no public network yet).
+    /// joined lab's `protocol_url` on its own regtest; none otherwise.
+    /// Today the protocol runs on a test regtest; in beta it will run on a
+    /// server of ours; then Liquid mainnet.
     pub fn protocol_url(&self, liquid: &LiquidNetwork) -> Option<Resolved<String>> {
         let p = self.profile?;
         let url = p.protocol_url.clone()?;
