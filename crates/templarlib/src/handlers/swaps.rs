@@ -379,6 +379,9 @@ pub fn publish(state: &AppState, proposal_json: &str, note: &str) -> Result<u64,
 /// the HTTP status (the order book's contract: match on the status, not the
 /// text); the book's own message is appended for people.
 pub(crate) fn publish_error(e: BookError, url: &str, network: &str) -> String {
+    // The publish URL may come from TEMPLAR_SWAP_ADMIN_URL with a login in
+    // it: never echo credentials.
+    let url = templar_core::endpoints::redact_userinfo(url);
     let (status, message, retry_after) = match e {
         BookError::Rejected {
             status,
@@ -1249,6 +1252,17 @@ mod tests {
         }
         let msg = publish_error(BookError::Network("refused".into()), url, "liquid-testnet");
         assert!(msg.starts_with("BOOK_UNREACHABLE:"), "{msg}");
+        // A login in the URL is never echoed.
+        let secret = "http://admin:hunter2@127.0.0.1:3210/api/admin/offers";
+        for e in [
+            BookError::Network("refused".into()),
+            refusal(401, None),
+            refusal(404, None),
+        ] {
+            let msg = publish_error(e, secret, "liquid-testnet");
+            assert!(!msg.contains("hunter2") && !msg.contains("admin:"), "{msg}");
+            assert!(msg.contains("***@127.0.0.1:3210"), "{msg}");
+        }
     }
 
     #[test]
