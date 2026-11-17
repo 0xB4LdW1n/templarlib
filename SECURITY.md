@@ -40,7 +40,16 @@ Particularly interesting:
 - a Templar Protocol check PSET ([docs/CONNECTOR.md §9](docs/CONNECTOR.md#9-proof-of-key--the-check-pset))
   that the wallet accepts as a proof but that can move funds, or that is
   valid for another site or challenge;
-- a mainnet key, coin or proposal that gets signed.
+- a mainnet key, coin or proposal that gets signed;
+- a server the wallet reads (a test server, the order book or HTLC
+  coordinator, SideSwap, an Electrum or Esplora server) that makes it pay,
+  claim or sign something other than what the user asked for, or that
+  holds the engine beyond its deadlines (see
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#untrusted-servers)). Known
+  and accepted: a peg-out names the parent genesis LWK knows for the lab's
+  chain (Bitcoin regtest), checked against the lab's published Bitcoin
+  server, not read from the Liquid chain itself
+  ([Peg](docs/ARCHITECTURE.md#peg)).
 
 Out of scope: the hosts (the Templar Wallet app, its terminal client, the
 Templar Protocol server) live in their own repositories; report there. A

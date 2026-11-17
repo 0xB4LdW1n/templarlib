@@ -150,7 +150,9 @@ methods:
   `orderbook_url`, `regtest: {instance_id, policy_asset, genesis_hash,
   liquid_electrum_url, bitcoin_network, bitcoin_electrum_url,
   bitcoin_esplora_url, faucet_url, peg: {provider, pegin_confirmations:
-  u32?, pegout_confirmations: u32?, pegout_max_sat: u64?}}`,
+  u32?, pegout_confirmations: u32?, pegout_max_sat: u64?, pegout_min_sat:
+  u64?}}` (confirmations are at most 1000; `pegout_min_sat` absent means
+  100 000),
   `testnet: {faucet_url: string?, peg: {provider, …}?}?` (display only).
 - `check: {reachable: bool, error: string?, server_instance_id: string?,
   stale: bool}?`: a live look at the server (`set_test_server`, and
@@ -191,7 +193,21 @@ deposit address is guaranteed valid through this Liquid height; renewed
 while the federation is unchanged), `last_error: string?` (why the last
 status check could not read the chains; null when it could), `expires_at:
 u64?` (SideSwap: Unix seconds after which it no longer takes the deposit;
-null when the order does not expire).
+null when the order does not expire), `deposits: [PegDeposit]` (native
+peg-in: every output that paid the deposit address; empty otherwise).
+
+**PegDeposit** (`PegDepositDto`): `outpoint` (`txid:vout`), `amount_sats:
+u64`, `confirmations: u32` (Bitcoin), `status` (`deposit_seen` |
+`confirming` | `claimable` | `settling` (claim signed, not yet in a
+block) | `completed` (claimed) | `unclaimable`), `txid_claim?`, `primary:
+bool` (the deposit the order itself follows), `note?` (why it is
+`unclaimable`). The order follows the deposit this wallet paid with
+`peg_fund`, else the first that carries at least `deposit_expected_sats`;
+any other payment to the address (smaller, later, from anyone) is listed
+and claimable on its own with `peg_claim {order_id, outpoint}`, also after
+the order completes. A transaction that pays the deposit address more
+than once is `unclaimable` (LWK claims only a transaction paying it once);
+the test server's operator can recover it.
 
 **SwapLeg** (`SwapLegDto`): `asset_id`, `ticker`, `amount_sats: u64`,
 `display_amount`.
@@ -1284,25 +1300,36 @@ retry of the same call rebroadcasts those bytes rather than paying twice.
 | `awaiting_deposit` | waiting for BTC at `deposit_address` (pay it with `peg_fund` or from anywhere) | waiting for `peg_fund` |
 | `deposit_seen` | the deposit is in the Bitcoin mempool | the peg-out is in the Liquid mempool |
 | `confirming` | the deposit has fewer than `confirmations_required` Bitcoin confirmations | the peg-out has fewer than `confirmations_required` Liquid confirmations |
-| `claimable` | deep enough: waiting for `peg_claim` | — |
-| `settling` | the claim is broadcast, not yet in a block | deep enough: waiting for the federation's payment (`txid_payout` appears with it) and its first Bitcoin confirmation |
+| `claimable` | the order's deposit is deep enough: waiting for `peg_claim` (a payment to the address that is not the order's own leaves it in `awaiting_deposit`, listed in `deposits`) | — |
+| `settling` | the claim is signed (and broadcast, or to be sent again by `peg_claim`), not yet in a block | deep enough: waiting for the federation's payment (`txid_payout` appears with it) and its first Bitcoin confirmation; a payment over the lab's hourly budget waits for its operator — the order just stays here longer |
 | `completed` | the claim is in a block | the payment is in a block |
 | `cancelled` | `peg_cancel` before any deposit | `peg_cancel` before `peg_fund` |
 | `expired` | the federation changed before a deposit: never pay this address; or the test server reset its chains | the test server reset its chains |
 | `failed` | — | — |
+| `unclaimable` | (a `deposits` row only) a payment this wallet cannot claim; `note` says why | — |
 
 SideSwap orders use the same statuses: `awaiting_deposit` (no deposit
 reported), `deposit_seen` / `confirming` (SideSwap's `Detected`, with its
 `detected_confs` / `total_confs` as `confirmations` /
 `confirmations_required`), `settling` (`Processing`, or `Done` while the
-payout is not yet in a block paying the receive address on the wallet's
-own chain view), `completed` (paid, and seen so), `cancelled` (locally;
-SideSwap has no cancel), `expired` (past `expires_at` with no deposit),
-`failed` (`InsufficientAmount`: the deposit does not cover SideSwap's
-fees and is not paid out; `last_error` quotes SideSwap).
+payout does not yet count), `completed` (paid, and seen so), `cancelled`
+(locally; SideSwap has no cancel), `expired` (past `expires_at` with no
+deposit), `failed` (`InsufficientAmount`: the deposit does not cover
+SideSwap's fees and is not paid out; `last_error` quotes SideSwap). A
+payout counts only if it is new to the receive address (its history is
+recorded when the order opens), not counted by another order, in a block
+on the wallet's own chain view, and worth at least the quoted
+`payout_expected_sats` — on Liquid, read from the wallet that owns the
+receive address once it is open and synced; until then the order stays
+`settling` and `last_error` says why. SideSwap's reports only move an
+order forward, never replace a deposit txid the order follows, and never
+fail an order whose deposit this wallet paid (the refusal is then only in
+`last_error`).
 
-`completed`, `cancelled`, `expired` and `failed` are final. A status can step back
-(`claimable` → `confirming`) if a Bitcoin reorg makes the deposit shallower.
+`completed`, `cancelled`, `expired` and `failed` are final (a completed
+native peg-in is still followed while one of its `deposits` can be
+claimed). A native status can step back (`claimable` → `confirming`) if a
+Bitcoin reorg makes the deposit shallower.
 
 **Peg tags.** `PEG_UNAVAILABLE` (no provider here, or the order belongs to
 another provider or chain), `PEG_NOT_READY` (the order is not where the
@@ -1329,8 +1356,10 @@ network_fee_included: bool}`. Native: `rate` 1, no service fee;
 the deposit (`network_fee_included: true`, `receive_sats = amount − fee`),
 or of the peg-out, paid on top (`false`, `receive_sats = amount`); the
 Bitcoin fee of a deposit is paid on top by whoever sends it. `min_sats`
-10 000; `max_sats` 21 million BTC for a peg-in, the lab's
-`pegout_max_sat` for a peg-out. `eta_minutes` assumes nominal block
+10 000 for a peg-in and the larger of 10 000 and the lab's
+`pegout_min_sat` (default 100 000: the lab never pays a smaller peg-out,
+its L-BTC would be burned) for a peg-out; `max_sats` 21 million BTC for a
+peg-in, the lab's `pegout_max_sat` for a peg-out. `eta_minutes` assumes nominal block
 intervals (10 min Bitcoin, 1 min Liquid) over `confirmations_required`.
 Reads no chain. SideSwap (*network*): its `server_status` terms —
 `service_fee_sats` its percentage of the amount, `network_fee_sats` 0 for
@@ -1399,9 +1428,14 @@ broadcast errors, `Vault is locked …`.
 *opens*, *network*. Native peg-in only: the user-confirmed signing step
 that claims a deposit once it is `claimable`.
 
-| Param | Type | Req. |
-|---|---|---|
-| `order_id` | string | yes |
+| Param | Type | Req. | Notes |
+|---|---|---|---|
+| `order_id` | string | yes | |
+| `outpoint` | string | no | the deposit to claim (`txid:vout` from `deposits`); default the order's own |
+
+A claim already signed for that deposit and not yet in a block is sent
+again as is, never signed a second time; only if the node refuses it and
+the deposit's block changed (a reorg) is a new claim built.
 
 Before anything is signed the wallet reads, from its own Bitcoin Electrum
 server, the deposit's height, the block hash at that height and the tip;
@@ -1413,10 +1447,13 @@ that height, and that it has `confirmations_required` confirmations. The
 claim spends the peg-in alone and pays everything but its fee to
 `payout_address`.
 
-Returns: **PegOrder** in `settling` with `txid_claim`. Errors:
-`PEG_NOT_READY` (no deposit, too few confirmations — e.g. `PEG_NOT_READY:
-the deposit has 1 of the 2 Bitcoin confirmations a claim needs.` —, a
-peg-out, already claimed), `PEG_PROOF_REJECTED`, `PEG_EXPIRED` (the
+Returns: **PegOrder** — in `settling` with `txid_claim` for the order's
+own deposit; for another deposit, its row in `deposits` shows the claim.
+Errors: `PEG_NOT_READY` (no deposit, or none of the expected amount yet
+when no `outpoint` is given; an unknown `outpoint`; too few confirmations
+— e.g. `PEG_NOT_READY: the deposit has 1 of the 2 Bitcoin confirmations a
+claim needs.` —; a peg-out; already claimed), `PEG_UNAVAILABLE` for an
+`unclaimable` deposit, `PEG_PROOF_REJECTED`, `PEG_EXPIRED` (the
 federation changed), `PEG_UNAVAILABLE` (also for a SideSwap order: SideSwap
 pays out by itself), signing and broadcast errors, `Vault is locked …`.
 
@@ -1429,8 +1466,9 @@ pays out by itself), signing and broadcast errors, `Vault is locked …`.
 | `order_id` | string | yes |
 
 Returns: **PegOrder**, read from the chains first (an open order of the
-active provider). A chain that cannot be read is `last_error`, not an
-error. Errors: unknown order.
+active provider, or a completed native peg-in with a deposit still to
+claim). A chain that cannot be read is `last_error`, not an error.
+Errors: unknown order.
 
 ### `peg_list`
 
@@ -1450,9 +1488,13 @@ as in `peg_status`.
 | `order_id` | string | yes |
 
 Returns: **PegOrder** in `cancelled`. A native peg-in is read from the
-chain first. Errors: unknown order; `Order can no longer be cancelled
-(status: …)` once anything was paid; `Order cannot be cancelled now: its
-deposit could not be checked (…)`.
+chain first. Errors: unknown order; `PEG_NOT_READY: this order's deposit
+was signed (<txid>) and may already be on its way …` while a deposit this
+wallet signed is not yet seen (either provider; `peg_fund` sends it
+again); `PEG_NOT_READY: a payment already reached this order's deposit
+address …` (native peg-in: claim it instead); `Order can no longer be
+cancelled (status: …)` once anything was paid; `Order cannot be cancelled
+now: its deposit could not be checked (…)`.
 
 ## LiquiDEX swaps
 
@@ -1619,6 +1661,19 @@ derived from the seed and never sent. All six are *opens* and *network*,
 and fail with `Cross-chain swaps v1 require Liquid testnet`, `Cross-chain
 swaps v1 currently require a software wallet` or `Open a wallet with both
 Bitcoin and Liquid enabled` when those conditions are not met.
+
+The coordinator is not trusted. The terms a wallet creates or accepts
+(legs, assets, amounts, payment hash, keys, timeouts) are kept locally;
+fund, claim and refund rebuild both HTLCs from them and the wallet's own
+key, pay and verify against the rebuilt addresses, and refuse a row that
+disagrees: `The swap coordinator's record of swap N no longer matches the
+terms this wallet accepted (<fields>); nothing was signed.` A maker also
+refuses a taker timeout that leaves it no time to claim (`… leaves this
+wallet no safe time to claim …`); other refusals: `The swap coordinator
+answered for another swap`, `This swap lives on another swap coordinator;
+…`, `The preimage does not match the swap's payment hash`, and for a
+swap recorded before terms were kept, `… does not carry this wallet's
+key; nothing was signed.`
 
 ### `atomic_swap_create`
 

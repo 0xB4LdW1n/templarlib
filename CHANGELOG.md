@@ -81,6 +81,13 @@ with 0, any release may change the method contract.
   `confirmations_required`, `network_fee_included`; `get_liquid_network`
   names the `peg_provider` or why there is none. Stable tags
   `PEG_UNAVAILABLE`, `PEG_NOT_READY`, `PEG_EXPIRED`, `PEG_PROOF_REJECTED`.
+- Native peg-ins follow every payment to the deposit address:
+  `PegOrder.deposits` (`PegDeposit`: `outpoint`, `amount_sats`,
+  `confirmations`, `status` including `unclaimable`, `txid_claim`,
+  `primary`, `note`), each claimable with `peg_claim {order_id,
+  outpoint}`. The lab's optional `peg.pegout_min_sat` (default 100 000) is
+  honoured: smaller native peg-outs are refused (the lab would burn them)
+  and quoted as the minimum; the profile shows it.
 - SideSwap on Liquid testnet, when the joined test server's config names
   it for testnet: the same peg methods open SideSwap swap orders (a
   custodial third-party service on Bitcoin testnet3, not a peg; provider
@@ -172,6 +179,26 @@ with 0, any release may change the method contract.
   `Transaction`, …) are `elements` 0.27's.
 
 ### Fixed
+
+- Security review of the peg branch:
+  - a stored test-server profile is validated again when loaded (an
+    invalid one is dropped, with testnet as the fallback; it used to
+    panic the engine), and the app config is written atomically; lab
+    peg confirmations are capped at 1000;
+  - SideSwap and the peg's Bitcoin chain view are bounded by a deadline
+    per step, not only per read;
+  - the order book, the HTLC coordinator, the asset registry and the
+    peg's Esplora are read with no redirects, bounded bodies and error
+    texts without URLs; a login in the publish URL is never echoed;
+  - a peg-in claim whose broadcast answer was lost is sent again, never
+    signed twice; an order with a signed deposit, or a peg-in whose
+    address was already paid, cannot be cancelled;
+  - a SideSwap order completes only on a payout the wallet sees in a
+    block, new, not another order's, worth at least the quote;
+  - every Bitcoin sync, broadcast and lookup checks the Electrum server
+    is on the wallet's network (block 0);
+  - cross-chain swaps rebuild both HTLCs from the terms the wallet
+    accepted and refuse a coordinator that disagrees.
 
 - A LiquiDEX maker's wallet never saw the payment of a taken offer: the
   taker sealed the maker output's rangeproof with a random secret, which
