@@ -35,8 +35,9 @@ use templar_core::peg::{self as core_peg, BitcoinChainView, DepositFacts};
 use templar_core::{CoinChain, NativePegTerms, PegError, PegProvider, WalletProfile};
 
 use super::{
-    now_secs, persist, set_status, PegOrderDto, PegQuoteDto, PegStatusEntryDto, StoredOrder,
-    AWAITING_DEPOSIT, CLAIMABLE, COMPLETED, CONFIRMING, DEPOSIT_SEEN, EXPIRED, SETTLING,
+    now_secs, persist, set_status, PegDepositDto, PegOrderDto, PegQuoteDto, PegStatusEntryDto,
+    StoredOrder, AWAITING_DEPOSIT, CLAIMABLE, COMPLETED, CONFIRMING, DEPOSIT_SEEN, EXPIRED,
+    SETTLING,
 };
 use crate::state::AppState;
 
@@ -93,8 +94,152 @@ pub(super) struct NativeState {
     // ── signed, written before their broadcast ──
     #[serde(default)]
     pub pending_deposit_tx: Option<String>,
+    /// Orders written before per-deposit claims: their one claim. Moved
+    /// onto the order's deposit at the next status check.
     #[serde(default)]
     pub pending_claim_tx: Option<String>,
+    // ── peg-in deposits ──
+    /// Every output that paid the deposit address.
+    #[serde(default)]
+    pub deposits: Vec<StoredDeposit>,
+    /// The deposit the order follows (`txid:vout`): the one this wallet
+    /// paid, else the first that carried at least the expected amount.
+    #[serde(default)]
+    pub primary: Option<String>,
+}
+
+/// Most deposits followed per order: a flood of dust to the address must
+/// not make every status check fetch thousands of transactions.
+const MAX_DEPOSITS: usize = 64;
+
+/// One output paying a peg-in's deposit address, and its claim.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct StoredDeposit {
+    pub txid: String,
+    pub vout: u32,
+    pub amount: u64,
+    /// Bitcoin confirmation height; `None` in the mempool.
+    #[serde(default)]
+    pub height: Option<u32>,
+    /// Why this wallet cannot claim it; `None` = it can.
+    #[serde(default)]
+    pub unclaimable: Option<String>,
+    #[serde(default)]
+    pub claim_txid: Option<String>,
+    /// The signed claim, kept until it is in a block and rebroadcast as is
+    /// on a retry.
+    #[serde(default)]
+    pub pending_claim_tx: Option<String>,
+    /// The Bitcoin block the claim's merkle proof is anchored in.
+    #[serde(default)]
+    pub claim_block: Option<String>,
+    /// Liquid confirmations of the claim; `None` = not seen.
+    #[serde(default)]
+    pub claim_confirmations: Option<u32>,
+}
+
+impl StoredDeposit {
+    fn outpoint(&self) -> String {
+        format!("{}:{}", self.txid, self.vout)
+    }
+
+    fn confirmations(&self, tip: u32) -> u32 {
+        self.height
+            .map(|h| tip.saturating_sub(h).saturating_add(1))
+            .unwrap_or(0)
+    }
+
+    fn claimed(&self) -> bool {
+        self.claim_confirmations.is_some_and(|c| c >= 1)
+    }
+
+    /// This deposit's status (see `PegDepositDto::status`).
+    fn status(&self, tip: u32, required: u32) -> &'static str {
+        if self.unclaimable.is_some() {
+            return UNCLAIMABLE;
+        }
+        if self.claimed() {
+            return COMPLETED;
+        }
+        if self.claim_txid.is_some() {
+            return SETTLING;
+        }
+        pegin_status(self.confirmations(tip), required)
+    }
+}
+
+/// Status of a deposit this wallet cannot claim.
+pub(super) const UNCLAIMABLE: &str = "unclaimable";
+
+/// Records every output of `history` paying `spk`, fetching each
+/// transaction once. A transaction paying the address more than once is
+/// recorded but unclaimable: LWK claims a transaction that pays the
+/// address exactly once. Deposits the server no longer lists (replaced,
+/// reorganised away) are dropped unless a claim was made for them.
+fn scan_deposits(
+    deposits: &mut Vec<StoredDeposit>,
+    history: &[core_peg::ScriptHistoryItem],
+    spk: &bitcoin::Script,
+    mut fetch: impl FnMut(&bitcoin::Txid) -> Result<bitcoin::Transaction, String>,
+) -> Result<(), String> {
+    for item in history {
+        let txid = item.txid.to_string();
+        let mut known = false;
+        for d in deposits.iter_mut().filter(|d| d.txid == txid) {
+            d.height = item.height;
+            known = true;
+        }
+        if known || deposits.len() >= MAX_DEPOSITS {
+            continue;
+        }
+        let tx = fetch(&item.txid)?;
+        let paying: Vec<(u32, u64)> = tx
+            .output
+            .iter()
+            .enumerate()
+            .filter(|(_, out)| out.script_pubkey.as_script() == spk)
+            .map(|(vout, out)| (vout as u32, out.value.to_sat()))
+            .collect();
+        let note = (paying.len() > 1).then(|| {
+            format!(
+                "transaction {txid} pays the deposit address {} times; this wallet claims only a                  transaction that pays it once (the test server's operator can recover it)",
+                paying.len()
+            )
+        });
+        for (vout, amount) in paying {
+            deposits.push(StoredDeposit {
+                txid: txid.clone(),
+                vout,
+                amount,
+                height: item.height,
+                unclaimable: note.clone(),
+                ..StoredDeposit::default()
+            });
+        }
+    }
+    deposits
+        .retain(|d| d.claim_txid.is_some() || history.iter().any(|i| i.txid.to_string() == d.txid));
+    Ok(())
+}
+
+/// The deposit an order follows: the one this wallet paid (`funded`), else
+/// the first claimable one, in chain order, carrying at least `expected`.
+/// A smaller payment that arrives first (dust from whoever saw the address)
+/// is listed and claimable on its own, but never becomes the order's.
+fn choose_primary(
+    deposits: &[StoredDeposit],
+    funded: Option<&str>,
+    expected: u64,
+) -> Option<String> {
+    let claimable = || deposits.iter().filter(|d| d.unclaimable.is_none());
+    if let Some(txid) = funded {
+        if let Some(d) = claimable().find(|d| d.txid == txid) {
+            return Some(d.outpoint());
+        }
+    }
+    let mut by_chain: Vec<&StoredDeposit> = claimable().filter(|d| d.amount >= expected).collect();
+    by_chain.sort_by_key(|d| (d.height.unwrap_or(u32::MAX), d.txid.clone(), d.vout));
+    by_chain.first().map(|d| d.outpoint())
 }
 
 fn s(e: impl std::fmt::Display) -> String {
@@ -272,6 +417,7 @@ pub(super) fn start(
             valid_until_liquid_height: valid_until,
             last_error: None,
             expires_at: None,
+            deposits: Vec::new(),
         },
         native: Some(native),
         sideswap: None,
@@ -330,10 +476,6 @@ fn deposit_script(o: &StoredOrder) -> Result<bitcoin::ScriptBuf, String> {
     core_peg::bitcoin_script_for(&o.order.deposit_address, bitcoin::Network::Regtest).map_err(s)
 }
 
-fn txid_of(v: &Option<String>, what: &str) -> Result<bitcoin::Txid, String> {
-    bitcoin::Txid::from_str(hex_field(v, what)?).map_err(|e| format!("Stored {what}: {e}"))
-}
-
 fn liquid_txid_of(v: &Option<String>, what: &str) -> Result<elements::Txid, String> {
     elements::Txid::from_str(hex_field(v, what)?).map_err(|e| format!("Stored {what}: {e}"))
 }
@@ -363,6 +505,18 @@ fn terms_for(state: &AppState, o: &mut StoredOrder) -> Result<NativePegTerms, St
     }
 }
 
+/// Whether a completed native peg-in is still followed: it has a deposit
+/// that can still be claimed (or whose claim is not yet in a block).
+pub(super) fn follows_after_completion(o: &StoredOrder) -> bool {
+    o.order.status == COMPLETED
+        && o.order.direction == "in"
+        && o.native.as_ref().is_some_and(|n| {
+            n.deposits
+                .iter()
+                .any(|d| d.unclaimable.is_none() && !d.claimed())
+        })
+}
+
 /// Reads the order's progress from the chains; a failure is left in
 /// `last_error`.
 pub(super) fn refresh(state: &mut AppState, o: &mut StoredOrder, payouts_taken: &[String]) {
@@ -385,45 +539,128 @@ fn refresh_with(
 
 fn refresh_pegin(state: &AppState, t: &NativePegTerms, o: &mut StoredOrder) -> Result<(), String> {
     match o.order.status.as_str() {
-        SETTLING => return refresh_claim(state, o),
-        AWAITING_DEPOSIT | DEPOSIT_SEEN | CONFIRMING | CLAIMABLE => {}
+        AWAITING_DEPOSIT | DEPOSIT_SEEN | CONFIRMING | CLAIMABLE | SETTLING | COMPLETED => {}
         _ => return Ok(()),
     }
     let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
     let spk = deposit_script(o)?;
     let history = view.history(&spk).map_err(s)?;
-    // The deposit this wallet sent, else the first payment the address got.
-    let recorded = o.order.txid_deposit.clone();
-    let item = recorded
-        .as_deref()
-        .and_then(|txid| history.iter().find(|i| i.txid.to_string() == txid))
-        .or_else(|| history.first())
-        .cloned();
-    let Some(item) = item else {
-        if o.order.status == AWAITING_DEPOSIT && native_of(o)?.pending_deposit_tx.is_none() {
+    let tip = view.tip_height().map_err(s)?;
+    let funded = o.order.txid_deposit.clone();
+    let expected = o.order.deposit_expected_sats;
+    let legacy_claim = o.order.txid_claim.clone();
+    {
+        let n = native_mut(o)?;
+        scan_deposits(&mut n.deposits, &history, &spk, |txid| {
+            view.transaction(txid).map_err(s)
+        })?;
+        if n.primary
+            .as_ref()
+            .is_some_and(|p| !n.deposits.iter().any(|d| &d.outpoint() == p))
+        {
+            n.primary = None;
+        }
+        if n.primary.is_none() {
+            n.primary = choose_primary(&n.deposits, funded.as_deref(), expected);
+        }
+        // An order written before per-deposit claims: its claim belongs to
+        // the deposit it followed.
+        if let Some(primary) = n.primary.clone() {
+            let legacy_pending = n.pending_claim_tx.take();
+            if let Some(d) = n.deposits.iter_mut().find(|d| d.outpoint() == primary) {
+                if d.claim_txid.is_none() {
+                    d.claim_txid = legacy_claim;
+                    d.pending_claim_tx = legacy_pending;
+                }
+            }
+        }
+        if n.deposits
+            .iter()
+            .any(|d| d.txid == funded.clone().unwrap_or_default())
+        {
+            n.pending_deposit_tx = None;
+        }
+    }
+    // Claims first: a claim already signed (maybe broadcast, maybe lost) is
+    // followed by its txid, never signed again.
+    refresh_claims(state, o)?;
+    let required = t.pegin_confirmations;
+    let n = native_of(o)?.clone();
+    let primary = n
+        .primary
+        .as_ref()
+        .and_then(|p| n.deposits.iter().find(|d| &d.outpoint() == p));
+    match primary {
+        Some(d) => {
+            let confirmations = d.confirmations(tip);
+            o.order.txid_deposit = Some(d.txid.clone());
+            o.order.deposit_received_sats = Some(d.amount);
+            o.order.confirmations = confirmations;
+            o.order.txid_claim = d.claim_txid.clone();
+            let status = d.status(tip, required);
+            o.order.eta_minutes = match status {
+                COMPLETED => 0,
+                SETTLING => LIQUID_BLOCK_MINUTES,
+                _ => eta_minutes("in", required, confirmations),
+            };
+            if status == COMPLETED {
+                o.order.txid_payout = d.claim_txid.clone();
+            }
+            set_status(&mut o.order, status, now_secs());
+        }
+        None if n.deposits.is_empty()
+            && o.order.status == AWAITING_DEPOSIT
+            && n.pending_deposit_tx.is_none() =>
+        {
+            o.order.deposits = Vec::new();
             return renew_or_expire(state, o);
         }
-        return Ok(());
-    };
-    let tx = view.transaction(&item.txid).map_err(s)?;
-    let received: u64 = tx
-        .output
+        None => {}
+    }
+    o.order.deposits = n
+        .deposits
         .iter()
-        .filter(|out| out.script_pubkey == spk)
-        .map(|out| out.value.to_sat())
-        .sum();
-    let tip = view.tip_height().map_err(s)?;
-    let confirmations = BitcoinChainView::confirmations(&item, tip);
-    o.order.txid_deposit = Some(item.txid.to_string());
-    o.order.deposit_received_sats = Some(received);
-    o.order.confirmations = confirmations;
-    o.order.eta_minutes = eta_minutes("in", t.pegin_confirmations, confirmations);
-    native_mut(o)?.pending_deposit_tx = None;
-    set_status(
-        &mut o.order,
-        pegin_status(confirmations, t.pegin_confirmations),
-        now_secs(),
-    );
+        .map(|d| PegDepositDto {
+            outpoint: d.outpoint(),
+            amount_sats: d.amount,
+            confirmations: d.confirmations(tip),
+            status: d.status(tip, required).to_string(),
+            txid_claim: d.claim_txid.clone(),
+            primary: n.primary.as_deref() == Some(d.outpoint().as_str()),
+            note: d.unclaimable.clone(),
+        })
+        .collect();
+    Ok(())
+}
+
+/// Reads the Liquid confirmations of every claim made and not yet in a
+/// block. A claim seen in a block drops its stored bytes.
+fn refresh_claims(state: &AppState, o: &mut StoredOrder) -> Result<(), String> {
+    let open: Vec<usize> = native_of(o)?
+        .deposits
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.claim_txid.is_some() && !d.claimed())
+        .map(|(i, _)| i)
+        .collect();
+    if open.is_empty() {
+        return Ok(());
+    }
+    let payout = state
+        .liquid_network
+        .parse_address(&o.order.payout_address)
+        .map_err(s)?
+        .script_pubkey();
+    let chain = state.liquid_chain()?;
+    let n = native_mut(o)?;
+    for i in open {
+        let d = &mut n.deposits[i];
+        let txid = liquid_txid_of(&d.claim_txid, "claim txid")?;
+        d.claim_confirmations = chain.tx_confirmations(&txid, &payout).map_err(s)?;
+        if d.claimed() {
+            d.pending_claim_tx = None;
+        }
+    }
     Ok(())
 }
 
@@ -454,27 +691,6 @@ fn renew_or_expire(state: &AppState, o: &mut StoredOrder) -> Result<(), String> 
             .into(),
     )
     .to_string())
-}
-
-fn refresh_claim(state: &AppState, o: &mut StoredOrder) -> Result<(), String> {
-    let txid = liquid_txid_of(&o.order.txid_claim, "claim txid")?;
-    let payout = state
-        .liquid_network
-        .parse_address(&o.order.payout_address)
-        .map_err(s)?
-        .script_pubkey();
-    let chain = state.liquid_chain()?;
-    match chain.tx_confirmations(&txid, &payout).map_err(s)? {
-        Some(c) if c >= 1 => {
-            native_mut(o)?.pending_claim_tx = None;
-            o.order.txid_payout = Some(txid.to_string());
-            o.order.eta_minutes = 0;
-            set_status(&mut o.order, COMPLETED, now_secs());
-        }
-        Some(_) => native_mut(o)?.pending_claim_tx = None,
-        None => {}
-    }
-    Ok(())
 }
 
 fn refresh_pegout(
@@ -742,10 +958,50 @@ fn check_pegout_tx(
     Ok(())
 }
 
+/// What `peg_claim` does for one deposit.
+#[derive(Debug, PartialEq, Eq)]
+enum ClaimStep {
+    /// Sign and broadcast a new claim.
+    Build,
+    /// A claim was signed before and is not in a block: send those bytes
+    /// again, never a second claim.
+    Rebroadcast(String),
+}
+
+fn claim_step(d: &StoredDeposit, tip: u32, required: u32) -> Result<ClaimStep, String> {
+    if let Some(why) = &d.unclaimable {
+        return Err(PegError::Unavailable(format!(
+            "deposit {} cannot be claimed by this wallet: {why}",
+            d.outpoint()
+        ))
+        .to_string());
+    }
+    if d.claimed() || d.claim_confirmations == Some(0) {
+        return Err(not_ready(format!(
+            "deposit {} was already claimed ({}).",
+            d.outpoint(),
+            d.claim_txid.as_deref().unwrap_or("?")
+        )));
+    }
+    if let Some(raw) = &d.pending_claim_tx {
+        return Ok(ClaimStep::Rebroadcast(raw.clone()));
+    }
+    let confirmations = d.confirmations(tip);
+    if confirmations < required {
+        return Err(not_ready(format!(
+            "the deposit has {confirmations} of the {required} Bitcoin confirmations a claim needs."
+        )));
+    }
+    Ok(ClaimStep::Build)
+}
+
+/// Claims one deposit of a native peg-in (`outpoint`, default the order's
+/// own) — the user-confirmed signing step.
 pub(super) fn claim(
     state: &mut AppState,
     t: &NativePegTerms,
     o: &mut StoredOrder,
+    outpoint: Option<&str>,
 ) -> Result<(), String> {
     if o.order.direction != "in" {
         return Err(not_ready(
@@ -757,32 +1013,95 @@ pub(super) fn claim(
     o.order.last_error = fresh.as_ref().err().cloned();
     persist(&state.data_dir, o)?;
     fresh?;
-    let pending = native_of(o)?.pending_claim_tx.clone();
-    match (o.order.status.as_str(), pending) {
-        (CLAIMABLE, _) => {}
-        (SETTLING, Some(raw)) => {
-            // Claimed before, not seen on chain yet: the same bytes again.
+    if o.order.status == EXPIRED {
+        return Err(PegError::Expired("this order expired.".into()).to_string());
+    }
+    let n = native_of(o)?.clone();
+    let target = match outpoint {
+        Some(op) => op.trim().to_string(),
+        None => n.primary.clone().ok_or_else(|| {
+            not_ready(if n.deposits.is_empty() {
+                "no deposit has arrived yet.".to_string()
+            } else {
+                "no deposit of the expected amount has arrived yet; claim one of the listed \
+                 deposits by its outpoint."
+                    .to_string()
+            })
+        })?,
+    };
+    let d = n
+        .deposits
+        .iter()
+        .find(|d| d.outpoint() == target)
+        .ok_or_else(|| not_ready(format!("no deposit {target} on this order.")))?
+        .clone();
+    let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
+    let tip = view.tip_height().map_err(s)?;
+    match claim_step(&d, tip, t.pegin_confirmations)? {
+        ClaimStep::Build => build_claim(state, t, o, &d, &view),
+        ClaimStep::Rebroadcast(raw) => {
             let bytes = hex::decode(raw).map_err(|e| format!("Stored claim: {e}"))?;
             let tx: elements::Transaction =
                 encode::deserialize(&bytes).map_err(|e| format!("Stored claim: {e}"))?;
-            state.liquid_chain()?.broadcast(&tx).map_err(s)?;
-            return Ok(());
-        }
-        (SETTLING | COMPLETED, None) => {
-            return Err(not_ready(format!(
-                "this peg-in was already claimed ({}).",
-                o.order.txid_claim.as_deref().unwrap_or("?")
-            )))
-        }
-        (AWAITING_DEPOSIT, _) => return Err(not_ready("no deposit has arrived yet.")),
-        (EXPIRED, _) => return Err(PegError::Expired("this order expired.".into()).to_string()),
-        (_, _) => {
-            return Err(not_ready(format!(
-                "the deposit has {} of the {} Bitcoin confirmations a claim needs.",
-                o.order.confirmations, t.pegin_confirmations
-            )))
+            match state.liquid_chain()?.broadcast(&tx) {
+                Ok(_) => {
+                    eprintln!(
+                        "[templarlib] peg-in {} claim rebroadcast: {}",
+                        o.order.order_id,
+                        tx.txid()
+                    );
+                    after_claim(o, &d.outpoint());
+                    persist(&state.data_dir, o)
+                }
+                Err(e) => {
+                    // Refused: the claim may rest on a block no longer in the
+                    // chain (a reorg). Read the evidence again; only a moved
+                    // block justifies a new claim.
+                    let txid = bitcoin::Txid::from_str(&d.txid).map_err(s)?;
+                    let facts = DepositFacts::read(&view, &deposit_script(o)?, &txid).map_err(s)?;
+                    if d.claim_block.as_deref() == Some(facts.block_hash.to_string().as_str()) {
+                        return Err(format!("The node refused the claim {}: {e}", tx.txid()));
+                    }
+                    let mut fresh = d.clone();
+                    fresh.claim_txid = None;
+                    fresh.pending_claim_tx = None;
+                    fresh.claim_block = None;
+                    fresh.claim_confirmations = None;
+                    if let Some(slot) = native_mut(o)?
+                        .deposits
+                        .iter_mut()
+                        .find(|x| x.outpoint() == d.outpoint())
+                    {
+                        *slot = fresh.clone();
+                    }
+                    persist(&state.data_dir, o)?;
+                    build_claim(state, t, o, &fresh, &view)
+                }
+            }
         }
     }
+}
+
+/// The order after a claim of `outpoint` went out: settling if it was the
+/// order's own deposit.
+fn after_claim(o: &mut StoredOrder, outpoint: &str) {
+    let primary = o.native.as_ref().and_then(|n| n.primary.as_deref()) == Some(outpoint);
+    if primary {
+        o.order.eta_minutes = LIQUID_BLOCK_MINUTES;
+        set_status(&mut o.order, SETTLING, now_secs());
+    }
+}
+
+/// Verifies the evidence of deposit `d` against the wallet's chain view,
+/// then signs and broadcasts its claim. The signed claim is stored on the
+/// deposit before the broadcast.
+fn build_claim(
+    state: &mut AppState,
+    t: &NativePegTerms,
+    o: &mut StoredOrder,
+    d: &StoredDeposit,
+    view: &BitcoinChainView,
+) -> Result<(), String> {
     open_software_wallet(state, &o.order.wallet_id)?;
     let n = native_of(o)?.clone();
     let index = n
@@ -791,11 +1110,10 @@ pub(super) fn claim(
     let fedpeg_height = n
         .fedpeg_height
         .ok_or("The order is missing its federation height")?;
-    let txid = txid_of(&o.order.txid_deposit, "deposit txid")?;
+    let txid = bitcoin::Txid::from_str(&d.txid).map_err(|e| format!("Deposit txid: {e}"))?;
 
     // The wallet's own chain view, then the evidence, checked against it.
-    let view = BitcoinChainView::connect(&state.bitcoin_backend().electrum_url).map_err(s)?;
-    let facts = DepositFacts::read(&view, &deposit_script(o)?, &txid).map_err(s)?;
+    let facts = DepositFacts::read(view, &deposit_script(o)?, &txid).map_err(s)?;
     let (tx_bytes, proof_bytes) =
         core_peg::fetch_pegin_evidence(&t.esplora_url, &txid).map_err(s)?;
 
@@ -833,6 +1151,14 @@ pub(super) fn claim(
         t.pegin_confirmations,
     )
     .map_err(s)?;
+    if funding.deposit().outpoint().vout != d.vout {
+        return Err(PegError::ProofRejected(format!(
+            "the evidence is for output {} of {txid}, not {}",
+            funding.deposit().outpoint().vout,
+            d.vout
+        ))
+        .to_string());
+    }
     let deposit = funding.deposit().amount().to_sat();
 
     let mut pset = liq
@@ -869,19 +1195,33 @@ pub(super) fn claim(
         )
         .to_string());
     }
-    o.order.txid_claim = Some(tx.txid().to_string());
-    o.order.deposit_received_sats = Some(deposit);
-    o.order.payout_expected_sats = deposit.saturating_sub(fee);
-    native_mut(o)?.pending_claim_tx = Some(encode::serialize_hex(&tx));
+    let outpoint = d.outpoint();
+    let is_primary = n.primary.as_deref() == Some(outpoint.as_str());
+    {
+        let n = native_mut(o)?;
+        let slot = n
+            .deposits
+            .iter_mut()
+            .find(|x| x.outpoint() == outpoint)
+            .ok_or("The deposit vanished from the order")?;
+        slot.claim_txid = Some(tx.txid().to_string());
+        slot.pending_claim_tx = Some(encode::serialize_hex(&tx));
+        slot.claim_block = Some(facts.block_hash.to_string());
+        slot.claim_confirmations = None;
+    }
+    if is_primary {
+        o.order.txid_claim = Some(tx.txid().to_string());
+        o.order.deposit_received_sats = Some(deposit);
+        o.order.payout_expected_sats = deposit.saturating_sub(fee);
+    }
     persist(&state.data_dir, o)?;
     chain.broadcast(&tx).map_err(s)?;
     eprintln!(
-        "[templarlib] peg-in {} claim broadcast: {}",
+        "[templarlib] peg-in {} claim of {outpoint} broadcast: {}",
         o.order.order_id,
         tx.txid()
     );
-    o.order.eta_minutes = LIQUID_BLOCK_MINUTES;
-    set_status(&mut o.order, SETTLING, now_secs());
+    after_claim(o, &outpoint);
     persist(&state.data_dir, o)
 }
 
@@ -899,6 +1239,143 @@ mod tests {
             pegout_confirmations: 3,
             pegout_max_sat: 100_000_000,
         }
+    }
+
+    fn tx_paying(spk: &bitcoin::Script, amounts: &[u64], salt: u8) -> bitcoin::Transaction {
+        let mut output: Vec<bitcoin::TxOut> = amounts
+            .iter()
+            .map(|a| bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(*a),
+                script_pubkey: spk.to_owned(),
+            })
+            .collect();
+        output.push(bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(1_000 + u64::from(salt)),
+            script_pubkey: bitcoin::ScriptBuf::new_op_return([salt; 4]),
+        });
+        bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![],
+            output,
+        }
+    }
+
+    fn item(tx: &bitcoin::Transaction, height: Option<u32>) -> core_peg::ScriptHistoryItem {
+        core_peg::ScriptHistoryItem {
+            txid: tx.compute_txid(),
+            height,
+        }
+    }
+
+    #[test]
+    fn every_deposit_is_tracked_and_dust_first_does_not_take_the_order() {
+        let spk = bitcoin::ScriptBuf::new_p2sh(&bitcoin::ScriptHash::from_byte_array([4u8; 20]));
+        let dust = tx_paying(&spk, &[546], 1);
+        let real = tx_paying(&spk, &[200_000], 2);
+        let twice = tx_paying(&spk, &[30_000, 40_000], 3);
+        let later = tx_paying(&spk, &[500_000], 4);
+        let txs = [dust.clone(), real.clone(), twice.clone(), later.clone()];
+        let fetch = |txid: &bitcoin::Txid| {
+            txs.iter()
+                .find(|t| t.compute_txid() == *txid)
+                .cloned()
+                .ok_or_else(|| "unknown".to_string())
+        };
+        let history = vec![
+            item(&dust, Some(100)),
+            item(&real, Some(101)),
+            item(&twice, Some(102)),
+            item(&later, None),
+        ];
+        let mut deposits = Vec::new();
+        scan_deposits(&mut deposits, &history, &spk, fetch).unwrap();
+        assert_eq!(deposits.len(), 5, "{deposits:?}");
+        // The dust came first; the order follows the deposit of its amount.
+        let primary = choose_primary(&deposits, None, 200_000).unwrap();
+        assert_eq!(primary, format!("{}:0", real.compute_txid()));
+        // The wallet's own payment wins whatever came first.
+        let own = choose_primary(&deposits, Some(&later.compute_txid().to_string()), 200_000);
+        assert_eq!(own, Some(format!("{}:0", later.compute_txid())));
+        // A transaction paying the address twice: both outputs listed,
+        // neither claimable, with the reason.
+        let both: Vec<_> = deposits
+            .iter()
+            .filter(|d| d.txid == twice.compute_txid().to_string())
+            .collect();
+        assert_eq!(both.len(), 2);
+        assert!(both.iter().all(|d| d.status(103, 2) == UNCLAIMABLE));
+        assert!(both[0].unclaimable.as_deref().unwrap().contains("2 times"));
+        // Later payments stay tracked and claimable on their own.
+        let dust_d = deposits.iter().find(|d| d.amount == 546).unwrap();
+        assert_eq!(dust_d.status(103, 2), CLAIMABLE);
+        let later_d = deposits.iter().find(|d| d.amount == 500_000).unwrap();
+        assert_eq!(later_d.status(103, 2), DEPOSIT_SEEN);
+        // A rescan does not fetch known transactions again and updates
+        // heights; a deposit gone from the server's history is dropped
+        // unless a claim was made for it.
+        deposits
+            .iter_mut()
+            .find(|d| d.amount == 546)
+            .unwrap()
+            .claim_txid = Some("aa".repeat(32));
+        let history = vec![item(&real, Some(101)), item(&later, Some(104))];
+        scan_deposits(&mut deposits, &history, &spk, |_| Err("no fetch".into())).unwrap();
+        assert_eq!(deposits.len(), 3);
+        assert_eq!(
+            deposits
+                .iter()
+                .find(|d| d.amount == 500_000)
+                .unwrap()
+                .height,
+            Some(104)
+        );
+        assert!(deposits.iter().any(|d| d.amount == 546));
+    }
+
+    #[test]
+    fn a_signed_claim_is_sent_again_never_signed_again() {
+        let mut d = StoredDeposit {
+            txid: "bb".repeat(32),
+            vout: 1,
+            amount: 200_000,
+            height: Some(100),
+            ..StoredDeposit::default()
+        };
+        // Too shallow, then deep enough.
+        let err = claim_step(&d, 100, 2).unwrap_err();
+        assert!(
+            err.starts_with("PEG_NOT_READY:") && err.contains("1 of the 2"),
+            "{err}"
+        );
+        assert_eq!(claim_step(&d, 101, 2).unwrap(), ClaimStep::Build);
+        // A claim was signed and stored, and its broadcast answer lost:
+        // the same bytes go out again, not a second claim.
+        d.claim_txid = Some("cc".repeat(32));
+        d.pending_claim_tx = Some("00ff".into());
+        assert_eq!(
+            claim_step(&d, 101, 2).unwrap(),
+            ClaimStep::Rebroadcast("00ff".into())
+        );
+        assert_eq!(d.status(101, 2), SETTLING);
+        // In the mempool, or in a block: already claimed.
+        d.claim_confirmations = Some(0);
+        assert!(claim_step(&d, 101, 2)
+            .unwrap_err()
+            .starts_with("PEG_NOT_READY:"));
+        d.claim_confirmations = Some(1);
+        assert_eq!(d.status(101, 2), COMPLETED);
+        assert!(claim_step(&d, 101, 2)
+            .unwrap_err()
+            .contains("already claimed"));
+        // Never claimable.
+        let bad = StoredDeposit {
+            unclaimable: Some("pays twice".into()),
+            ..d.clone()
+        };
+        assert!(claim_step(&bad, 101, 2)
+            .unwrap_err()
+            .starts_with("PEG_UNAVAILABLE:"));
     }
 
     #[test]

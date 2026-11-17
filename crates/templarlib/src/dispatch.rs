@@ -826,10 +826,11 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         }
 
         "peg_claim" => {
-            let p: peg::PegOrderIdParams =
+            let p: peg::PegClaimParams =
                 serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
             reg::reload_registry(state)?;
-            peg::claim(state, &p.order_id).map(|v| serde_json::to_value(v).unwrap())
+            peg::claim(state, &p.order_id, p.outpoint.as_deref())
+                .map(|v| serde_json::to_value(v).unwrap())
         }
 
         // ── LiquiDEX swaps / order book ───────────────────────────────────────

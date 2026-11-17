@@ -148,6 +148,30 @@ pub struct PegOrderDto {
     /// null when the order does not expire.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// Native peg-in: every output that paid the deposit address, each
+    /// claimable on its own (`peg_claim` with its `outpoint`). Empty
+    /// otherwise.
+    #[serde(default)]
+    pub deposits: Vec<PegDepositDto>,
+}
+
+/// One payment to a native peg-in's deposit address.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PegDepositDto {
+    /// `txid:vout` of the Bitcoin output.
+    pub outpoint: String,
+    pub amount_sats: u64,
+    /// Bitcoin confirmations (0 in the mempool).
+    pub confirmations: u32,
+    /// `deposit_seen` | `confirming` | `claimable` | `settling` (claim
+    /// signed, not yet in a block) | `completed` (claimed) | `unclaimable`
+    /// (`note` says why).
+    pub status: String,
+    pub txid_claim: Option<String>,
+    /// True for the deposit the order itself follows (the one its status,
+    /// `txid_deposit` and `txid_claim` describe).
+    pub primary: bool,
+    pub note: Option<String>,
 }
 
 // ── Params (deserialized by dispatch.rs) ────────────────────────────────────
@@ -176,6 +200,16 @@ pub struct PegOrderIdParams {
 #[derive(Deserialize, Debug)]
 pub struct PegListParams {
     pub wallet_id: String,
+}
+
+/// `peg_claim`.
+#[derive(Deserialize, Debug)]
+pub struct PegClaimParams {
+    pub order_id: String,
+    /// The deposit to claim (`txid:vout` from `deposits`); default the
+    /// order's own deposit.
+    #[serde(default)]
+    pub outpoint: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -311,15 +345,37 @@ pub fn list(state: &mut AppState, wallet_id: &str) -> Result<Vec<PegOrderDto>, S
     Ok(out)
 }
 
-/// Cancel an order — only while nothing has been paid to it. A native
-/// peg-in is read from the chain first: a deposit that already arrived
-/// (or a chain that cannot be read) refuses the cancel.
+/// Cancel an order — only while nothing has been paid to it. A deposit
+/// this wallet signed (maybe already on its way) refuses the cancel; a
+/// native peg-in is read from the chain first, and any payment to its
+/// address (or a chain that cannot be read) refuses it too.
 pub fn cancel(state: &mut AppState, order_id: &str) -> Result<PegOrderDto, String> {
     let mut store = load_store(&state.data_dir)?;
     let index = find_index(&store, order_id)?;
     let taken = payouts_taken(&store, order_id);
     let order = &mut store.orders[index];
+    if let Some(txid) = order.signed_deposit() {
+        return Err(PegError::NotReady(format!(
+            "this order's deposit was signed ({txid}) and may already be on its way, so the \
+             order cannot be cancelled. Use peg_fund to send the same deposit again, or wait \
+             for it to show."
+        ))
+        .to_string());
+    }
     refresh(state, order, &taken);
+    if order
+        .native
+        .as_ref()
+        .is_some_and(|n| !n.deposits.is_empty())
+    {
+        save_store(&state.data_dir, &store)?;
+        return Err(PegError::NotReady(
+            "a payment already reached this order's deposit address, so the order cannot be \
+             cancelled; claim it instead."
+                .into(),
+        )
+        .to_string());
+    }
     if order.order.status != AWAITING_DEPOSIT {
         let status = order.order.status.clone();
         save_store(&state.data_dir, &store)?;
@@ -360,13 +416,17 @@ pub fn fund(
 
 /// Claim a native peg-in once its deposit is deep enough — the
 /// user-confirmed signing step of a peg-in.
-pub fn claim(state: &mut AppState, order_id: &str) -> Result<PegOrderDto, String> {
+pub fn claim(
+    state: &mut AppState,
+    order_id: &str,
+    outpoint: Option<&str>,
+) -> Result<PegOrderDto, String> {
     let store = load_store(&state.data_dir)?;
     let mut order = store.orders[find_index(&store, order_id)?].clone();
     refuse_simulated(&order)?;
     let provider = provider_of(state, &order)?;
     match provider {
-        PegProvider::Native(terms) => native::claim(state, &terms, &mut order)?,
+        PegProvider::Native(terms) => native::claim(state, &terms, &mut order, outpoint)?,
         PegProvider::SideSwap { .. } => {
             return Err(PegError::Unavailable(
                 "SideSwap pays out by itself; there is nothing to claim.".into(),
@@ -433,7 +493,7 @@ fn set_status(order: &mut PegOrderDto, status: &str, now: u64) -> bool {
 /// Reads an order's progress from the chains. Returns whether anything
 /// about it changed (and must be saved). Never signs anything.
 fn refresh(state: &mut AppState, order: &mut StoredOrder, payouts_taken: &[String]) -> bool {
-    if is_terminal(&order.order.status) {
+    if is_terminal(&order.order.status) && !native::follows_after_completion(order) {
         return false;
     }
     if order.order.simulated {
@@ -498,6 +558,29 @@ fn new_order_id(store: &PegStore) -> String {
 }
 
 // ── Persistence ──────────────────────────────────────────────────────────────
+
+impl StoredOrder {
+    /// The txid of a deposit this wallet signed and stored before its
+    /// broadcast, while it is not yet seen on chain.
+    fn signed_deposit(&self) -> Option<String> {
+        let pending = self
+            .native
+            .as_ref()
+            .map(|n| n.pending_deposit_tx.is_some())
+            .or_else(|| {
+                self.sideswap
+                    .as_ref()
+                    .map(|s| s.pending_deposit_tx.is_some())
+            })
+            .unwrap_or(false);
+        pending.then(|| {
+            self.order
+                .txid_deposit
+                .clone()
+                .unwrap_or_else(|| "?".into())
+        })
+    }
+}
 
 /// One order as stored: the host's DTO plus the provider's own state. The
 /// DTO is flattened, so files written before the provider state existed
@@ -642,7 +725,7 @@ mod tests {
             err.starts_with("PEG_UNAVAILABLE:") && err.contains("simulated"),
             "{err}"
         );
-        let err = claim(&mut state, "pg_00000002").unwrap_err();
+        let err = claim(&mut state, "pg_00000002", None).unwrap_err();
         assert!(err.starts_with("PEG_UNAVAILABLE:"), "{err}");
         let s = status(&mut state, "pg_00000002").unwrap();
         assert_eq!(s.txid_payout.as_deref(), Some("cc"));
@@ -689,6 +772,40 @@ mod tests {
         assert_eq!(o.updated_at, 5);
         assert_eq!(o.status_history.len(), 1);
         assert!(is_terminal(EXPIRED) && is_terminal(COMPLETED) && !is_terminal(CLAIMABLE));
+    }
+
+    #[test]
+    fn an_order_with_a_signed_deposit_cannot_be_cancelled() {
+        let mut state = test_state("pending_cancel");
+        let order = |id: &str, provider: &str| {
+            serde_json::json!({
+                "order_id": id, "wallet_id": "w", "direction": "out",
+                "status": "awaiting_deposit", "deposit_address": "",
+                "deposit_expected_sats": 50000, "payout_address": "bcrt1q",
+                "payout_expected_sats": 50000, "created_at": 1, "updated_at": 1,
+                "eta_minutes": 1, "txid_deposit": "dd".repeat(32), "txid_payout": null,
+                "simulated": false, "status_history": [], "provider": provider
+            })
+        };
+        let mut native = order("pg_native01", "native");
+        native["native"] = serde_json::json!({
+            "lab_url": "http://127.0.0.1:8096", "instance_id": "11".repeat(32),
+            "pending_deposit_tx": "0200"
+        });
+        let mut swap = order("pg_sswap001", "sideswap");
+        swap["sideswap"] = serde_json::json!({
+            "url": "wss://api-testnet.sideswap.io/json-rpc-ws",
+            "order_id": "ee".repeat(32), "peg_in": false, "pending_deposit_tx": "0200"
+        });
+        let store = serde_json::json!({ "orders": [native, swap] });
+        fs::write(state.data_dir.join(STORE_FILE), store.to_string()).unwrap();
+        for id in ["pg_native01", "pg_sswap001"] {
+            let err = cancel(&mut state, id).unwrap_err();
+            assert!(err.starts_with("PEG_NOT_READY:"), "{err}");
+            assert!(err.contains(&"dd".repeat(32)), "{err}");
+        }
+        let listed = list(&mut state, "w").unwrap();
+        assert!(listed.iter().all(|o| o.status == AWAITING_DEPOSIT));
     }
 
     #[test]

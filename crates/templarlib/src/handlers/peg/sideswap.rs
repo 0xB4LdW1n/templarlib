@@ -190,6 +190,7 @@ pub(super) fn start(
             valid_until_liquid_height: None,
             last_error: None,
             expires_at: (order.expires_at > 0).then_some(order.expires_at / 1000),
+            deposits: Vec::new(),
         },
         native: None,
         sideswap: Some(SideSwapState {
