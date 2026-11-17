@@ -28,6 +28,7 @@ pub const METHODS: &[&str] = &[
     "get_test_server",
     "set_test_server",
     "clear_test_server",
+    "test_server_faucet",
     "vault_status",
     "setup_vault",
     "unlock_vault",

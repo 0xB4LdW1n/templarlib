@@ -128,6 +128,41 @@ impl<'a> Endpoints<'a> {
         self.route(None, "/api/atomic-swaps")
     }
 
+    /// The order book's public asset registry, `…/api/assets` (same origin
+    /// as the book, the markets and publish; no variable overrides it).
+    pub fn assets_url(&self) -> Resolved<String> {
+        self.route(None, "/api/assets")
+    }
+
+    /// Whether `liquid` is the joined test server's own regtest (an
+    /// environment policy asset pointing elsewhere is not).
+    pub fn is_lab_regtest(&self, liquid: &LiquidNetwork) -> bool {
+        self.profile.is_some_and(|p| {
+            liquid.is_regtest() && p.regtest.liquid_network().ok().as_ref() == Some(liquid)
+        })
+    }
+
+    /// The Templar Protocol (lending) site of the network `liquid`: the
+    /// joined lab's `protocol_url` on its own regtest; none otherwise (the
+    /// protocol runs on no public network yet).
+    pub fn protocol_url(&self, liquid: &LiquidNetwork) -> Option<Resolved<String>> {
+        let p = self.profile?;
+        let url = p.protocol_url.clone()?;
+        self.is_lab_regtest(liquid)
+            .then(|| Resolved::new(url, Source::Profile))
+    }
+
+    /// The joined lab's faucet when `liquid` is the lab's own regtest: its
+    /// URL and the assets it pays. Never on testnet.
+    pub fn faucet(
+        &self,
+        liquid: &LiquidNetwork,
+    ) -> Option<(String, Vec<crate::test_server::FaucetAsset>)> {
+        let p = self.profile?;
+        self.is_lab_regtest(liquid)
+            .then(|| (p.regtest.faucet_url.clone(), p.regtest.faucet_assets()))
+    }
+
     /// The Liquid regtest to run on: the environment's policy asset
     /// (`TEMPLAR_LIQUID_REGTEST_POLICY_ASSET`), else the test server's
     /// policy asset and genesis, else `setting` (a regtest the user chose by

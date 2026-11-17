@@ -2,8 +2,6 @@
 //! answered by a closure, so a test can stand in for the order book, the
 //! HTLC coordinator, the asset registry or a lab's faucet.
 
-#![allow(dead_code)] // helpers used by some tests only
-
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 

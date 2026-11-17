@@ -310,6 +310,51 @@ pub struct TestServerDto {
     pub applied: Option<TestServerAppliedDto>,
     /// The servers in use after the call.
     pub active: ActiveEndpointsDto,
+    /// The joined lab's faucet; null when no lab is joined.
+    pub faucet: Option<FaucetInfoDto>,
+}
+
+/// `TestServer.faucet`: what the joined lab's faucet pays and whether
+/// `test_server_faucet` can ask it now.
+#[derive(Serialize, Debug)]
+pub struct FaucetInfoDto {
+    /// The faucet's `POST` URL (from the lab's config).
+    pub url: String,
+    /// `profile`: the lab lists what its faucet pays; `default`: an older
+    /// lab that does not, so the wallet offers `btc` and `lbtc` only.
+    pub assets_source: String,
+    /// What the faucet pays.
+    pub assets: Vec<templar_core::test_server::FaucetAsset>,
+    /// The active network is the lab's regtest, so `test_server_faucet`
+    /// may ask it (never on testnet).
+    pub available: bool,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct TestServerFaucetParams {
+    pub wallet_id: String,
+    /// `btc`, `lbtc`, or the ticker or asset id of a lab asset the faucet
+    /// lists (case-insensitive).
+    pub asset: String,
+}
+
+/// `test_server_faucet`: what the lab's faucet paid to this wallet.
+#[derive(Serialize, Debug)]
+pub struct FaucetPaymentDto {
+    pub txid: String,
+    /// The faucet's name of the asset paid (`btc`, `lbtc`, a lab ticker).
+    pub asset: String,
+    /// `bitcoin-regtest` | `liquid-regtest`.
+    pub network: String,
+    /// Base units paid.
+    pub amount_sat: u64,
+    /// The wallet's own fresh receive address the faucet paid.
+    pub address: String,
+    /// Display metadata of the asset, from the lab's list.
+    pub ticker: String,
+    pub precision: u8,
+    /// The Liquid asset id; null for Bitcoin.
+    pub asset_id: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -356,6 +401,8 @@ pub struct OrderbookEndpointsDto {
     pub publish: SourcedUrlDto,
     /// The HTLC v1 coordinator.
     pub atomic_swaps: SourcedUrlDto,
+    /// The public asset registry (`GET`/`POST …/api/assets`).
+    pub assets: SourcedUrlDto,
 }
 
 #[derive(Serialize, Debug)]
@@ -391,6 +438,10 @@ pub struct ActiveEndpointsDto {
     pub orderbook: OrderbookEndpointsDto,
     pub liquid: LiquidEndpointDto,
     pub bitcoin: BitcoinEndpointDto,
+    /// The Templar Protocol (lending) site for the active network: the
+    /// joined lab's on its own regtest (`source` `profile`); null when there
+    /// is none.
+    pub protocol: Option<SourcedUrlDto>,
 }
 
 #[derive(Deserialize, Debug)]

@@ -31,6 +31,9 @@ pub enum TemplarError {
 
     #[error(transparent)]
     Peg(#[from] PegError),
+
+    #[error(transparent)]
+    Faucet(#[from] FaucetError),
 }
 
 /// Tag of [`PegError::Unavailable`]: no peg provider on the active network.
@@ -94,6 +97,36 @@ pub enum PegError {
     /// The transaction could not be built or did not come out as intended.
     #[error("Peg transaction failed: {0}")]
     Build(String),
+}
+
+/// Why a lab's faucet did not pay. Each variant starts with a stable tag
+/// hosts key on; the text after it may change.
+#[derive(Debug, Error)]
+pub enum FaucetError {
+    /// No lab joined, the wallet is not on the lab's regtest, the lab's
+    /// faucet does not pay that asset or has no faucet, or the faucet
+    /// cannot pay right now (its node refused, HTTP 404/5xx).
+    #[error("FAUCET_UNAVAILABLE: {0}")]
+    Unavailable(String),
+
+    /// A limit is reached (per client, per address, or the lab's budget);
+    /// the text says when to retry when the faucet said (`Retry-After`).
+    #[error("FAUCET_RATE_LIMITED: {message}")]
+    RateLimited {
+        /// The faucet's reason and when to retry, for people.
+        message: String,
+        /// Seconds to wait, from `Retry-After`, when given.
+        retry_after: Option<u64>,
+    },
+
+    /// The faucet refused the request (HTTP 400 and other 4xx), with its
+    /// reason, sanitised and bounded.
+    #[error("FAUCET_REFUSED: {0}")]
+    Refused(String),
+
+    /// No answer: connection refused, timeout, redirect, oversize answer.
+    #[error("FAUCET_UNREACHABLE: {0}")]
+    Unreachable(String),
 }
 
 /// A Templar test server (`GET <url>/api/config`) that cannot be used. Every

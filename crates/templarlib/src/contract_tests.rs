@@ -2538,6 +2538,267 @@ const PEG_QUOTE_KEYS: &[&str] = &[
     "network_fee_included",
 ];
 
+// ── Test coins from a lab's faucet ──────────────────────────────────
+
+type FaucetSlot = std::sync::Arc<std::sync::Mutex<(u16, Option<String>, String)>>;
+
+/// A lab whose faucet is a loopback stub answering from `slot`
+/// (`status`, `Retry-After`, body). Returns the engine side, the stub and
+/// the lab's config server.
+fn faucet_lab(mutate: impl FnOnce(&mut Value)) -> (crate::test_http::MockHttp, FaucetSlot, String) {
+    use crate::test_http::{MockHttp, Reply};
+    let slot: FaucetSlot = std::sync::Arc::new(std::sync::Mutex::new((
+        200,
+        None,
+        json!({"ok": true, "txid": "ab".repeat(32), "amount_sat": 1_000_000, "asset": "lbtc"})
+            .to_string(),
+    )));
+    let answer = slot.clone();
+    let faucet = MockHttp::start(move |_| {
+        let (status, retry, body) = answer.lock().unwrap().clone();
+        let reply = Reply::json(status, body);
+        match retry {
+            Some(r) => reply.with_header("Retry-After", &r),
+            None => reply,
+        }
+    });
+    let mut cfg = lab_config(&"33".repeat(32));
+    cfg["networks"]["liquid-regtest"]["faucet_url"] = json!(format!("{}/api/faucet", faucet.url));
+    mutate(&mut cfg);
+    let lab = serve(std::sync::Arc::new(std::sync::Mutex::new((
+        200,
+        cfg.to_string(),
+    ))));
+    (faucet, slot, lab)
+}
+
+#[test]
+fn the_test_server_object_shows_the_faucet_and_the_protocol_site() {
+    let mut env = TestEnv::new();
+    let v = env.ok("get_test_server", json!({}));
+    assert!(v["faucet"].is_null(), "no lab, no faucet");
+    assert!(v["active"]["protocol"].is_null());
+    assert_eq!(
+        v["active"]["orderbook"]["assets"]["url"],
+        json!("http://127.0.0.1:3210/api/assets")
+    );
+
+    // An older lab: no list, no protocol site.
+    let (lab, _) = lab_server(&"11".repeat(32));
+    let v = env.ok("set_test_server", json!({ "url": lab }));
+    assert_keys(
+        "faucet",
+        &v["faucet"],
+        &["url", "assets_source", "assets", "available"],
+    );
+    assert_eq!(v["faucet"]["assets_source"], json!("default"));
+    assert_eq!(v["faucet"]["available"], json!(true));
+    let assets = v["faucet"]["assets"].as_array().unwrap();
+    assert_eq!(assets.len(), 2);
+    assert_keys(
+        "faucet asset",
+        &assets[1],
+        &[
+            "asset",
+            "network",
+            "ticker",
+            "name",
+            "precision",
+            "asset_id",
+            "default_sat",
+            "max_sat",
+        ],
+    );
+    assert_eq!(assets[0]["asset"], json!("btc"));
+    assert_eq!(assets[1]["asset_id"], json!(LAB_POLICY));
+    assert!(v["active"]["protocol"].is_null());
+
+    // A lab that lists its faucet and its protocol site.
+    let (_, _, lab) = faucet_lab(|cfg| {
+        cfg["protocol_url"] = json!("http://127.0.0.1:4100/");
+        cfg["networks"]["liquid-regtest"]["faucet"] = json!([
+            {"asset":"USDt","network":"liquid-regtest","ticker":"USDt",
+             "name":"Tether USD (test)","precision":8,"asset_id":"cc".repeat(32),
+             "default_sat":10000000000u64,"max_sat":100000000000u64}
+        ]);
+    });
+    let v = env.ok("set_test_server", json!({ "url": lab }));
+    assert_eq!(v["faucet"]["assets_source"], json!("profile"));
+    assert_eq!(v["faucet"]["assets"][0]["ticker"], json!("USDt"));
+    assert_eq!(v["profile"]["protocol_url"], json!("http://127.0.0.1:4100"));
+    assert_eq!(
+        v["active"]["protocol"],
+        json!({"url": "http://127.0.0.1:4100", "source": "profile"})
+    );
+    // On Liquid testnet the lab's protocol site and faucet are not offered.
+    env.ok("set_liquid_network", json!({ "network": "testnet" }));
+    let v = env.ok("get_test_server", json!({}));
+    assert!(v["active"]["protocol"].is_null());
+    assert_eq!(v["faucet"]["available"], json!(false));
+}
+
+#[test]
+fn test_server_faucet_pays_this_wallet_on_the_labs_regtest_only() {
+    let mut env = TestEnv::new();
+    // No lab: refused before any wallet is opened.
+    let err = env.err(
+        "test_server_faucet",
+        json!({ "wallet_id": "nope", "asset": "lbtc" }),
+    );
+    assert!(err.starts_with("FAUCET_UNAVAILABLE: "), "{err}");
+
+    let (faucet, slot, lab) = faucet_lab(|_| {});
+    env.ok("set_test_server", json!({ "url": lab }));
+    let id = env.create_test_wallet();
+
+    // L-BTC: a Liquid regtest address of this wallet; network, address and
+    // asset are all that is sent.
+    let paid = env.ok(
+        "test_server_faucet",
+        json!({ "wallet_id": id, "asset": "LBTC" }),
+    );
+    assert_keys(
+        "test_server_faucet",
+        &paid,
+        &[
+            "txid",
+            "asset",
+            "network",
+            "amount_sat",
+            "address",
+            "ticker",
+            "precision",
+            "asset_id",
+        ],
+    );
+    assert_eq!(paid["txid"], json!("ab".repeat(32)));
+    assert_eq!(paid["asset"], json!("lbtc"));
+    assert_eq!(paid["network"], json!("liquid-regtest"));
+    assert_eq!(paid["amount_sat"], json!(1_000_000));
+    assert_eq!(paid["asset_id"], json!(LAB_POLICY));
+    let address = paid["address"].as_str().unwrap();
+    assert!(address.starts_with("el1"), "{address}");
+    let sent: Value = serde_json::from_str(&faucet.requests()[0].body).unwrap();
+    assert_eq!(
+        sent,
+        json!({"network": "liquid-regtest", "address": address, "asset": "lbtc"})
+    );
+    assert_eq!(faucet.requests()[0].method, "POST");
+    assert_eq!(faucet.requests()[0].target, "/api/faucet");
+
+    // BTC: a Bitcoin regtest address.
+    let paid = env.ok(
+        "test_server_faucet",
+        json!({ "wallet_id": id, "asset": "btc" }),
+    );
+    assert_eq!(paid["network"], json!("bitcoin-regtest"));
+    assert!(paid["address"].as_str().unwrap().starts_with("bcrt1"));
+    assert!(paid["asset_id"].is_null());
+
+    // Refusals, each with its tag.
+    let mut ask = |status: u16, retry: Option<&str>, body: &str| -> String {
+        *slot.lock().unwrap() = (status, retry.map(str::to_string), body.to_string());
+        env.err(
+            "test_server_faucet",
+            json!({ "wallet_id": id, "asset": "lbtc" }),
+        )
+    };
+    let err = ask(
+        429,
+        Some("120"),
+        r#"{"ok":false,"error":"3 payments per address per hour."}"#,
+    );
+    assert!(err.starts_with("FAUCET_RATE_LIMITED: "), "{err}");
+    assert!(
+        err.contains("per address") && err.contains("120 seconds"),
+        "{err}"
+    );
+    let err = ask(429, None, r#"{"ok":false,"error":"budget"}"#);
+    assert!(err.contains("Try again later"), "{err}");
+    let hostile = format!(
+        r#"{{"ok":false,"error":"bad address\u001b[2J{}"}}"#,
+        "x".repeat(5000)
+    );
+    let err = ask(400, None, &hostile);
+    assert!(err.starts_with("FAUCET_REFUSED: "), "{err}");
+    assert!(err.contains("bad address"), "{err}");
+    assert!(!err.contains('\u{1b}') && err.len() < 600, "{err}");
+    let err = ask(502, None, r#"{"ok":false,"error":"node refused"}"#);
+    assert!(err.starts_with("FAUCET_UNAVAILABLE: "), "{err}");
+    let err = ask(404, None, "not found");
+    assert!(err.starts_with("FAUCET_UNAVAILABLE: "), "{err}");
+    let err = ask(200, None, r#"{"ok":true,"txid":"nope"}"#);
+    assert!(err.starts_with("FAUCET_UNAVAILABLE: "), "{err}");
+    let err = ask(200, None, r#"{"ok":false,"error":"empty"}"#);
+    assert!(err.starts_with("FAUCET_REFUSED: "), "{err}");
+
+    // An asset the faucet does not pay: refused without asking it.
+    let before = faucet.requests().len();
+    let err = env.err(
+        "test_server_faucet",
+        json!({ "wallet_id": id, "asset": "DOGE" }),
+    );
+    assert!(err.starts_with("FAUCET_UNAVAILABLE: "), "{err}");
+    assert!(err.contains("BTC, LBTC"), "{err}");
+    // Never on testnet.
+    env.ok("set_liquid_network", json!({ "network": "testnet" }));
+    let err = env.err(
+        "test_server_faucet",
+        json!({ "wallet_id": id, "asset": "lbtc" }),
+    );
+    assert!(err.starts_with("FAUCET_UNAVAILABLE: "), "{err}");
+    assert!(err.contains("liquid-testnet"), "{err}");
+    assert_eq!(faucet.requests().len(), before, "nothing asked");
+
+    // An unreachable faucet.
+    let mut env = TestEnv::new();
+    let mut cfg = lab_config(&"44".repeat(32));
+    cfg["networks"]["liquid-regtest"]["faucet_url"] = json!(format!(
+        "{}/api/faucet",
+        crate::test_http::closed_port_url()
+    ));
+    let lab = serve(std::sync::Arc::new(std::sync::Mutex::new((
+        200,
+        cfg.to_string(),
+    ))));
+    env.ok("set_test_server", json!({ "url": lab }));
+    let id = env.create_test_wallet();
+    let err = env.err(
+        "test_server_faucet",
+        json!({ "wallet_id": id, "asset": "btc" }),
+    );
+    assert!(err.starts_with("FAUCET_UNREACHABLE: "), "{err}");
+}
+
+#[test]
+fn test_server_faucet_asks_for_a_listed_lab_asset_by_its_faucet_name() {
+    let (faucet, _, lab) = faucet_lab(|cfg| {
+        cfg["networks"]["liquid-regtest"]["faucet"] = json!([
+            {"asset":"lbtc","network":"liquid-regtest","ticker":"LBTC","name":"Liquid Bitcoin",
+             "precision":8},
+            {"asset":"USDt","network":"liquid-regtest","ticker":"USDt",
+             "name":"Tether USD (test)","precision":8,"asset_id":"cc".repeat(32)}
+        ]);
+    });
+    let mut env = TestEnv::new();
+    env.ok("set_test_server", json!({ "url": lab }));
+    let id = env.create_test_wallet();
+    let paid = env.ok(
+        "test_server_faucet",
+        json!({ "wallet_id": id, "asset": "cc".repeat(32) }),
+    );
+    assert_eq!(paid["asset"], json!("USDt"));
+    assert_eq!(paid["ticker"], json!("USDt"));
+    let sent: Value = serde_json::from_str(&faucet.requests()[0].body).unwrap();
+    assert_eq!(sent["asset"], json!("USDt"));
+    // This lab's faucet pays no BTC.
+    let err = env.err(
+        "test_server_faucet",
+        json!({ "wallet_id": id, "asset": "btc" }),
+    );
+    assert!(err.starts_with("FAUCET_UNAVAILABLE: "), "{err}");
+}
+
 #[test]
 fn peg_without_a_provider_says_why_and_still_lists() {
     let mut env = TestEnv::new();

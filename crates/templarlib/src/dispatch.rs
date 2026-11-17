@@ -23,9 +23,10 @@ use crate::types::{
     GetTestServerParams, InspectPsbtParams, IssueAssetParams, ListActivityParams, ListUtxosParams,
     OpenWalletParams, PreviewFeeBumpParams, PreviewTxParams, PsetParams, ReissueAssetParams,
     RenameWalletParams, ReregisterAssetParams, SendTxParams, SetLiquidNetworkParams,
-    SetTestServerParams, SetUtxosFrozenParams, SignPsbtParams, SyncOutcomeDto, TxOutputSpec,
-    UrDecodePartsParams, UrPsbtEncodeParams, UrPsetEncodeParams, ValidateCosignerKeyParams,
-    VaultKeyParams, VaultPassphraseParams, VerifyBackupParams, WalletIdParams,
+    SetTestServerParams, SetUtxosFrozenParams, SignPsbtParams, SyncOutcomeDto,
+    TestServerFaucetParams, TxOutputSpec, UrDecodePartsParams, UrPsbtEncodeParams,
+    UrPsetEncodeParams, ValidateCosignerKeyParams, VaultKeyParams, VaultPassphraseParams,
+    VerifyBackupParams, WalletIdParams,
 };
 #[cfg(feature = "hardware")]
 use crate::types::{
@@ -84,6 +85,17 @@ fn try_dispatch(state: &mut AppState, method: &str, params: &Value) -> Result<Va
         }
 
         "clear_test_server" => test_server::clear(state).map(|v| serde_json::to_value(v).unwrap()),
+
+        // Test coins from the joined lab's faucet, to a fresh address of
+        // this wallet. Only on the lab's regtest (checked before the wallet
+        // is opened); nothing is signed.
+        "test_server_faucet" => {
+            let p: TestServerFaucetParams =
+                serde_json::from_value(params.clone()).map_err(|e| e.to_string())?;
+            let terms = test_server::faucet_terms(state)?;
+            ensure_wallet_open(state, &p.wallet_id)?;
+            test_server::faucet(state, terms, &p.asset).map(|v| serde_json::to_value(v).unwrap())
+        }
 
         // ── Vault (at-rest encryption, C1) ───────────────────────────────────
         "vault_status" => Ok(vault::status(state)),

@@ -82,6 +82,10 @@ pub struct TestServerProfile {
     /// The public Liquid testnet block: display only.
     #[serde(default)]
     pub testnet: Option<TestnetProfile>,
+    /// The lab's Templar Protocol (lending) site, `http(s)://…` without
+    /// credentials; optional in version 1 (absent: none).
+    #[serde(default)]
+    pub protocol_url: Option<String>,
 }
 
 /// `networks["liquid-regtest"]`.
@@ -106,7 +110,43 @@ pub struct RegtestProfile {
     pub faucet_url: String,
     /// The lab's peg terms ([`crate::Endpoints::peg_provider`]).
     pub peg: PegProfile,
+    /// What the faucet pays, as the lab lists it (optional in version 1;
+    /// `None` on older labs: see [`RegtestProfile::faucet_assets`]).
+    #[serde(default)]
+    pub faucet: Option<Vec<FaucetAsset>>,
 }
+
+/// One asset the lab's faucet pays (`networks["liquid-regtest"].faucet[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaucetAsset {
+    /// What the faucet request names: `btc`, `lbtc`, or the lab's ticker or
+    /// id of one of its assets.
+    pub asset: String,
+    /// `bitcoin-regtest` | `liquid-regtest`.
+    pub network: String,
+    pub ticker: String,
+    pub name: String,
+    /// Decimal places of the asset (0–8).
+    pub precision: u8,
+    /// The Liquid asset id (64 hex); null for Bitcoin.
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    /// What one request pays when it names no amount, in base units.
+    #[serde(default)]
+    pub default_sat: Option<u64>,
+    /// The most one request may ask for, in base units.
+    #[serde(default)]
+    pub max_sat: Option<u64>,
+}
+
+/// Network name of a faucet asset on the lab's Bitcoin regtest.
+pub const FAUCET_BITCOIN_REGTEST: &str = "bitcoin-regtest";
+/// Network name of a faucet asset on the lab's Liquid regtest.
+pub const FAUCET_LIQUID_REGTEST: &str = "liquid-regtest";
+/// Most faucet assets a config may list.
+pub const MAX_FAUCET_ASSETS: usize = 32;
+/// Most base units a faucet entry may name (21 million BTC).
+const MAX_FAUCET_SAT: u64 = 2_100_000_000_000_000;
 
 /// A `peg` block. Only `provider` is always present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,6 +201,36 @@ impl RegtestProfile {
     pub fn bitcoin_is_regtest(&self) -> bool {
         self.bitcoin_network == "regtest"
     }
+
+    /// What the faucet pays: the lab's own list, else (a lab older than
+    /// the list) regtest BTC and the chain's L-BTC.
+    pub fn faucet_assets(&self) -> Vec<FaucetAsset> {
+        match &self.faucet {
+            Some(list) => list.clone(),
+            None => vec![
+                FaucetAsset {
+                    asset: "btc".into(),
+                    network: FAUCET_BITCOIN_REGTEST.into(),
+                    ticker: "BTC".into(),
+                    name: "Bitcoin (regtest)".into(),
+                    precision: 8,
+                    asset_id: None,
+                    default_sat: None,
+                    max_sat: None,
+                },
+                FaucetAsset {
+                    asset: "lbtc".into(),
+                    network: FAUCET_LIQUID_REGTEST.into(),
+                    ticker: "LBTC".into(),
+                    name: "Liquid Bitcoin".into(),
+                    precision: 8,
+                    asset_id: Some(self.policy_asset.clone()),
+                    default_sat: None,
+                    max_sat: None,
+                },
+            ],
+        }
+    }
 }
 
 impl TestServerProfile {
@@ -186,6 +256,7 @@ impl TestServerProfile {
             "version": self.version,
             "name": self.name,
             "orderbook_url": self.orderbook_url,
+            "protocol_url": self.protocol_url,
             "networks": networks,
         });
         let parsed = parse_config(&base, &doc.to_string(), self.fetched_at)?;
@@ -377,6 +448,154 @@ fn peg(v: &Value, path: &str) -> Result<PegProfile, TemplarError> {
     })
 }
 
+/// A short display text of the config: at most `max` characters, none of
+/// them a control character, not empty.
+fn display_text(
+    o: &Map<String, Value>,
+    path: &str,
+    key: &str,
+    max: usize,
+) -> Result<String, TemplarError> {
+    let s = string(o, path, key)?;
+    if s.is_empty() || s.chars().count() > max || s.chars().any(char::is_control) {
+        return Err(invalid(format!(
+            "{path}.{key} must be 1 to {max} printable characters"
+        )));
+    }
+    Ok(s.to_string())
+}
+
+/// A ticker or asset name of the faucet list: 1–64 of `A-Z a-z 0-9 . _ -`.
+fn token(o: &Map<String, Value>, path: &str, key: &str) -> Result<String, TemplarError> {
+    let s = string(o, path, key)?;
+    if s.is_empty()
+        || s.len() > 64
+        || !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        return Err(invalid(format!(
+            "{path}.{key} must be 1 to 64 of A-Z, a-z, 0-9, '.', '_', '-'"
+        )));
+    }
+    Ok(s.to_string())
+}
+
+fn faucet_entry(
+    v: &Value,
+    path: &str,
+    policy_asset: &str,
+) -> Result<Option<FaucetAsset>, TemplarError> {
+    let o = obj(v, path)?;
+    let network = string(o, path, "network")?.to_ascii_lowercase();
+    if MAINNET_KEYS.contains(&network.as_str()) {
+        return Err(
+            TestServerError::Mainnet(format!("{path}.network {}", quoted(&network))).into(),
+        );
+    }
+    if network != FAUCET_BITCOIN_REGTEST && network != FAUCET_LIQUID_REGTEST {
+        // A network this wallet does not know: ignored, like unknown keys.
+        return Ok(None);
+    }
+    let asset = token(o, path, "asset")?;
+    let ticker = token(o, path, "ticker")?;
+    if ticker.len() > 24 {
+        return Err(invalid(format!(
+            "{path}.ticker is longer than 24 characters"
+        )));
+    }
+    let name = display_text(o, path, "name", MAX_NAME_CHARS)?;
+    let precision = o
+        .get("precision")
+        .and_then(Value::as_u64)
+        .filter(|p| *p <= 8)
+        .ok_or_else(|| {
+            invalid(format!(
+                "{path}.precision is not a whole number from 0 to 8"
+            ))
+        })? as u8;
+    let asset_id = match o.get("asset_id") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(hex64(o, path, "asset_id")?),
+    };
+    let amount = |key: &str| -> Result<Option<u64>, TemplarError> {
+        match opt_u64(o, path, key)? {
+            Some(n) if n == 0 || n > MAX_FAUCET_SAT => Err(invalid(format!(
+                "{path}.{key} is not an amount from 1 to {MAX_FAUCET_SAT}"
+            ))),
+            other => Ok(other),
+        }
+    };
+    let default_sat = amount("default_sat")?;
+    let max_sat = amount("max_sat")?;
+    if let (Some(d), Some(m)) = (default_sat, max_sat) {
+        if d > m {
+            return Err(invalid(format!("{path}.default_sat is above its max_sat")));
+        }
+    }
+    let lbtc = asset.eq_ignore_ascii_case("lbtc");
+    if network == FAUCET_BITCOIN_REGTEST {
+        if !asset.eq_ignore_ascii_case("btc") || asset_id.is_some() || precision != 8 {
+            return Err(invalid(format!(
+                "{path} on bitcoin-regtest must be asset \"btc\" with 8 decimals and no asset_id"
+            )));
+        }
+    } else if lbtc {
+        if asset_id.as_deref().is_some_and(|id| id != policy_asset) || precision != 8 {
+            return Err(invalid(format!(
+                "{path} names \"lbtc\" but not the chain's policy asset with 8 decimals"
+            )));
+        }
+    } else if asset.eq_ignore_ascii_case("btc") || asset_id.as_deref() == Some(policy_asset) {
+        return Err(invalid(format!(
+            "{path} gives another name to BTC or to the chain's L-BTC"
+        )));
+    }
+    Ok(Some(FaucetAsset {
+        asset,
+        network,
+        ticker,
+        name,
+        precision,
+        asset_id: if lbtc {
+            Some(policy_asset.to_string())
+        } else {
+            asset_id
+        },
+        default_sat,
+        max_sat,
+    }))
+}
+
+fn faucet_list(v: &Value, policy_asset: &str) -> Result<Vec<FaucetAsset>, TemplarError> {
+    const P: &str = "networks.liquid-regtest.faucet";
+    let items = v
+        .as_array()
+        .ok_or_else(|| invalid(format!("{P} is not a list")))?;
+    if items.len() > MAX_FAUCET_ASSETS {
+        return Err(invalid(format!(
+            "{P} lists more than {MAX_FAUCET_ASSETS} assets"
+        )));
+    }
+    let mut out: Vec<FaucetAsset> = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        let Some(entry) = faucet_entry(item, &format!("{P}[{i}]"), policy_asset)? else {
+            continue;
+        };
+        if out
+            .iter()
+            .any(|e| e.network == entry.network && e.asset.eq_ignore_ascii_case(&entry.asset))
+        {
+            return Err(invalid(format!(
+                "{P}[{i}] repeats asset {}",
+                quoted(&entry.asset)
+            )));
+        }
+        out.push(entry);
+    }
+    Ok(out)
+}
+
 fn regtest_block(v: &Value) -> Result<RegtestProfile, TemplarError> {
     const P: &str = "networks.liquid-regtest";
     let o = obj(v, P)?;
@@ -417,7 +636,6 @@ fn regtest_block(v: &Value) -> Result<RegtestProfile, TemplarError> {
     }
     Ok(RegtestProfile {
         instance_id: hex64(o, P, "instance_id")?,
-        policy_asset,
         genesis_hash,
         liquid_electrum_url: electrum_url(o, P, "liquid_electrum_url")?,
         bitcoin_network,
@@ -429,6 +647,11 @@ fn regtest_block(v: &Value) -> Result<RegtestProfile, TemplarError> {
                 .ok_or_else(|| invalid(format!("{P}.peg is missing")))?,
             &format!("{P}.peg"),
         )?,
+        faucet: match o.get("faucet") {
+            None | Some(Value::Null) => None,
+            Some(list) => Some(faucet_list(list, &policy_asset)?),
+        },
+        policy_asset,
     })
 }
 
@@ -476,6 +699,10 @@ pub fn parse_config(
         )));
     }
     let orderbook_url = http_url(o, "config", "orderbook_url")?;
+    let protocol_url = match o.get("protocol_url") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(http_url(o, "config", "protocol_url")?),
+    };
 
     let networks = obj(
         o.get("networks")
@@ -506,6 +733,7 @@ pub fn parse_config(
         orderbook_url,
         regtest,
         testnet,
+        protocol_url,
     })
 }
 
@@ -563,6 +791,100 @@ fn fetch_config_body(base: &str) -> Result<String, TemplarError> {
         return Err(TestServerError::TooLarge(MAX_CONFIG_BYTES).into());
     }
     String::from_utf8(body).map_err(|_| invalid("the answer is not UTF-8"))
+}
+
+// ---------------------------------------------------------------------------
+// Faucet
+// ---------------------------------------------------------------------------
+
+/// Whole-request bound of a faucet request: the lab answers once the
+/// payment is in its mempool.
+const FAUCET_TIMEOUT: Duration = Duration::from_secs(20);
+/// Largest faucet answer read.
+const MAX_FAUCET_ANSWER_BYTES: u64 = 64 * 1024;
+
+/// What the faucet paid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaucetPayment {
+    pub txid: String,
+    /// Base units paid.
+    pub amount_sat: u64,
+}
+
+/// Asks the lab's faucet at `faucet_url` to pay `address` on `network`
+/// (`bitcoin-regtest` | `liquid-regtest`) some `asset` (the faucet's name
+/// for it). Only those three values are sent; the amount is the faucet's
+/// default. Bounded in time and size; no redirect is followed.
+pub fn request_faucet(
+    faucet_url: &str,
+    network: &str,
+    address: &str,
+    asset: &str,
+) -> Result<FaucetPayment, crate::error::FaucetError> {
+    use crate::error::FaucetError;
+    let client = crate::http::client(FAUCET_TIMEOUT).map_err(FaucetError::Unreachable)?;
+    let request = client
+        .post(faucet_url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .json(&serde_json::json!({
+            "network": network,
+            "address": address,
+            "asset": asset,
+        }));
+    let answer = crate::http::send(request, MAX_FAUCET_ANSWER_BYTES)
+        .map_err(|e| FaucetError::Unreachable(format!("the lab's faucet: {e}")))?;
+    let status = answer.status.as_u16();
+    let reason = crate::http::excerpt(&answer.body)
+        .trim_end_matches('.')
+        .to_string();
+    match status {
+        200..=299 => {}
+        429 => {
+            let when = match answer.retry_after {
+                Some(s) => format!("Try again in {s} seconds."),
+                None => "Try again later.".to_string(),
+            };
+            return Err(FaucetError::RateLimited {
+                message: format!("the lab's faucet is at a limit: {reason}. {when}"),
+                retry_after: answer.retry_after,
+            });
+        }
+        404 | 405 | 421 | 501 => {
+            return Err(FaucetError::Unavailable(format!(
+                "the lab has no faucet at its published address (HTTP {status})."
+            )))
+        }
+        400..=499 => {
+            return Err(FaucetError::Refused(format!(
+                "the lab's faucet refused the request (HTTP {status}): {reason}"
+            )))
+        }
+        _ => {
+            return Err(FaucetError::Unavailable(format!(
+                "the lab's faucet cannot pay right now (HTTP {status}): {reason}"
+            )))
+        }
+    }
+    let unreadable =
+        || FaucetError::Unavailable("the lab's faucet answered something unreadable.".to_string());
+    let v: Value = serde_json::from_str(&answer.body).map_err(|_| unreadable())?;
+    if v.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(FaucetError::Refused(format!(
+            "the lab's faucet did not pay: {reason}"
+        )));
+    }
+    let txid = v
+        .get("txid")
+        .and_then(Value::as_str)
+        .filter(|t| t.len() == 64 && t.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(unreadable)?
+        .to_ascii_lowercase();
+    let amount_sat = v
+        .get("amount_sat")
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0 && *n <= MAX_FAUCET_SAT)
+        .ok_or_else(unreadable)?;
+    Ok(FaucetPayment { txid, amount_sat })
 }
 
 /// The documented example config, for other modules' tests.
@@ -838,6 +1160,179 @@ mod tests {
         assert!(p.regtest.liquid_network().is_err());
         p.regtest.liquid_electrum_url = "garbage".into();
         assert!(p.regtest.liquid_backend().is_err());
+    }
+
+    /// The `faucet` list and `protocol_url` as the brief documents them.
+    fn with_faucet() -> Value {
+        let policy = "b0b2bef620ac742b2399a0085bc84e4860ae2c65b5375e3b94399debec69aa6b";
+        let mut v: Value = serde_json::from_str(EXAMPLE).unwrap();
+        v["protocol_url"] = "http://127.0.0.1:4000/".into();
+        reg(&mut v)["faucet"] = serde_json::json!([
+            {"asset":"btc","network":"bitcoin-regtest","ticker":"BTC","name":"Bitcoin (regtest)",
+             "precision":8,"default_sat":1000000,"max_sat":10000000},
+            {"asset":"lbtc","network":"liquid-regtest","ticker":"LBTC","name":"Liquid Bitcoin",
+             "precision":8,"asset_id":policy,"default_sat":1000000,"max_sat":10000000},
+            {"asset":"USDt","network":"liquid-regtest","ticker":"USDt","name":"Tether USD (test)",
+             "precision":8,"asset_id":"cc".repeat(32),"default_sat":10000000000u64,
+             "max_sat":100000000000u64},
+            {"asset":"x","network":"some-future-chain","ticker":"X","name":"ignored","precision":2}
+        ]);
+        v
+    }
+
+    #[test]
+    fn the_faucet_list_and_protocol_url_are_read_and_checked() {
+        let p = parse(&with_faucet().to_string()).unwrap();
+        assert_eq!(p.protocol_url.as_deref(), Some("http://127.0.0.1:4000"));
+        let list = p.regtest.faucet.clone().unwrap();
+        assert_eq!(list.len(), 3, "the unknown network is ignored");
+        assert_eq!(list[0].network, FAUCET_BITCOIN_REGTEST);
+        assert_eq!(
+            list[1].asset_id.as_deref(),
+            Some(p.regtest.policy_asset.as_str())
+        );
+        assert_eq!(list[2].ticker, "USDt");
+        assert_eq!(list[2].max_sat, Some(100_000_000_000));
+        assert_eq!(p.regtest.faucet_assets(), list);
+        p.revalidate().unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        assert_eq!(serde_json::from_str::<TestServerProfile>(&json).unwrap(), p);
+
+        // Older labs: no list, no protocol site; the faucet pays BTC and L-BTC.
+        let old = parse(EXAMPLE).unwrap();
+        assert!(old.protocol_url.is_none() && old.regtest.faucet.is_none());
+        let defaults = old.regtest.faucet_assets();
+        let names: Vec<&str> = defaults.iter().map(|a| a.asset.as_str()).collect();
+        assert_eq!(names, ["btc", "lbtc"]);
+        assert_eq!(
+            defaults[1].asset_id.as_deref(),
+            Some(old.regtest.policy_asset.as_str())
+        );
+        // A profile stored before these fields existed still loads.
+        let mut stored = serde_json::to_value(&old).unwrap();
+        stored.as_object_mut().unwrap().remove("protocol_url");
+        stored["regtest"].as_object_mut().unwrap().remove("faucet");
+        let back: TestServerProfile = serde_json::from_value(stored).unwrap();
+        assert_eq!(back, old);
+        back.revalidate().unwrap();
+    }
+
+    #[test]
+    fn a_hostile_faucet_list_or_protocol_url_refuses_the_config() {
+        type Mutation = Box<dyn FnOnce(&mut Value)>;
+        let f = |i: usize| -> Box<dyn Fn(&mut Value) -> &mut Value> {
+            Box::new(move |v: &mut Value| &mut v["networks"]["liquid-regtest"]["faucet"][i])
+        };
+        let cases: Vec<(Mutation, &str)> = vec![
+            (
+                Box::new(|v| {
+                    let one = reg(v)["faucet"][2].clone();
+                    reg(v)["faucet"] = Value::Array(vec![one; MAX_FAUCET_ASSETS + 1]);
+                }),
+                "more than",
+            ),
+            (Box::new(|v| reg(v)["faucet"] = "btc".into()), "not a list"),
+            (
+                Box::new({
+                    let f = f(2);
+                    move |v| f(v)["asset_id"] = "zz".repeat(32).into()
+                }),
+                "asset_id",
+            ),
+            (
+                Box::new({
+                    let f = f(2);
+                    move |v| f(v)["precision"] = 9.into()
+                }),
+                "precision",
+            ),
+            (
+                Box::new({
+                    let f = f(2);
+                    move |v| f(v)["name"] = "Tether\u{1b}[2J".into()
+                }),
+                "name",
+            ),
+            (
+                Box::new({
+                    let f = f(2);
+                    move |v| f(v)["ticker"] = "US Dt".into()
+                }),
+                "ticker",
+            ),
+            (
+                // Another asset named with the chain's own L-BTC id.
+                Box::new(|v| {
+                    let policy = reg(v)["policy_asset"].clone();
+                    reg(v)["faucet"][2]["asset_id"] = policy;
+                }),
+                "L-BTC",
+            ),
+            (
+                Box::new({
+                    let f = f(1);
+                    move |v| f(v)["asset_id"] = "dd".repeat(32).into()
+                }),
+                "policy asset",
+            ),
+            (
+                Box::new({
+                    let f = f(0);
+                    move |v| f(v)["asset_id"] = "dd".repeat(32).into()
+                }),
+                "bitcoin-regtest",
+            ),
+            (
+                Box::new({
+                    let f = f(2);
+                    move |v| f(v)["default_sat"] = (u64::MAX).into()
+                }),
+                "default_sat",
+            ),
+            (
+                Box::new({
+                    let f = f(2);
+                    move |v| f(v)["max_sat"] = 5.into()
+                }),
+                "above its max_sat",
+            ),
+            (
+                Box::new(|v| {
+                    let dup = reg(v)["faucet"][2].clone();
+                    reg(v)["faucet"].as_array_mut().unwrap().push(dup);
+                }),
+                "repeats",
+            ),
+            (
+                Box::new(|v| v["protocol_url"] = "http://u:p@h:1".into()),
+                "protocol_url",
+            ),
+            (
+                Box::new(|v| v["protocol_url"] = "ftp://h".into()),
+                "protocol_url",
+            ),
+        ];
+        for (mutate, want) in cases {
+            let mut v = with_faucet();
+            mutate(&mut v);
+            let err = parse(&v.to_string()).unwrap_err();
+            assert!(err.contains(want), "{want}: {err}");
+            assert!(!err.contains('\u{1b}'), "{err}");
+        }
+        let mut v = with_faucet();
+        reg(&mut v)["faucet"][3]["network"] = "liquid".into();
+        assert!(parse(&v.to_string()).unwrap_err().contains("mainnet"));
+        // A stored profile tampered with is refused like a fetched one.
+        let mut p = parse(&with_faucet().to_string()).unwrap();
+        p.regtest.faucet.as_mut().unwrap()[2].precision = 12;
+        assert!(p
+            .revalidate()
+            .unwrap_err()
+            .to_string()
+            .contains("precision"));
+        let mut p = parse(&with_faucet().to_string()).unwrap();
+        p.protocol_url = Some("javascript:alert(1)".into());
+        assert!(p.revalidate().is_err());
     }
 
     #[test]
