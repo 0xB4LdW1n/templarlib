@@ -419,7 +419,8 @@ pub fn send_liquid(
             {
                 let jade = templar_core::JadeLiquidSigner::connect_on(&network)
                     .map_err(|e| e.to_string())?;
-                jade.sign_pset(&mut pset).map_err(|e| e.to_string())?;
+                jade.sign_pset(&mut pset, liq.signing_descriptor())
+                    .map_err(|e| e.to_string())?;
             }
             #[cfg(not(feature = "hardware"))]
             return Err(crate::handlers::hw::HW_UNSUPPORTED.to_string());
@@ -428,8 +429,12 @@ pub fn send_liquid(
             mnemonics,
             required_sigs,
         } => {
-            LiquidMultisigSetup::sign_pset_with_mnemonics(&mut pset, &mnemonics)
-                .map_err(|e| e.to_string())?;
+            LiquidMultisigSetup::sign_pset_with_mnemonics(
+                &mut pset,
+                &mnemonics,
+                liq.signing_descriptor(),
+            )
+            .map_err(|e| e.to_string())?;
             let have = signatures_on_weakest_input(liq, &pset)?;
             if (have as usize) < required_sigs {
                 // Not a failure: the transaction is built and carries whatever
@@ -664,8 +669,10 @@ pub fn inspect_pset(
 /// The checks every Liquid signing route runs before a key touches the PSET,
 /// whoever the caller is: the PSET belongs to this wallet's network and
 /// derivations ([`LiquidWalletManager::inspect_pset`]), it has exactly one
-/// fee output, the inputs this wallet signs ask for SIGHASH_ALL only
-/// ([`templar_core::refuse_unsafe_signing`]; the signers check again), and
+/// fee output, and the inputs this wallet signs ask for SIGHASH_ALL only
+/// and name the coin the key's signature would spend — a
+/// coin of this wallet exactly as its descriptor derives it
+/// ([`templar_core::refuse_unsafe_signing`]; the signers check again) — and
 /// every output it asks the key to pay says what it pays in a way the
 /// commitments prove.
 fn ensure_pset_signable(state: &AppState, pset_base64: &str) -> Result<(), String> {
@@ -721,7 +728,10 @@ pub fn sign_pset(state: &AppState, wallet_id: &str, pset_base64: &str) -> Result
         }
     };
 
-    let added = LiquidMultisigSetup::sign_pset_with_mnemonics(&mut pset, &mnemonics)
+    // The keys sign for the open wallet (`dispatch` opened `wallet_id`):
+    // its descriptor decides which coins are its own.
+    let wallet = state.liquid.as_ref().and_then(|l| l.signing_descriptor());
+    let added = LiquidMultisigSetup::sign_pset_with_mnemonics(&mut pset, &mnemonics, wallet)
         .map_err(|e| e.to_string())?;
     if added == 0 {
         return Err(
@@ -764,7 +774,9 @@ pub fn sign_pset_hw(
             return Err("This multisig wallet has no Liquid side.".into())
         }
         _ => {
-            jade.sign_pset(&mut pset).map_err(|e| e.to_string())?;
+            let wallet = state.liquid.as_ref().and_then(|l| l.signing_descriptor());
+            jade.sign_pset(&mut pset, wallet)
+                .map_err(|e| e.to_string())?;
         }
     }
     LiquidWalletManager::pset_to_base64(&pset).map_err(|e| e.to_string())

@@ -176,16 +176,19 @@ impl LiquidMultisigSetup {
     ///
     /// Zero added is *not* an error here — the caller decides, because a
     /// coordinator with no local key legitimately adds none. Each key first
-    /// passes [`crate::liquid::pset::refuse_unsafe_signing`].
+    /// passes [`crate::liquid::pset::refuse_unsafe_signing`], judged against
+    /// `wallet` — the descriptor of the wallet the keys sign for (the open
+    /// wallet's [`signing_descriptor`](crate::LiquidWalletManager::signing_descriptor)).
     pub fn sign_pset_with_mnemonics(
         pset: &mut PartiallySignedTransaction,
         mnemonics: &[String],
+        wallet: Option<&Descriptor<DescriptorPublicKey>>,
     ) -> Result<u32, TemplarError> {
         let mut added = 0;
         for mnemonic in mnemonics {
             let signer = SwSigner::new_with_network(mnemonic, lwk_wollet::Network::TestnetLiquid)
                 .map_err(|e| LiquidError::SigningFailed(format!("SwSigner: {e}")))?;
-            crate::liquid::pset::refuse_unsafe_signing(pset, &[signer.fingerprint()])?;
+            crate::liquid::pset::refuse_unsafe_signing(pset, &[signer.fingerprint()], wallet)?;
             added += signer
                 .sign(pset)
                 .map_err(|e| LiquidError::SigningFailed(e.to_string()))?;
@@ -310,6 +313,126 @@ mod tests {
             LiquidMultisigSetup::from_mnemonics(1, &[TEST_MNEMONIC_A], &BlindingKeySource::Elip151)
                 .unwrap();
         assert_ne!(ab, other);
+    }
+
+    /// A cosigner key of a multisig signs only that multisig's own coins:
+    /// not another policy that holds the same key at the same path, not the
+    /// wallet's coin with someone else's witness script. LWK alone signs
+    /// both.
+    #[test]
+    fn a_multisig_key_signs_only_its_own_multisigs_coins() {
+        use lwk_wollet::elements::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_1, OP_PUSHNUM_2};
+        use lwk_wollet::elements::pset::{Input, Output};
+        use lwk_wollet::elements::script::Builder;
+        use lwk_wollet::elements::{confidential, OutPoint, Script, TxOut, Txid};
+        use lwk_wollet::elements_miniscript::psbt::PsbtExt;
+
+        let desc = LiquidMultisigSetup::from_mnemonics(
+            2,
+            &[TEST_MNEMONIC_A, TEST_MNEMONIC_B],
+            &BlindingKeySource::Elip151,
+        )
+        .unwrap();
+        let wallet: WolletDescriptor = desc.parse().unwrap();
+        let derived = wallet
+            .definite_descriptor(lwk_wollet::Chain::External, 0)
+            .unwrap();
+        let asset = crate::liquid::network::LiquidNetwork::testnet().policy_asset();
+        let coin = |script_pubkey: Script| TxOut {
+            asset: confidential::Asset::Explicit(asset),
+            value: confidential::Value::Explicit(10_000),
+            nonce: confidential::Nonce::Null,
+            script_pubkey,
+            witness: Default::default(),
+        };
+        // The multisig's own coin at 0/0, as LWK's builder lays it out.
+        let own = || {
+            let mut pset = PartiallySignedTransaction::new_v2();
+            let mut input =
+                Input::from_prevout(OutPoint::new(Txid::from_byte_array([0x66; 32]), 0));
+            input.witness_utxo = Some(coin(derived.script_pubkey()));
+            pset.add_input(input);
+            pset.update_input_with_descriptor(0, &derived).unwrap();
+            pset.add_output(Output::new_explicit(
+                Script::from(vec![0u8, 20, 7, 7]),
+                9_000,
+                asset,
+                None,
+            ));
+            pset.add_output(Output::from_txout(TxOut::new_fee(1_000, asset)));
+            pset
+        };
+        let signer_a =
+            SwSigner::new_with_network(TEST_MNEMONIC_A, lwk_wollet::Network::TestnetLiquid)
+                .unwrap();
+        let a_key = *own().inputs()[0]
+            .bip32_derivation
+            .iter()
+            .find(|(_, (fp, _))| *fp == signer_a.fingerprint())
+            .unwrap()
+            .0;
+        let stranger = lwk_wollet::bitcoin::PublicKey::new(
+            lwk_wollet::elements::secp256k1_zkp::SecretKey::from_slice(&[5u8; 32])
+                .unwrap()
+                .public_key(&lwk_wollet::elements::secp256k1_zkp::Secp256k1::new()),
+        );
+        // 1-of-2 of A's key (same path) and a stranger's: another policy.
+        let other_policy = Builder::new()
+            .push_opcode(OP_PUSHNUM_1)
+            .push_key(&a_key)
+            .push_key(&stranger)
+            .push_opcode(OP_PUSHNUM_2)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        let mut other = own();
+        other.inputs_mut()[0].witness_utxo = Some(coin(other_policy.to_v0_p2wsh()));
+        other.inputs_mut()[0].witness_script = Some(other_policy.clone());
+        let mut swapped = own();
+        swapped.inputs_mut()[0].witness_script = Some(other_policy);
+
+        let mnemonics = [TEST_MNEMONIC_A.to_string()];
+        let watch = crate::LiquidWalletManager::watch_only_with_persist_on(
+            &crate::liquid::network::LiquidNetwork::testnet(),
+            &desc,
+            None,
+        )
+        .unwrap();
+        for (pset, words) in [
+            (&other, "not the coin this wallet derives"),
+            (&swapped, "witness_script is not the one"),
+        ] {
+            assert_eq!(signer_a.sign(&mut pset.clone()).unwrap(), 1, "LWK signs it");
+            let mut p = pset.clone();
+            let err = LiquidMultisigSetup::sign_pset_with_mnemonics(
+                &mut p,
+                &mnemonics,
+                watch.signing_descriptor(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.starts_with("Signing failed: refusing to sign input 0:") && err.contains(words),
+                "{err}"
+            );
+            assert!(p.inputs()[0].partial_sigs.is_empty());
+            // The check the co-signing routes run before unlocking a key.
+            let err = watch.refuse_unsafe_signing(pset).unwrap_err().to_string();
+            assert!(err.contains(words), "{err}");
+        }
+
+        // The multisig's own coin signs as before, by both keys.
+        let mut p = own();
+        watch.refuse_unsafe_signing(&p).unwrap();
+        let both = [TEST_MNEMONIC_A.to_string(), TEST_MNEMONIC_B.to_string()];
+        assert_eq!(
+            LiquidMultisigSetup::sign_pset_with_mnemonics(
+                &mut p,
+                &both,
+                watch.signing_descriptor()
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[test]

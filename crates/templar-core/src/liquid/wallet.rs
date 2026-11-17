@@ -17,6 +17,7 @@ use lwk_wollet::{
         encode::{Decodable, Encodable},
         Address, AssetId, Script,
     },
+    elements_miniscript::{Descriptor, DescriptorPublicKey},
     FakeStore, Network as ElementsNetwork, Recipient, Wollet, WolletBuilder, WolletDescriptor,
 };
 use serde_json::json;
@@ -1210,23 +1211,32 @@ impl LiquidWalletManager {
             .collect())
     }
 
+    /// This wallet's descriptor without its blinding key: the coins its keys
+    /// may sign as the wallet's own ([`refuse_unsafe_signing`]). `None` for a
+    /// wallet LWK knows by its scripts only.
+    pub fn signing_descriptor(&self) -> Option<&Descriptor<DescriptorPublicKey>> {
+        self.wollet.descriptor().ok().map(|ct| &ct.descriptor)
+    }
+
     /// [`refuse_unsafe_signing`] for every key this wallet signs with: its
-    /// software signer and every key origin of its descriptor. The
-    /// co-signing routes run it before a key is unlocked; each signer below
-    /// runs the same check again for its own key.
+    /// software signer and every key origin of its descriptor, judged
+    /// against this wallet's descriptor. The co-signing routes run it before
+    /// a key is unlocked; each signer below runs the same check again for
+    /// its own key.
     pub fn refuse_unsafe_signing(&self, pset: &Pset) -> Result<(), TemplarError> {
         let mut signers = self.wollet.signers();
         if let Some(signer) = &self.signer {
             signers.push(signer.fingerprint());
         }
-        refuse_unsafe_signing(pset, &signers)
+        refuse_unsafe_signing(pset, &signers, self.signing_descriptor())
     }
 
     /// Signs a PSET with the software signer.
     ///
     /// Returns an error if this is a watch-only wallet, or if the PSET asks
-    /// the key for a taproot signature or anything but SIGHASH_ALL, or lacks
-    /// a single fee output ([`refuse_unsafe_signing`]).
+    /// the key for a taproot signature or anything but SIGHASH_ALL, lacks a
+    /// single fee output, or names a coin other than the one the key's
+    /// signature would spend ([`refuse_unsafe_signing`]).
     pub fn sign(
         &self,
         pset: &mut lwk_wollet::elements::pset::PartiallySignedTransaction,
@@ -1235,7 +1245,7 @@ impl LiquidWalletManager {
             .signer
             .as_ref()
             .ok_or_else(|| LiquidError::SigningFailed("Watch-only wallet cannot sign".into()))?;
-        refuse_unsafe_signing(pset, &[signer.fingerprint()])?;
+        refuse_unsafe_signing(pset, &[signer.fingerprint()], self.signing_descriptor())?;
         let sigs = signer
             .sign(pset)
             .map_err(|e| LiquidError::SigningFailed(e.to_string()))?;
@@ -1378,7 +1388,7 @@ impl LiquidWalletManager {
             .map_err(|e| frozen_hint(LiquidError::IssuanceFailed, "Finish PSET", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, true)?;
 
-        refuse_unsafe_signing(&pset, &[signer.fingerprint()])?;
+        refuse_unsafe_signing(&pset, &[signer.fingerprint()], self.signing_descriptor())?;
         let sigs = signer
             .sign(&mut pset)
             .map_err(|e| LiquidError::IssuanceFailed(format!("Sign: {e}")))?;
@@ -1499,7 +1509,7 @@ impl LiquidWalletManager {
             .map_err(|e| frozen_hint(LiquidError::ReissuanceFailed, "Finish PSET", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, false)?;
 
-        refuse_unsafe_signing(&pset, &[signer.fingerprint()])?;
+        refuse_unsafe_signing(&pset, &[signer.fingerprint()], self.signing_descriptor())?;
         let sigs = signer
             .sign(&mut pset)
             .map_err(|e| LiquidError::ReissuanceFailed(format!("Sign: {e}")))?;
@@ -1570,7 +1580,7 @@ impl LiquidWalletManager {
             .map_err(|e| frozen_hint(LiquidError::BurnFailed, "Finish PSET", e, frozen))?;
         refuse_frozen_inputs(&pset, frozen, lbtc)?;
 
-        refuse_unsafe_signing(&pset, &[signer.fingerprint()])?;
+        refuse_unsafe_signing(&pset, &[signer.fingerprint()], self.signing_descriptor())?;
         let sigs = signer
             .sign(&mut pset)
             .map_err(|e| LiquidError::BurnFailed(format!("Sign: {e}")))?;
@@ -1656,7 +1666,7 @@ impl LiquidWalletManager {
     ) -> Result<u32, TemplarError> {
         let signer = SwSigner::new_with_network(mnemonic, ElementsNetwork::TestnetLiquid)
             .map_err(|e| LiquidError::SigningFailed(format!("SwSigner: {e}")))?;
-        refuse_unsafe_signing(pset, &[signer.fingerprint()])?;
+        refuse_unsafe_signing(pset, &[signer.fingerprint()], None)?;
         let sigs = signer
             .sign(pset)
             .map_err(|e| LiquidError::SigningFailed(e.to_string()))?;
@@ -1897,8 +1907,10 @@ mod tests {
         pset.inputs().iter().all(|i| i.partial_sigs.is_empty())
     }
 
-    /// Every software route: the mnemonic signer, the multisig loop and an
-    /// open wallet's own signer.
+    /// Every software route: the mnemonic signer (no descriptor known, the
+    /// rule for keys outside a wallet's descriptor applies to every key), the
+    /// multisig loop judged against the wallet's descriptor, and an open
+    /// wallet's own signer.
     fn sign_every_way(
         pset: &PartiallySignedTransaction,
     ) -> Vec<Result<(u32, PartiallySignedTransaction), String>> {
@@ -1918,6 +1930,7 @@ mod tests {
             crate::liquid::multisig::LiquidMultisigSetup::sign_pset_with_mnemonics(
                 &mut b,
                 &[TEST_MNEMONIC.to_string()],
+                wallet.signing_descriptor(),
             )
             .map(|n| (n, b))
             .map_err(|e| e.to_string()),
@@ -2108,6 +2121,7 @@ mod tests {
                 crate::liquid::multisig::LiquidMultisigSetup::sign_pset_with_mnemonics(
                     &mut b,
                     &[TEST_MNEMONIC.to_string()],
+                    wallet.signing_descriptor(),
                 )
                 .map_err(|e| e.to_string()),
                 wallet.sign(&mut c).map_err(|e| e.to_string()),
@@ -2128,6 +2142,234 @@ mod tests {
                 );
                 assert!(no_signature(after), "{path}: route {route}");
             }
+        }
+    }
+
+    // -- ownership guard: a key of this wallet signs a coin of this wallet
+    //    only as the coin its descriptor derives ------------------------------
+
+    /// The test mnemonic's key at `path`.
+    fn key_at(path: &str) -> (PublicKey, Fingerprint, DerivationPath) {
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC, ElementsNetwork::TestnetLiquid).unwrap();
+        let path = DerivationPath::from_str(path).unwrap();
+        let xpub = Signer::derive_xpub(&signer, &path).unwrap();
+        (PublicKey::new(xpub.public_key), signer.fingerprint(), path)
+    }
+
+    /// `input` alone, paying 9 000 sats to a stranger, one fee output.
+    fn pset_spending(input: Input) -> PartiallySignedTransaction {
+        let asset = LiquidNetwork::testnet().policy_asset();
+        let mut pset = PartiallySignedTransaction::new_v2();
+        pset.add_input(input);
+        pset.add_output(Output::new_explicit(
+            Script::from(vec![0u8, 20, 7, 7]),
+            9_000,
+            asset,
+            None,
+        ));
+        pset.add_output(Output::from_txout(TxOut::new_fee(1_000, asset)));
+        pset
+    }
+
+    /// The script code a P2WPKH coin of `pk` is signed under.
+    fn p2pkh_script_code(pk: &PublicKey) -> Script {
+        Address::p2pkh(pk, None, &AddressParams::LIQUID_TESTNET).script_pubkey()
+    }
+
+    /// Whether the signature `pk` put on input 0 of `signed` spends the
+    /// wallet's P2WPKH coin of `pk` (10 000 sats) at that input's outpoint.
+    fn spends_the_p2wpkh_coin(signed: &PartiallySignedTransaction, pk: &PublicKey) -> bool {
+        use lwk_wollet::elements::secp256k1_zkp::{ecdsa::Signature, Message, Secp256k1};
+        use lwk_wollet::elements::sighash::SighashCache;
+        use lwk_wollet::elements::EcdsaSighashType;
+        let Some(raw) = signed.inputs()[0].partial_sigs.get(pk) else {
+            return false;
+        };
+        let (_, der) = raw.split_last().unwrap();
+        let tx = signed.extract_tx().unwrap();
+        let msg = SighashCache::new(&tx).segwitv0_sighash(
+            0,
+            &p2pkh_script_code(pk),
+            confidential::Value::Explicit(10_000),
+            EcdsaSighashType::All,
+        );
+        Secp256k1::new()
+            .verify_ecdsa(
+                &Message::from_digest(msg.to_byte_array()),
+                &Signature::from_der(der).unwrap(),
+                &pk.inner,
+            )
+            .is_ok()
+    }
+
+    /// LWK's own signer, with no guard of ours in front of it: what every
+    /// route handed the PSET to before the ownership guard.
+    fn bare_lwk_signature(pset: &PartiallySignedTransaction) -> PartiallySignedTransaction {
+        let signer =
+            SwSigner::new_with_network(TEST_MNEMONIC, ElementsNetwork::TestnetLiquid).unwrap();
+        let mut signed = pset.clone();
+        assert_eq!(signer.sign(&mut signed).unwrap(), 1, "LWK signs it");
+        signed
+    }
+
+    /// Every software route refuses `pset` for input 0 and leaves it
+    /// unsigned: with `without` in the message where no descriptor is known
+    /// (route 0), with `with` where the wallet's descriptor judges it.
+    fn refused_everywhere(pset: &PartiallySignedTransaction, without: &str, with: &str) {
+        for (route, result) in sign_every_way(pset).into_iter().enumerate() {
+            let err = match result {
+                Ok((n, _)) => panic!("route {route} signed ({n} signatures)"),
+                Err(e) => e,
+            };
+            let words = if route == 0 { without } else { with };
+            assert!(
+                err.starts_with("Signing failed: refusing to sign input 0:") && err.contains(words),
+                "route {route}: {err}"
+            );
+        }
+        assert!(no_signature(pset));
+    }
+
+    fn testnet_wallet() -> LiquidWalletManager {
+        LiquidWalletManager::from_mnemonic_with_persist_on(
+            &LiquidNetwork::testnet(),
+            TEST_MNEMONIC,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_wallet_coin_disguised_as_a_foreign_p2wsh_is_never_signed() {
+        // The reviewer's attack. The outpoint is the wallet's own P2WPKH coin
+        // of key K; the PSET declares it as P2WSH(script) with `script` the
+        // P2PKH script code of K, and names K at the wallet's own path.
+        let (pk, fp, path) = test_key();
+        let script_code = p2pkh_script_code(&pk);
+        let mut input = input_for(0x11, pk, fp, &path, None);
+        input.witness_utxo.as_mut().unwrap().script_pubkey = script_code.to_v0_p2wsh();
+        input.witness_script = Some(script_code);
+        let pset = pset_spending(input);
+
+        // A co-signer is told no coin of the wallet leaves it…
+        let details = testnet_wallet().inspect_pset(&pset).unwrap();
+        assert!(
+            details.net_change.values().all(|v| *v >= -1_000),
+            "{:?}",
+            details.net_change
+        );
+        // …yet LWK's signature spends exactly that coin.
+        assert!(spends_the_p2wpkh_coin(&bare_lwk_signature(&pset), &pk));
+
+        refused_everywhere(
+            &pset,
+            "P2PKH script code",
+            "not the coin this wallet derives",
+        );
+    }
+
+    #[test]
+    fn a_p2sh_wrapped_disguise_is_never_signed() {
+        // P2SH(P2WPKH(K)) with the P2WPKH program as redeem script: the
+        // signer reads it as nested P2WPKH and signs the P2WPKH script code.
+        let (pk, fp, path) = test_key();
+        let mut input = input_for(0x11, pk, fp, &path, None);
+        let program = input.witness_utxo.as_ref().unwrap().script_pubkey.clone();
+        input.witness_utxo.as_mut().unwrap().script_pubkey = program.to_p2sh();
+        input.redeem_script = Some(program);
+        let pset = pset_spending(input);
+        assert!(spends_the_p2wpkh_coin(&bare_lwk_signature(&pset), &pk));
+        refused_everywhere(&pset, "P2SH-wrapped", "not the coin this wallet derives");
+    }
+
+    #[test]
+    fn a_derivation_at_another_index_than_the_coin_is_never_signed() {
+        // The coin is the wallet's P2WPKH at 0/0; the PSET asks the key at
+        // 0/7 to sign it. LWK counts the input as not the wallet's (the path
+        // does not derive the script), the signer signs it all the same.
+        let (pk0, _, _) = test_key();
+        let (pk7, fp, path7) = key_at("m/84'/1'/0'/0/7");
+        let mut input = input_for(0x11, pk7, fp, &path7, None);
+        input.witness_utxo.as_mut().unwrap().script_pubkey =
+            Address::p2wpkh(&pk0, None, &AddressParams::LIQUID_TESTNET).script_pubkey();
+        let pset = pset_spending(input);
+        let details = testnet_wallet().inspect_pset(&pset).unwrap();
+        assert!(details.net_change.values().all(|v| *v >= -1_000));
+        bare_lwk_signature(&pset);
+        refused_everywhere(
+            &pset,
+            "is not the coin of",
+            "not the coin this wallet derives",
+        );
+    }
+
+    #[test]
+    fn a_foreign_witness_script_beside_a_true_witness_utxo_is_never_signed() {
+        // The wallet's real P2WPKH coin, with a witness script that is not
+        // the wallet's: the review would show a contract the coin is not.
+        let (pk, fp, path) = test_key();
+        let mut input = input_for(0x11, pk, fp, &path, None);
+        let one_of_one = lwk_wollet::elements::script::Builder::new()
+            .push_opcode(lwk_wollet::elements::opcodes::all::OP_PUSHNUM_1)
+            .push_key(&pk)
+            .push_opcode(lwk_wollet::elements::opcodes::all::OP_PUSHNUM_1)
+            .push_opcode(lwk_wollet::elements::opcodes::all::OP_CHECKMULTISIG)
+            .into_script();
+        input.witness_script = Some(one_of_one);
+        let pset = pset_spending(input);
+        bare_lwk_signature(&pset);
+        refused_everywhere(
+            &pset,
+            "together with a witness_script",
+            "witness_script is not the one",
+        );
+    }
+
+    #[test]
+    fn a_non_witness_utxo_that_disagrees_with_the_witness_utxo_is_never_signed() {
+        use lwk_wollet::elements::{LockTime, Transaction};
+        let (pk, fp, path) = test_key();
+        let honest = input_for(0x11, pk, fp, &path, None);
+        let txout = honest.witness_utxo.clone().unwrap();
+        let prev = |output: TxOut| Transaction {
+            version: 2,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![output],
+        };
+        // The full transaction says the coin is worth more than the PSET
+        // claims (the signature commits to the PSET's 10 000).
+        let mut richer = txout.clone();
+        richer.value = confidential::Value::Explicit(1_000_000);
+        let tx = prev(richer);
+        let mut input = honest.clone();
+        input.previous_txid = tx.txid();
+        input.non_witness_utxo = Some(tx);
+        let pset = pset_spending(input);
+        bare_lwk_signature(&pset);
+        refused_everywhere(&pset, "non_witness_utxo", "non_witness_utxo");
+
+        // A full transaction that is not the one the input spends.
+        let tx = prev(txout.clone());
+        let mut input = honest.clone();
+        input.non_witness_utxo = Some(tx);
+        refused_everywhere(
+            &pset_spending(input),
+            "non_witness_utxo",
+            "non_witness_utxo",
+        );
+
+        // One that agrees signs as before.
+        let tx = prev(txout);
+        let mut input = honest;
+        input.previous_txid = tx.txid();
+        input.non_witness_utxo = Some(tx);
+        for (route, result) in sign_every_way(&pset_spending(input))
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(result.unwrap().0, 1, "route {route}");
         }
     }
 }

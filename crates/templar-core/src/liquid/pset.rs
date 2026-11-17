@@ -15,11 +15,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use lwk_wollet::bitcoin::bip32::Fingerprint;
+use lwk_wollet::bitcoin::bip32::{ChildNumber, DerivationPath, Fingerprint};
 use lwk_wollet::elements::confidential::{Asset, Value};
 use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction};
 use lwk_wollet::elements::secp256k1_zkp::{All, Secp256k1};
-use lwk_wollet::elements::AssetId;
+use lwk_wollet::elements::{AssetId, Script};
+use lwk_wollet::elements_miniscript::{
+    DefiniteDescriptorKey, Descriptor, DescriptorPublicKey, ForEachKey, ToPublicKey,
+};
 
 use crate::error::{LiquidError, TemplarError};
 
@@ -216,7 +219,6 @@ pub fn refuse_non_testnet_paths(
     pset: &PartiallySignedTransaction,
     ours: &BTreeSet<String>,
 ) -> Result<(), TemplarError> {
-    use lwk_wollet::bitcoin::bip32::ChildNumber;
     let testnet = ChildNumber::from_hardened_idx(1).expect("1 is a valid index");
     for (index, input) in pset.inputs().iter().enumerate() {
         for (fp, path) in input.bip32_derivation.values() {
@@ -273,9 +275,11 @@ pub fn refuse_bad_fee_outputs(pset: &PartiallySignedTransaction) -> Result<(), T
 }
 
 /// The check every signer of this crate runs before a key with one of
-/// `signers` as master fingerprint touches `pset`. It only refuses; when
-/// none of `signers` would sign any input it lets the PSET through, since
-/// the signer then adds nothing.
+/// `signers` as master fingerprint touches `pset`. `wallet` is the
+/// descriptor (without its blinding key) of the wallet those keys sign
+/// for, when the caller has one. It only refuses; when none of `signers`
+/// would sign any input it lets the PSET through, since the signer then
+/// adds nothing.
 ///
 /// - No input such a key would sign is a taproot input or names the key in
 ///   `tap_key_origins`: this wallet does not sign taproot inputs on Liquid.
@@ -289,11 +293,19 @@ pub fn refuse_bad_fee_outputs(pset: &PartiallySignedTransaction) -> Result<(), T
 ///   SINGLE or ANYONECANPAY signature lets whoever holds the PSET change
 ///   what it pays.
 /// - Exactly one fee output ([`refuse_bad_fee_outputs`]).
+/// - Every input such a key would sign says truthfully which coin it spends
+///   ([`refuse_unowned_input`]): a key of `wallet` signs only the very
+///   coin `wallet` derives at that key's path, and any other key of ours
+///   only a coin whose declared script is the script the signature commits
+///   to. Otherwise a PSET could name the wallet's own P2WPKH coin as
+///   someone else's P2WSH contract — the review would show nothing of the
+///   wallet's leaving, and the signature would spend it.
 ///
 /// Inputs only other keys sign are not judged: they are their signer's call.
 pub fn refuse_unsafe_signing(
     pset: &PartiallySignedTransaction,
     signers: &[Fingerprint],
+    wallet: Option<&Descriptor<DescriptorPublicKey>>,
 ) -> Result<(), TemplarError> {
     let ours: Vec<(usize, &Input)> = pset
         .inputs()
@@ -305,32 +317,249 @@ pub fn refuse_unsafe_signing(
         return Ok(());
     }
     refuse_bad_fee_outputs(pset)?;
-    for (index, input) in ours {
+    for &(index, input) in &ours {
         let names_tap_key = input
             .tap_key_origins
             .values()
             .any(|(_, (fp, _))| signers.contains(fp));
         if names_tap_key || lwk_common::is_taproot_input(input) {
-            return Err(LiquidError::SigningFailed(format!(
-                "refusing to sign input {index}: it is a taproot input, and this wallet \
-                 does not sign taproot inputs on Liquid"
-            ))
-            .into());
+            return Err(refusal(
+                index,
+                "it is a taproot input, and this wallet does not sign taproot inputs on Liquid",
+            ));
         }
         let Some(declared) = input.sighash_type else {
             continue;
         };
         let declared = declared.to_u32();
         if declared != SIGHASH_ALL {
-            return Err(LiquidError::SigningFailed(format!(
-                "refusing to sign input {index}: it asks for sighash type 0x{declared:02x}, \
-                 and this wallet signs SIGHASH_ALL only — any other type would let \
-                 whoever holds the transaction change what it pays"
-            ))
-            .into());
+            return Err(refusal(
+                index,
+                format!(
+                    "it asks for sighash type 0x{declared:02x}, and this wallet signs \
+                     SIGHASH_ALL only — any other type would let whoever holds the \
+                     transaction change what it pays"
+                ),
+            ));
+        }
+    }
+    let singles = wallet
+        .and_then(|d| d.clone().into_single_descriptors().ok())
+        .unwrap_or_default();
+    for (index, input) in ours {
+        refuse_unowned_input(index, input, signers, &singles)?;
+    }
+    Ok(())
+}
+
+/// `Signing failed: refusing to sign input <index>: <why>`.
+fn refusal(index: usize, why: impl std::fmt::Display) -> TemplarError {
+    LiquidError::SigningFailed(format!("refusing to sign input {index}: {why}")).into()
+}
+
+/// Elements' flag on a peg-in input's outpoint index.
+const PEGIN_FLAG: u32 = 1 << 30;
+
+/// Refuses input `index` unless, for every key of `signers` it names, the
+/// coin it declares is the coin that key's signature would spend:
+///
+/// - It carries a `witness_utxo` (the coin), and a `non_witness_utxo`, when
+///   present, is the transaction of that outpoint and holds that very
+///   output.
+/// - A key at a path of the wallet's descriptor (`singles`: same master
+///   fingerprint, the path the descriptor derives at that path's last
+///   index) signs only the coin the descriptor derives there: the same
+///   scriptPubKey, the same key, and exactly the witness / redeem scripts
+///   the descriptor gives that coin. That is LWK's ownership rule, so an
+///   input such a key signs is always one inspection counts as the
+///   wallet's.
+/// - Any other key of ours (a loan key, a cosigner key of another wallet,
+///   or every key when no descriptor is known) signs a P2WPKH coin locked
+///   to that key with no witness script, or a P2WSH coin whose witness
+///   script hashes to it and is not a P2PKH script code. Nothing else: a
+///   P2SH wrapper or a P2PKH script code in a P2WSH lets a signature over
+///   one declared script spend a P2WPKH coin of the same key.
+fn refuse_unowned_input(
+    index: usize,
+    input: &Input,
+    signers: &[Fingerprint],
+    singles: &[Descriptor<DescriptorPublicKey>],
+) -> Result<(), TemplarError> {
+    let Some(coin) = &input.witness_utxo else {
+        return Err(refusal(
+            index,
+            "it does not say which coin it spends (no witness_utxo)",
+        ));
+    };
+    if let Some(tx) = &input.non_witness_utxo {
+        let vout = (input.previous_output_index & !PEGIN_FLAG) as usize;
+        let agrees = tx.txid() == input.previous_txid
+            && tx.output.get(vout).is_some_and(|o| {
+                o.script_pubkey == coin.script_pubkey
+                    && o.asset == coin.asset
+                    && o.value == coin.value
+                    && o.nonce == coin.nonce
+            });
+        if !agrees {
+            return Err(refusal(
+                index,
+                "its non_witness_utxo and its witness_utxo describe different coins",
+            ));
+        }
+    }
+    let spk = &coin.script_pubkey;
+    for (pk, (fp, path)) in &input.bip32_derivation {
+        if !signers.contains(fp) {
+            continue;
+        }
+        match descriptor_coin_at(singles, *fp, path) {
+            Some((derived, key)) => {
+                if derived.script_pubkey() != *spk {
+                    return Err(refusal(
+                        index,
+                        format!(
+                            "it asks this wallet's key {fp} at {path} to sign, but the coin it \
+                             names is not the coin this wallet derives at that path"
+                        ),
+                    ));
+                }
+                if key.to_public_key() != *pk {
+                    return Err(refusal(
+                        index,
+                        format!("it names {pk} at {path}, which is not the key this wallet derives there"),
+                    ));
+                }
+                let Some((redeem, witness)) = descriptor_scripts(&derived) else {
+                    return Err(refusal(
+                        index,
+                        format!("this wallet does not sign {} coins", derived.desc_type()),
+                    ));
+                };
+                if input.redeem_script != redeem {
+                    return Err(refusal(
+                        index,
+                        "its redeem_script is not the one this wallet's coin has",
+                    ));
+                }
+                if input.witness_script != witness {
+                    return Err(refusal(
+                        index,
+                        "its witness_script is not the one this wallet's coin has",
+                    ));
+                }
+            }
+            None => refuse_foreign_coin(index, input, spk, pk)?,
         }
     }
     Ok(())
+}
+
+/// The coin a key of ours outside the wallet's descriptor may sign: see
+/// [`refuse_unowned_input`].
+fn refuse_foreign_coin(
+    index: usize,
+    input: &Input,
+    spk: &Script,
+    pk: &lwk_wollet::bitcoin::PublicKey,
+) -> Result<(), TemplarError> {
+    if spk.is_p2sh() || input.redeem_script.is_some() {
+        return Err(refusal(
+            index,
+            "it spends a P2SH-wrapped coin, which a key of this wallet never signs — the wrapper \
+             would let the signature spend a coin other than the one it names",
+        ));
+    }
+    if spk.is_v0_p2wpkh() {
+        if input.witness_script.is_some() {
+            return Err(refusal(
+                index,
+                "it names a P2WPKH coin together with a witness_script, which such a coin \
+                 does not have",
+            ));
+        }
+        let locked_to_key = pk
+            .wpubkey_hash()
+            .is_ok_and(|hash| *spk == Script::new_v0_wpkh(&hash));
+        if !locked_to_key {
+            return Err(refusal(
+                index,
+                format!(
+                    "the P2WPKH coin it names is not the coin of {pk}, the key it asks to sign"
+                ),
+            ));
+        }
+        return Ok(());
+    }
+    if spk.is_v0_p2wsh() {
+        let Some(witness_script) = &input.witness_script else {
+            return Err(refusal(
+                index,
+                "it names a P2WSH coin without its witness_script",
+            ));
+        };
+        if witness_script.to_v0_p2wsh() != *spk {
+            return Err(refusal(
+                index,
+                "its witness_script is not the script of the coin it names",
+            ));
+        }
+        if witness_script.is_p2pkh() {
+            return Err(refusal(
+                index,
+                "its witness_script is a P2PKH script code — the script a P2WPKH coin is signed \
+                 under — so the signature would spend a P2WPKH coin, not the P2WSH coin it names",
+            ));
+        }
+        return Ok(());
+    }
+    Err(refusal(
+        index,
+        "it spends a coin that is neither P2WPKH nor P2WSH, and this wallet signs no other kind",
+    ))
+}
+
+/// The coin `singles` derives at `path`'s last index whose key is `fp` at
+/// exactly `path`, with that key. `None`: `path` is not a path of the
+/// wallet's descriptor.
+fn descriptor_coin_at(
+    singles: &[Descriptor<DescriptorPublicKey>],
+    fp: Fingerprint,
+    path: &DerivationPath,
+) -> Option<(Descriptor<DefiniteDescriptorKey>, DefiniteDescriptorKey)> {
+    let ChildNumber::Normal { index } = *path.into_iter().last()? else {
+        return None;
+    };
+    singles.iter().find_map(|single| {
+        let derived = single.at_derivation_index(index).ok()?;
+        let mut found = None;
+        derived.for_each_key(|key| {
+            if found.is_none()
+                && key.master_fingerprint() == fp
+                && key.full_derivation_path().as_ref() == Some(path)
+            {
+                found = Some(key.clone());
+            }
+            true
+        });
+        found.map(|key| (derived, key))
+    })
+}
+
+/// `(redeem_script, witness_script)` a PSET input spending a coin of
+/// `derived` carries — what `update_input_with_descriptor` writes. `None`
+/// for a descriptor type without a script code (taproot).
+fn descriptor_scripts(
+    derived: &Descriptor<DefiniteDescriptorKey>,
+) -> Option<(Option<Script>, Option<Script>)> {
+    use lwk_wollet::elements_miniscript::descriptor::DescriptorType as T;
+    let explicit = derived.explicit_script().ok()?;
+    Some(match derived.desc_type() {
+        T::Bare | T::Pkh | T::Wpkh => (None, None),
+        T::Wsh | T::WshSortedMulti => (None, Some(explicit)),
+        T::ShWsh | T::ShWshSortedMulti => (Some(explicit.to_v0_p2wsh()), Some(explicit)),
+        T::Sh | T::ShWpkh | T::ShSortedMulti => (Some(explicit), None),
+        _ => return None,
+    })
 }
 
 /// Structured details about a PSET, for display before signing.
@@ -861,7 +1090,7 @@ mod tests {
             Some(0x81),
             Some(0x83),
         ] {
-            let err = refuse_unsafe_signing(&with_fee(taproot_input(ours, sighash)), &[ours])
+            let err = refuse_unsafe_signing(&with_fee(taproot_input(ours, sighash)), &[ours], None)
                 .expect_err("our taproot input")
                 .to_string();
             assert!(
@@ -885,10 +1114,10 @@ mod tests {
                 lwk_wollet::bitcoin::bip32::DerivationPath::from_str("m/84'/1'/0'/0/0").unwrap(),
             ),
         );
-        assert!(refuse_unsafe_signing(&with_fee(by_bip32), &[ours]).is_err());
+        assert!(refuse_unsafe_signing(&with_fee(by_bip32), &[ours], None).is_err());
         // Someone else's taproot input is theirs to judge.
         let theirs = Fingerprint::from_str("deadbeef").unwrap();
-        refuse_unsafe_signing(&with_fee(taproot_input(theirs, Some(0x83))), &[ours]).unwrap();
+        refuse_unsafe_signing(&with_fee(taproot_input(theirs, Some(0x83))), &[ours], None).unwrap();
     }
 
     #[test]
@@ -901,9 +1130,9 @@ mod tests {
             err,
             "PSET inspection failed: PSET doesn't contain a fee output"
         );
-        assert!(refuse_unsafe_signing(&none, &[ours]).is_err());
+        assert!(refuse_unsafe_signing(&none, &[ours], None).is_err());
         // Nobody here signs it: the signer has nothing to refuse.
-        refuse_unsafe_signing(&none, &[Fingerprint::from_str("deadbeef").unwrap()]).unwrap();
+        refuse_unsafe_signing(&none, &[Fingerprint::from_str("deadbeef").unwrap()], None).unwrap();
 
         let mut two = with_fee(taproot_input(ours, None));
         two.add_output(Output::from_txout(TxOut::new_fee(
@@ -913,6 +1142,119 @@ mod tests {
         let err = refuse_bad_fee_outputs(&two).unwrap_err().to_string();
         assert_eq!(err, "PSET inspection failed: Multiple fee outputs");
         refuse_bad_fee_outputs(&with_fee(taproot_input(ours, None))).unwrap();
+    }
+
+    // -- ownership: keys outside a wallet descriptor --------------------------
+
+    /// A key of ours at a loan path, and a stranger's key.
+    fn loan_and_stranger() -> (
+        lwk_wollet::bitcoin::PublicKey,
+        Fingerprint,
+        DerivationPath,
+        lwk_wollet::bitcoin::PublicKey,
+    ) {
+        use lwk_wollet::elements::secp256k1_zkp::SecretKey;
+        let secp = Secp256k1::new();
+        let key = |b: u8| {
+            lwk_wollet::bitcoin::PublicKey::new(
+                SecretKey::from_slice(&[b; 32]).unwrap().public_key(&secp),
+            )
+        };
+        (
+            key(6),
+            Fingerprint::from_str("73c5da0a").unwrap(),
+            DerivationPath::from_str("m/2121'/1'/0'/0/7").unwrap(),
+            key(9),
+        )
+    }
+
+    /// An input naming `pk` at `path` of `fp`, spending `spk`.
+    fn named(
+        spk: Script,
+        pk: lwk_wollet::bitcoin::PublicKey,
+        fp: Fingerprint,
+        path: &DerivationPath,
+    ) -> Input {
+        let mut input = input_with(TxOut {
+            asset: Asset::Explicit(AssetId::from_byte_array([7u8; 32])),
+            value: Value::Explicit(1_000),
+            nonce: Nonce::Null,
+            script_pubkey: spk,
+            witness: Default::default(),
+        });
+        input.bip32_derivation.insert(pk, (fp, path.clone()));
+        input
+    }
+
+    #[test]
+    fn a_key_outside_the_descriptor_signs_only_a_coin_named_as_what_it_is() {
+        use lwk_wollet::elements::opcodes::all::{OP_CHECKMULTISIG, OP_PUSHNUM_2};
+        use lwk_wollet::elements::script::Builder;
+        use lwk_wollet::elements::{Address, AddressParams};
+        let (pk, ours, path, stranger) = loan_and_stranger();
+        let p2wpkh = Address::p2wpkh(&pk, None, &AddressParams::LIQUID_TESTNET).script_pubkey();
+        let escrow = Builder::new()
+            .push_opcode(OP_PUSHNUM_2)
+            .push_key(&pk)
+            .push_key(&stranger)
+            .push_opcode(OP_PUSHNUM_2)
+            .push_opcode(OP_CHECKMULTISIG)
+            .into_script();
+        let check = |input: Input| refuse_unsafe_signing(&with_fee(input), &[ours], None);
+
+        // What the protocol signs: the check PSET's P2WPKH, an escrow P2WSH.
+        check(named(p2wpkh.clone(), pk, ours, &path)).unwrap();
+        let mut input = named(escrow.to_v0_p2wsh(), pk, ours, &path);
+        input.witness_script = Some(escrow.clone());
+        check(input).unwrap();
+
+        let refused = |input: Input, words: &str| {
+            let err = check(input).unwrap_err().to_string();
+            assert!(
+                err.starts_with("Signing failed: refusing to sign input 0:") && err.contains(words),
+                "{words}: {err}"
+            );
+        };
+        // The P2PKH script code of the key inside a P2WSH.
+        let code = Address::p2pkh(&pk, None, &AddressParams::LIQUID_TESTNET).script_pubkey();
+        let mut input = named(code.to_v0_p2wsh(), pk, ours, &path);
+        input.witness_script = Some(code);
+        refused(input, "P2PKH script code");
+        // Nested in P2SH.
+        let mut input = named(p2wpkh.to_p2sh(), pk, ours, &path);
+        input.redeem_script = Some(p2wpkh.clone());
+        refused(input, "P2SH-wrapped");
+        // Another key's P2WPKH, or a P2WPKH with a witness script.
+        let other =
+            Address::p2wpkh(&stranger, None, &AddressParams::LIQUID_TESTNET).script_pubkey();
+        refused(named(other, pk, ours, &path), "is not the coin of");
+        let mut input = named(p2wpkh.clone(), pk, ours, &path);
+        input.witness_script = Some(escrow.clone());
+        refused(input, "together with a witness_script");
+        // A P2WSH without its script, or with another script.
+        refused(
+            named(escrow.to_v0_p2wsh(), pk, ours, &path),
+            "without its witness_script",
+        );
+        let mut input = named(escrow.to_v0_p2wsh(), pk, ours, &path);
+        input.witness_script = Some(Script::from(vec![0x51]));
+        refused(input, "not the script of the coin");
+        // Neither P2WPKH nor P2WSH; no coin at all.
+        let legacy = Address::p2pkh(&pk, None, &AddressParams::LIQUID_TESTNET).script_pubkey();
+        refused(named(legacy, pk, ours, &path), "neither P2WPKH nor P2WSH");
+        let mut input = named(p2wpkh, pk, ours, &path);
+        input.witness_utxo = None;
+        refused(input, "no witness_utxo");
+
+        // A stranger's key on the same input is not judged.
+        let mut input = named(
+            Script::from(vec![0x51]),
+            stranger,
+            Fingerprint::from_str("deadbeef").unwrap(),
+            &path,
+        );
+        input.witness_utxo = None;
+        check(input).unwrap();
     }
 
     // -- threshold parsing ---------------------------------------------------

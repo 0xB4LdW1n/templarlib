@@ -3744,10 +3744,25 @@ fn live_testlab_native_peg_in_and_out() {
 /// any co-signed input): one explicit 10 000-sat input declaring `sighash`,
 /// one 9 000-sat payment and `fees` fee outputs of 1 000. Base64.
 fn guard_pset(sighash: Option<u32>, fees: usize) -> String {
+    use lwk_wollet::elements::pset::PsbtSighashType;
+    key_pset("m/2121'/1'/0'/0/0", fees, |input, _| {
+        input.sighash_type = sighash.map(PsbtSighashType::from_u32);
+    })
+}
+
+/// A testnet PSET for the test mnemonic's key at `path`: one explicit
+/// 10 000-sat input spending that key's P2WPKH and naming the key, then
+/// changed by `edit` (which gets the key); one 9 000-sat payment and `fees`
+/// fee outputs of 1 000. Base64.
+fn key_pset(
+    path: &str,
+    fees: usize,
+    edit: impl FnOnce(&mut lwk_wollet::elements::pset::Input, &lwk_wollet::bitcoin::PublicKey),
+) -> String {
     use lwk_wollet::bitcoin::bip32::{DerivationPath, Xpriv};
     use lwk_wollet::bitcoin::secp256k1::Secp256k1;
     use lwk_wollet::bitcoin::PublicKey;
-    use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction, PsbtSighashType};
+    use lwk_wollet::elements::pset::{Input, Output, PartiallySignedTransaction};
     use lwk_wollet::elements::{
         confidential, Address, AddressParams, AssetId, OutPoint, Script, TxOut, Txid,
     };
@@ -3755,7 +3770,7 @@ fn guard_pset(sighash: Option<u32>, fees: usize) -> String {
 
     let secp = Secp256k1::new();
     let master = Xpriv::from_str(&templar_core::master_xprv(MNEMONIC).unwrap()).unwrap();
-    let path = DerivationPath::from_str("m/2121'/1'/0'/0/0").unwrap();
+    let path = DerivationPath::from_str(path).unwrap();
     let pk = PublicKey::new(
         master
             .derive_priv(&secp, &path)
@@ -3775,7 +3790,7 @@ fn guard_pset(sighash: Option<u32>, fees: usize) -> String {
     input
         .bip32_derivation
         .insert(pk, (master.fingerprint(&secp), path));
-    input.sighash_type = sighash.map(PsbtSighashType::from_u32);
+    edit(&mut input, &pk);
     let mut pset = PartiallySignedTransaction::new_v2();
     pset.add_input(input);
     pset.add_output(Output::new_explicit(
@@ -3919,6 +3934,75 @@ fn sign_pset_never_signs_a_taproot_input() {
             err.starts_with("Signing failed: refusing to sign input 0:")
                 && err.contains("does not sign taproot inputs"),
             "{path}: {err}"
+        );
+    }
+}
+
+/// `sign_pset` signs a coin of the wallet only as the coin the wallet's
+/// descriptor derives at the key's path. The reviewer's attack: the
+/// wallet's own P2WPKH coin, declared as P2WSH of the P2PKH script code of
+/// its key. Inspection shows nothing of the wallet's leaving it — the
+/// signature would spend it all the same — so it is refused with a plain
+/// `err`. (The core tests sign the same coin declared truthfully; here
+/// LWK's inspection refuses an unblinded coin of the wallet before that.)
+#[test]
+fn sign_pset_refuses_a_wallet_coin_named_as_another_coin() {
+    use lwk_wollet::elements::{Address, AddressParams};
+    let mut env = TestEnv::new();
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Owner", "mnemonic": MNEMONIC, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+
+    let disguised = key_pset("m/84'/1'/0'/0/0", 1, |input, pk| {
+        let script_code = Address::p2pkh(pk, None, &AddressParams::LIQUID_TESTNET).script_pubkey();
+        input.witness_utxo.as_mut().unwrap().script_pubkey = script_code.to_v0_p2wsh();
+        input.witness_script = Some(script_code);
+    });
+    let d = env.ok(
+        "inspect_pset",
+        json!({ "wallet_id": id, "pset_base64": disguised }),
+    );
+    assert_eq!(d["inputs"][0]["is_ours"], json!(true));
+    assert_eq!(d["inputs"][0]["script_type"], json!("p2wsh"));
+    assert!(
+        d["net_change"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|v| v.as_i64().unwrap() >= -1_000),
+        "the review shows no coin of the wallet leaving: {d}"
+    );
+    let resp = env.call(
+        "sign_pset",
+        json!({ "wallet_id": id, "pset_base64": disguised }),
+    );
+    assert_keys("sign_pset ownership refusal", &resp, &["err"]);
+    let err = resp["err"].as_str().unwrap();
+    assert!(
+        err.starts_with("Signing failed: refusing to sign input 0:")
+            && err.contains("not the coin this wallet derives"),
+        "{err}"
+    );
+
+    // P2SH-wrapped, and the wallet's coin under the key of another index.
+    let wrapped = key_pset("m/84'/1'/0'/0/0", 1, |input, _| {
+        let program = input.witness_utxo.as_ref().unwrap().script_pubkey.clone();
+        input.witness_utxo.as_mut().unwrap().script_pubkey = program.to_p2sh();
+        input.redeem_script = Some(program);
+    });
+    let other_index = key_pset("m/84'/1'/0'/0/7", 1, |input, _| {
+        let coin = key_pset("m/84'/1'/0'/0/0", 1, |_, _| {});
+        let coin = templar_core::LiquidWalletManager::pset_from_base64(&coin).unwrap();
+        input.witness_utxo = coin.inputs()[0].witness_utxo.clone();
+    });
+    for pset in [wrapped, other_index] {
+        let err = env.err("sign_pset", json!({ "wallet_id": id, "pset_base64": pset }));
+        assert!(
+            err.starts_with("Signing failed: refusing to sign input 0:")
+                && err.contains("not the coin this wallet derives"),
+            "{err}"
         );
     }
 }

@@ -41,7 +41,7 @@ use lwk_jade::Jade;
 #[cfg(feature = "hardware")]
 use lwk_wollet::elements::pset::PartiallySignedTransaction;
 #[cfg(feature = "hardware")]
-use lwk_wollet::elements_miniscript::{ConfidentialDescriptor, DescriptorPublicKey};
+use lwk_wollet::elements_miniscript::{ConfidentialDescriptor, Descriptor, DescriptorPublicKey};
 #[cfg(feature = "hardware")]
 use lwk_wollet::Network as JadeNetwork;
 
@@ -191,9 +191,15 @@ impl JadeLiquidSigner {
     ///
     /// Refuses first what [`refuse_unsafe_signing`](Self::refuse_unsafe_signing)
     /// refuses: `lwk_jade` 0.20 forwards the sighash type an input declares to
-    /// the device, where 0.9 always asked for SIGHASH_ALL.
-    pub fn sign_pset(&self, pset: &mut PartiallySignedTransaction) -> Result<u32, TemplarError> {
-        self.refuse_unsafe_signing(pset)?;
+    /// the device, where 0.9 always asked for SIGHASH_ALL. `wallet` is the
+    /// descriptor of the wallet the device signs for — the open wallet's
+    /// [`signing_descriptor`](crate::LiquidWalletManager::signing_descriptor).
+    pub fn sign_pset(
+        &self,
+        pset: &mut PartiallySignedTransaction,
+        wallet: Option<&Descriptor<DescriptorPublicKey>>,
+    ) -> Result<u32, TemplarError> {
+        self.refuse_unsafe_signing(pset, wallet)?;
         let added = Signer::sign(&self.jade, pset)
             .map_err(|e| tagged(ERR_SIGNING, format!("Jade refused to sign: {e}")))?;
         if added == 0 {
@@ -206,16 +212,18 @@ impl JadeLiquidSigner {
         Ok(added)
     }
 
-    /// [`crate::liquid::pset::refuse_unsafe_signing`] for this device's key.
+    /// [`crate::liquid::pset::refuse_unsafe_signing`] for this device's key,
+    /// judged against `wallet`.
     pub fn refuse_unsafe_signing(
         &self,
         pset: &PartiallySignedTransaction,
+        wallet: Option<&Descriptor<DescriptorPublicKey>>,
     ) -> Result<(), TemplarError> {
         let fingerprint = self
             .jade
             .fingerprint()
             .map_err(|e| tagged(ERR_DEVICE_NOT_READY, e))?;
-        crate::liquid::pset::refuse_unsafe_signing(pset, &[fingerprint])
+        crate::liquid::pset::refuse_unsafe_signing(pset, &[fingerprint], wallet)
     }
 
     /// The device's BIP87 cosigner key: `[fp/87h/1h/0h]tpub…`.
@@ -278,17 +286,22 @@ impl JadeLiquidSigner {
 
     /// Register the wallet if needed, then sign. The registration is what
     /// makes a multisig signature possible at all, so the two belong together
-    /// — a caller that forgets the first step gets an opaque refusal.
+    /// — a caller that forgets the first step gets an opaque refusal. The
+    /// device's inputs are judged against `ct_descriptor`, the wallet it
+    /// signs for.
     pub fn sign_multisig_pset(
         &self,
         name: &str,
         ct_descriptor: &str,
         pset: &mut PartiallySignedTransaction,
     ) -> Result<u32, TemplarError> {
+        let wallet: ConfidentialDescriptor<DescriptorPublicKey> = ct_descriptor
+            .parse()
+            .map_err(|e| LiquidError::InvalidDescriptor(format!("Not a CT descriptor: {e}")))?;
         // Before the registration, which the user confirms on screen.
-        self.refuse_unsafe_signing(pset)?;
+        self.refuse_unsafe_signing(pset, Some(&wallet.descriptor))?;
         self.register_multisig(name, ct_descriptor)?;
-        self.sign_pset(pset)
+        self.sign_pset(pset, Some(&wallet.descriptor))
     }
 
     /// SLIP-0077 master blinding key, hex. Exposed for diagnostics and for
