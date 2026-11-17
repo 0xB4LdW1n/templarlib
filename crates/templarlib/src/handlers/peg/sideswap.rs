@@ -41,6 +41,67 @@ pub(super) struct SideSwapState {
     /// A signed deposit, written before its broadcast.
     #[serde(default)]
     pub pending_deposit_tx: Option<String>,
+    /// The deposit this wallet signed: SideSwap's reports are read for it
+    /// only, never for another transaction it names.
+    #[serde(default)]
+    pub funded_txid: Option<String>,
+    /// What the quote promised; a payout must bring at least this much.
+    #[serde(default)]
+    pub quoted_payout: Option<u64>,
+    /// Transactions the receive address had when the order was opened:
+    /// none of them is the payout.
+    #[serde(default)]
+    pub receive_known_txids: Vec<String>,
+}
+
+/// Rank of a status along the order's way; SideSwap's reports only move
+/// an order forward.
+fn rank(status: &str) -> u8 {
+    match status {
+        AWAITING_DEPOSIT => 0,
+        DEPOSIT_SEEN => 1,
+        CONFIRMING => 2,
+        SETTLING => 3,
+        _ => 4,
+    }
+}
+
+/// Moves `order` to `next` only if that is further along.
+fn advance(order: &mut PegOrderDto, next: &str, now: u64) {
+    if rank(next) > rank(&order.status) {
+        set_status(order, next, now);
+    }
+}
+
+/// The deposit report to follow: the wallet's own deposit when it paid
+/// one, else the one already followed, else (nothing followed yet) the
+/// first. A followed deposit SideSwap no longer lists is waited for, never
+/// swapped for another transaction.
+fn pick_tx<'a>(
+    list: &'a [PegTx],
+    funded: Option<&str>,
+    recorded: Option<&str>,
+) -> Option<&'a PegTx> {
+    match funded.or(recorded) {
+        Some(followed) => list.iter().find(|t| t.tx_hash == followed),
+        None => list.first(),
+    }
+}
+
+/// A payout transaction SideSwap names may count only if it is new to the
+/// receive address and no other order counted it.
+fn payout_is_new(txid: &str, known: &[String], taken: &[String]) -> Result<(), String> {
+    if known.iter().any(|k| k == txid) {
+        return Err(format!(
+            "SideSwap names payout {txid}, which the receive address had before this order."
+        ));
+    }
+    if taken.iter().any(|t| t == txid) {
+        return Err(format!(
+            "SideSwap names payout {txid}, which another order already counted."
+        ));
+    }
+    Ok(())
 }
 
 fn s(e: impl std::fmt::Display) -> String {
@@ -159,6 +220,31 @@ pub(super) fn start(
     } else {
         terms.fastest_fee_rate()
     };
+    // What the receive address already has, before SideSwap knows it: no
+    // later payout claim can point at one of these.
+    let known: Vec<String> = if peg_in {
+        let script = state
+            .liquid_network
+            .parse_address(n.payout_address)
+            .map_err(s)?
+            .script_pubkey();
+        state
+            .liquid_chain()?
+            .script_txids(&script)
+            .map_err(s)?
+            .into_iter()
+            .map(|t| t.to_string())
+            .collect()
+    } else {
+        let spk =
+            core_peg::bitcoin_script_for(n.payout_address, bitcoin::Network::Testnet).map_err(s)?;
+        BitcoinChainView::connect(&state.bitcoin_backend().electrum_url)
+            .and_then(|v| v.history(&spk))
+            .map_err(s)?
+            .into_iter()
+            .map(|i| i.txid.to_string())
+            .collect()
+    };
     let order = client.peg(peg_in, n.payout_address, fee_rate).map_err(s)?;
     check_deposit_address(state, peg_in, &order.peg_addr)?;
     let now = now_secs();
@@ -198,6 +284,9 @@ pub(super) fn start(
             order_id: order.order_id,
             peg_in,
             pending_deposit_tx: None,
+            funded_txid: None,
+            quoted_payout: Some(q.receive_sats),
+            receive_known_txids: known,
         }),
     })
 }
@@ -223,12 +312,17 @@ fn url_for(state: &AppState, o: &StoredOrder) -> Result<String, String> {
     }
 }
 
-pub(super) fn refresh(state: &mut AppState, o: &mut StoredOrder) {
-    let result = url_for(state, o).and_then(|url| refresh_with(state, &url, o));
+pub(super) fn refresh(state: &mut AppState, o: &mut StoredOrder, payouts_taken: &[String]) {
+    let result = url_for(state, o).and_then(|url| refresh_with(state, &url, o, payouts_taken));
     o.order.last_error = result.err();
 }
 
-fn refresh_with(state: &AppState, url: &str, o: &mut StoredOrder) -> Result<(), String> {
+fn refresh_with(
+    state: &AppState,
+    url: &str,
+    o: &mut StoredOrder,
+    payouts_taken: &[String],
+) -> Result<(), String> {
     let ss = state_of(o)?.clone();
     let status = SideSwapClient::connect(url)
         .and_then(|mut c| c.peg_status(ss.peg_in, &ss.order_id))
@@ -239,95 +333,138 @@ fn refresh_with(state: &AppState, url: &str, o: &mut StoredOrder) -> Result<(), 
         )
         .to_string());
     }
-    let recorded = o.order.txid_deposit.clone();
-    let tx = recorded
-        .as_deref()
-        .and_then(|t| status.list.iter().find(|x| x.tx_hash == t))
-        .or_else(|| status.list.first())
-        .cloned();
     let now = now_secs();
-    let Some(tx) = tx else {
+    let funded = ss.funded_txid.as_deref();
+    let Some(tx) = pick_tx(&status.list, funded, o.order.txid_deposit.as_deref()).cloned() else {
         let expired = o.order.expires_at.is_some_and(|at| now > at);
         if o.order.status == AWAITING_DEPOSIT && ss.pending_deposit_tx.is_none() && expired {
             set_status(&mut o.order, EXPIRED, now);
         }
         return Ok(());
     };
-    apply_tx(state, o, &tx)
-}
-
-/// Moves the order along SideSwap's report of its deposit.
-fn apply_tx(state: &AppState, o: &mut StoredOrder, tx: &PegTx) -> Result<(), String> {
-    let now = now_secs();
-    o.order.txid_deposit = Some(tx.tx_hash.clone());
-    o.order.deposit_received_sats = Some(tx.amount);
-    if let Some(total) = tx.total_confs {
-        o.order.confirmations_required = total;
-    }
-    o.order.confirmations = tx.detected_confs.unwrap_or(o.order.confirmations);
-    if let Some(payout) = tx.payout {
-        o.order.payout_expected_sats = payout;
-    }
     if let Some(ss) = o.sideswap.as_mut() {
         ss.pending_deposit_tx = None;
     }
-    let required = o.order.confirmations_required;
-    o.order.eta_minutes = eta_minutes(&o.order.direction, required, o.order.confirmations);
+    let Some(payout) = apply_report(&mut o.order, &tx, funded.is_some(), now)? else {
+        return Ok(());
+    };
+    match payout_verified(state, o, &payout, payouts_taken)? {
+        Ok(()) => {
+            o.order.txid_payout = Some(payout);
+            o.order.eta_minutes = 0;
+            set_status(&mut o.order, COMPLETED, now);
+            Ok(())
+        }
+        Err(why) => {
+            advance(&mut o.order, SETTLING, now);
+            Err(why)
+        }
+    }
+}
+
+/// Applies SideSwap's report of the deposit the order follows. Returns
+/// the payout txid to verify when SideSwap says it paid. Status only moves
+/// forward; the deposit txid, once known, is never replaced; and SideSwap
+/// alone cannot fail an order whose deposit this wallet paid.
+fn apply_report(
+    order: &mut PegOrderDto,
+    tx: &PegTx,
+    wallet_funded: bool,
+    now: u64,
+) -> Result<Option<String>, String> {
+    if order.txid_deposit.is_none() {
+        order.txid_deposit = Some(tx.tx_hash.clone());
+    }
+    order.deposit_received_sats = Some(tx.amount);
+    if let Some(total) = tx.total_confs {
+        order.confirmations_required = total;
+    }
+    order.confirmations = tx.detected_confs.unwrap_or(order.confirmations);
+    if let Some(payout) = tx.payout {
+        order.payout_expected_sats = payout;
+    }
+    let required = order.confirmations_required;
+    order.eta_minutes = eta_minutes(&order.direction, required, order.confirmations);
     match tx.state {
         TxState::InsufficientAmount => {
-            set_status(&mut o.order, FAILED, now);
-            Err(format!(
+            let why = format!(
                 "SideSwap will not pay this deposit: it does not cover the fees ({}).",
                 tx.status
-            ))
+            );
+            if !wallet_funded {
+                set_status(order, FAILED, now);
+            }
+            Err(why)
         }
         TxState::Detected => {
-            let next = if o.order.confirmations == 0 {
+            let next = if order.confirmations == 0 {
                 DEPOSIT_SEEN
             } else {
                 CONFIRMING
             };
-            set_status(&mut o.order, next, now);
-            Ok(())
+            advance(order, next, now);
+            Ok(None)
         }
         TxState::Processing => {
-            set_status(&mut o.order, SETTLING, now);
-            Ok(())
+            advance(order, SETTLING, now);
+            Ok(None)
         }
-        TxState::Done => {
-            let txid = tx.payout_txid.clone().unwrap_or_default();
-            o.order.txid_payout = Some(txid.clone());
-            o.order.eta_minutes = 0;
-            if payout_confirmed(state, o, &txid)? {
-                set_status(&mut o.order, COMPLETED, now);
-                Ok(())
-            } else {
-                set_status(&mut o.order, SETTLING, now);
-                Err(format!(
-                    "SideSwap reports payout {txid}; it is not confirmed to the receive address \
-                     on chain yet."
-                ))
-            }
-        }
+        TxState::Done => Ok(tx.payout_txid.clone()),
     }
 }
 
-/// Whether the payout `txid` is in a block and pays the receive address,
-/// by the wallet's own chain view (Liquid for a peg-in, Bitcoin for a
-/// peg-out).
-fn payout_confirmed(state: &AppState, o: &StoredOrder, txid: &str) -> Result<bool, String> {
+/// Whether payout `txid` counts, by the wallet's own chain view: new to
+/// the receive address and nobody else's, in a block, paying the receive
+/// address at least what the quote promised. The inner error says why not
+/// (yet).
+fn payout_verified(
+    state: &AppState,
+    o: &StoredOrder,
+    txid: &str,
+    payouts_taken: &[String],
+) -> Result<Result<(), String>, String> {
+    let ss = state_of(o)?;
+    if let Err(why) = payout_is_new(txid, &ss.receive_known_txids, payouts_taken) {
+        return Ok(Err(why));
+    }
+    let promised = ss.quoted_payout.unwrap_or(o.order.payout_expected_sats);
     if o.order.direction == "in" {
+        // A Liquid payout is confidential: its amount is read from the
+        // wallet that owns the receive address, once synced.
         let script = state
             .liquid_network
             .parse_address(&o.order.payout_address)
             .map_err(s)?
             .script_pubkey();
-        let txid: elements::Txid = txid.parse().map_err(|e| format!("Payout txid: {e}"))?;
+        let parsed: elements::Txid = txid.parse().map_err(|e| format!("Payout txid: {e}"))?;
         let confs = state
             .liquid_chain()?
-            .tx_confirmations(&txid, &script)
+            .tx_confirmations(&parsed, &script)
             .map_err(s)?;
-        Ok(confs.is_some_and(|c| c >= 1))
+        if confs.is_none_or(|c| c < 1) {
+            return Ok(Err(format!(
+                "SideSwap reports payout {txid}; it is not in a block paying the receive address \
+                 yet."
+            )));
+        }
+        let received = state
+            .liquid
+            .as_ref()
+            .filter(|_| state.active_wallet_id.as_deref() == Some(o.order.wallet_id.as_str()))
+            .and_then(|liq| {
+                let wtx = liq.wollet.transaction(&parsed).ok()??;
+                wtx.balance.get(&liq.policy_asset()).copied()
+            });
+        Ok(match received {
+            Some(got) if got >= promised as i64 => Ok(()),
+            Some(got) => Err(format!(
+                "SideSwap's payout {txid} brought {got} sats, less than the {promised} quoted."
+            )),
+            None => Err(format!(
+                "SideSwap's payout {txid} is in a block; open and sync this wallet to check its \
+                 amount."
+            )),
+        })
     } else {
         let spk = core_peg::bitcoin_script_for(&o.order.payout_address, bitcoin::Network::Testnet)
             .map_err(s)?;
@@ -338,15 +475,30 @@ fn payout_confirmed(state: &AppState, o: &StoredOrder, txid: &str) -> Result<boo
             .into_iter()
             .find(|i| i.txid.to_string() == txid)
         else {
-            return Ok(false);
+            return Ok(Err(format!(
+                "SideSwap reports payout {txid}; the receive address has not received it."
+            )));
         };
-        let pays = view
+        if item.height.is_none() {
+            return Ok(Err(format!(
+                "SideSwap's payout {txid} is not in a block yet."
+            )));
+        }
+        let paid: u64 = view
             .transaction(&item.txid)
             .map_err(s)?
             .output
             .iter()
-            .any(|out| out.script_pubkey == spk);
-        Ok(pays && item.height.is_some())
+            .filter(|out| out.script_pubkey == spk)
+            .map(|out| out.value.to_sat())
+            .sum();
+        Ok(if paid < promised {
+            Err(format!(
+                "SideSwap's payout {txid} pays {paid} sats, less than the {promised} quoted."
+            ))
+        } else {
+            Ok(())
+        })
     }
 }
 
@@ -372,7 +524,7 @@ pub(super) fn fund(
     fee_rate: Option<f32>,
 ) -> Result<(), String> {
     let url = url_for(state, o)?;
-    let fresh = refresh_with(state, &url, o);
+    let fresh = refresh_with(state, &url, o, &[]);
     o.order.last_error = fresh.as_ref().err().cloned();
     persist(&state.data_dir, o)?;
     fresh?;
@@ -417,6 +569,7 @@ pub(super) fn fund(
             o.order.txid_deposit = Some(tx.txid().to_string());
             if let Some(ss) = o.sideswap.as_mut() {
                 ss.pending_deposit_tx = Some(hex::encode(&raw));
+                ss.funded_txid = Some(tx.txid().to_string());
             }
             persist(&state.data_dir, o)?;
             btc.broadcast(tx).map_err(s)?;
@@ -457,6 +610,7 @@ pub(super) fn fund(
             o.order.txid_deposit = Some(tx.txid().to_string());
             if let Some(ss) = o.sideswap.as_mut() {
                 ss.pending_deposit_tx = Some(encode::serialize_hex(&tx));
+                ss.funded_txid = Some(tx.txid().to_string());
             }
             persist(&state.data_dir, o)?;
             tx
@@ -485,6 +639,98 @@ mod tests {
             peg_out_bitcoin_tx_vsize: 141,
             bitcoin_fee_rates: vec![(2, 3.0), (6, 1.0)],
         }
+    }
+
+    fn report(hash: &str, state: TxState, confs: Option<u32>) -> PegTx {
+        PegTx {
+            tx_hash: hash.into(),
+            vout: 0,
+            status: "x".into(),
+            amount: 100_000,
+            payout: Some(99_000),
+            state,
+            detected_confs: confs,
+            total_confs: Some(2),
+            payout_txid: (state == TxState::Done).then(|| "ff".repeat(32)),
+        }
+    }
+
+    fn order(status: &str) -> PegOrderDto {
+        serde_json::from_value(serde_json::json!({
+            "order_id": "pg_1", "wallet_id": "w", "direction": "out", "status": status,
+            "deposit_address": "x", "deposit_expected_sats": 100000, "payout_address": "y",
+            "payout_expected_sats": 99000, "created_at": 1, "updated_at": 1, "eta_minutes": 1,
+            "txid_deposit": null, "txid_payout": null, "simulated": false,
+            "status_history": [], "provider": "sideswap"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn sideswap_cannot_swap_the_deposit_or_turn_the_order_back() {
+        let ours = "aa".repeat(32);
+        let theirs = "bb".repeat(32);
+        let list = vec![
+            report(&theirs, TxState::Done, None),
+            report(&ours, TxState::Detected, Some(1)),
+        ];
+        // The wallet's own deposit is the one followed; when SideSwap does
+        // not list it, nothing is.
+        assert_eq!(pick_tx(&list, Some(&ours), None).unwrap().tx_hash, ours);
+        assert!(pick_tx(&list[..1], Some(&ours), None).is_none());
+        assert!(pick_tx(&list[..1], None, Some(&ours)).is_none());
+        assert_eq!(pick_tx(&list, None, None).unwrap().tx_hash, theirs);
+
+        let mut o = order(CONFIRMING);
+        o.txid_deposit = Some(ours.clone());
+        // A report for another transaction never replaces the deposit.
+        apply_report(
+            &mut o,
+            &report(&theirs, TxState::Detected, Some(0)),
+            true,
+            5,
+        )
+        .unwrap();
+        assert_eq!(o.txid_deposit.as_deref(), Some(ours.as_str()));
+        // Nor does a report move the order back.
+        assert_eq!(o.status, CONFIRMING);
+        apply_report(&mut o, &report(&ours, TxState::Processing, None), true, 6).unwrap();
+        assert_eq!(o.status, SETTLING);
+        apply_report(&mut o, &report(&ours, TxState::Detected, Some(1)), true, 7).unwrap();
+        assert_eq!(o.status, SETTLING);
+        // SideSwap alone cannot fail a deposit the wallet paid…
+        let err = apply_report(
+            &mut o,
+            &report(&ours, TxState::InsufficientAmount, None),
+            true,
+            8,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not cover the fees"), "{err}");
+        assert_eq!(o.status, SETTLING);
+        // …but it can say so of one paid from elsewhere.
+        let mut other = order(DEPOSIT_SEEN);
+        let _ = apply_report(
+            &mut other,
+            &report(&theirs, TxState::InsufficientAmount, None),
+            false,
+            9,
+        );
+        assert_eq!(other.status, FAILED);
+        // "Done" only names the payout to verify; it completes nothing.
+        let payout = apply_report(&mut o, &report(&ours, TxState::Done, None), true, 10).unwrap();
+        assert_eq!(payout, Some("ff".repeat(32)));
+        assert_eq!(o.status, SETTLING);
+    }
+
+    #[test]
+    fn a_payout_must_be_new_and_nobody_elses() {
+        let p = "cc".repeat(32);
+        assert!(payout_is_new(&p, &[], &[]).is_ok());
+        let err = payout_is_new(&p, std::slice::from_ref(&p), &[]).unwrap_err();
+        assert!(err.contains("had before this order"), "{err}");
+        let err = payout_is_new(&p, &[], std::slice::from_ref(&p)).unwrap_err();
+        assert!(err.contains("another order"), "{err}");
     }
 
     #[test]

@@ -733,6 +733,32 @@ impl LiquidChain {
             .map_err(|e| sync_err("federation parameters", e))
     }
 
+    /// Every transaction touching `script` (Electrum only: the RPC
+    /// backend indexes only the wallet's own scripts).
+    pub fn script_txids(&self, script: &Script) -> Result<Vec<Txid>, TemplarError> {
+        if self.rpc.is_some() {
+            return Err(sync_err(
+                "script history",
+                "not available through elementsd RPC",
+            ));
+        }
+        let mut hash = sha256::Hash::hash(script.as_bytes()).to_byte_array();
+        hash.reverse();
+        let value = self
+            .raw_electrum()?
+            .raw_call(
+                "blockchain.scripthash.get_history",
+                vec![electrum_client::Param::String(hex::encode(hash))],
+            )
+            .map_err(|e| sync_err("get_history", e))?;
+        Ok(value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i.get("tx_hash")?.as_str()?.parse().ok())
+            .collect())
+    }
+
     /// Confirmations of `txid`: `None` when the backend does not know it,
     /// `Some(0)` in the mempool. On Electrum the transaction is found
     /// through `script`, one of its outputs' scriptPubKeys.

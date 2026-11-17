@@ -503,7 +503,7 @@ fn refresh(state: &mut AppState, order: &mut StoredOrder, payouts_taken: &[Strin
     if order.native.is_some() {
         native::refresh(state, order, payouts_taken);
     } else if order.sideswap.is_some() {
-        sideswap::refresh(state, order);
+        sideswap::refresh(state, order, payouts_taken);
     }
     *order != before
 }
