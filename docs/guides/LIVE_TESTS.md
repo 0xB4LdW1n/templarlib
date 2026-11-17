@@ -1,6 +1,6 @@
 # Running the ignored tests
 
-`cargo test --workspace` is offline and is the gate. Ten tests are
+`cargo test --workspace` is offline and is the gate. Eleven tests are
 `#[ignore]`d because they need something the gate does not have: a local
 Elements regtest node, a running Templar testlab, a running Templar
 Protocol site, a public Electrum server, or time. This guide says what each one needs and how to run it.
@@ -47,6 +47,7 @@ chain.
 | Test | Crate | What it proves |
 |---|---|---|
 | `live_testlab_liquidex_make_publish_take_cancel` | templarlib | LiquiDEX end to end with nothing but the test-server profile: two fresh software wallets join the lab (`set_test_server`), get L-BTC and an issued asset from the lab's admin API and regtest BTC from its public faucet (one small request); A prepares an exact coin (`swap_make_prepare`), makes and publishes an offer (the same proposal again is `BOOK_DUPLICATE`); B finds it in `list_markets`, verifies it deep, previews and takes it; both balances move by the offer and the price; a second offer is cancelled; neither can be taken again; the order book's watcher closes both |
+| `live_testlab_wallet_created_before_joining_sees_its_regtest_funds` | templarlib | the manual tester's order in one engine: a wallet created and synced on Liquid testnet (needs the public testnet Electrum servers), then the lab joined, the wallet reopened, regtest BTC sent through the admin API and mined; a sync in the same engine shows it. The lab's Electrum sees a new block about 5–7 s after bitcoind, and until then a sync answers `ok` with the old balance, so the test syncs until the funds show (it prints after how long) |
 | `live_testlab_native_peg_in_and_out` | templarlib | the native Elements peg with nothing but the test-server profile: a fresh software wallet joins the lab, gets regtest BTC and L-BTC from the lab's admin API; peg-in: `peg_start`; someone else pays the address first, less than expected (20 000 sats): listed in `deposits`, not the order's own, and the order can no longer be cancelled; `peg_fund` (the wallet pays the deposit from its own Bitcoin) → a claim at one confirmation is `PEG_NOT_READY` → mined to depth → `claimable` → `peg_claim` → the early payment claimed by its `outpoint` → `completed`, the L-BTC balance up by exactly both claims; peg-out: one below the lab's `pegout_min_sat` and one over its maximum refused, `peg_start` → `peg_fund` → mined → the lab's federation bot pays → `completed`, the BTC balance up by exactly the amount; an expired peg-in address (a federation change, simulated in the stored order) refused with `PEG_EXPIRED` |
 
 The LiquiDEX test needs the Templar testlab (the `templar-testlab`

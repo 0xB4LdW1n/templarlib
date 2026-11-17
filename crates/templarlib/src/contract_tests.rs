@@ -2323,6 +2323,85 @@ fn joining_a_lab_applies_its_regtest_and_order_book_only() {
     assert!(!cfg.contains("test_server"), "{cfg}");
 }
 
+/// A wallet created and opened on testnet BEFORE the engine joins a lab
+/// (the order a manual tester takes) must come back, in the same engine,
+/// entirely on the lab's chains: Bitcoin regtest with its own database
+/// under `bitcoin-regtest/`, the lab's Electrum server, regtest addresses,
+/// and Liquid on the lab's regtest. Nothing of the testnet side may be
+/// reused.
+#[test]
+fn a_wallet_created_before_joining_a_lab_reopens_on_the_labs_chains() {
+    let mut env = TestEnv::new();
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Before the lab", "mnemonic": MNEMONIC, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let testnet_btc = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "BTC" }),
+    )["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(testnet_btc.starts_with("tb1"), "{testnet_btc}");
+    let testnet_db: Vec<_> = std::fs::read_dir(&env.dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("bdk_sw_"))
+        .collect();
+    assert_eq!(testnet_db.len(), 1, "{testnet_db:?}");
+    {
+        let b = env.state.bitcoin.as_ref().unwrap();
+        assert_eq!(b.network(), bdk::bitcoin::Network::Testnet);
+    }
+
+    let (lab, _slot) = lab_server(&"66".repeat(32));
+    let joined = env.ok("set_test_server", json!({ "url": lab }));
+    assert_eq!(joined["applied"]["wallet_closed"], json!(true));
+    assert!(
+        env.state.bitcoin.is_none(),
+        "the testnet manager must be gone"
+    );
+
+    let regtest_btc = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "BTC" }),
+    )["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(regtest_btc.starts_with("bcrt1"), "{regtest_btc}");
+    let b = env.state.bitcoin.as_ref().unwrap();
+    assert_eq!(b.network(), bdk::bitcoin::Network::Regtest);
+    assert_eq!(
+        b.backend(),
+        &templar_core::BitcoinBackend::regtest("tcp://127.0.0.1:19060")
+    );
+    // The wallet's own descriptor, re-encoded for regtest.
+    use std::str::FromStr;
+    let addr = bdk::bitcoin::Address::from_str(&regtest_btc)
+        .unwrap()
+        .require_network(bdk::bitcoin::Network::Regtest)
+        .unwrap();
+    assert!(b.is_mine(&addr.script_pubkey()));
+    // Its own database under bitcoin-regtest/, the testnet one untouched.
+    let regtest_db = env.dir.join("bitcoin-regtest").join(&testnet_db[0]);
+    assert!(regtest_db.is_dir(), "{regtest_db:?}");
+    assert!(env.dir.join(&testnet_db[0]).is_dir());
+    let liq = env.state.liquid.as_ref().unwrap();
+    assert!(liq.network().unwrap().is_regtest());
+    let lbtc = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "LBTC" }),
+    )["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(lbtc.starts_with("el1"), "{lbtc}");
+}
+
 #[test]
 fn set_test_server_refuses_bad_servers_and_applies_nothing() {
     let mut env = TestEnv::new();
@@ -3327,6 +3406,78 @@ fn live_testlab_liquidex_make_publish_take_cancel() {
                 || r["proposal_json"] == json!(second_json)),
         "closed offers must leave the open book"
     );
+}
+
+/// The manual tester's order, live: a wallet created and synced on Liquid
+/// testnet, then the engine joins the lab, reopens the wallet, gets regtest
+/// BTC through the lab's admin API, a block is mined, and a sync in the
+/// same engine must show it. The lab's Electrum server sees a new block a
+/// few seconds after bitcoind (about 5–7 s, measured): until then a sync
+/// answers `ok` with the old balance, so the test syncs until it shows.
+#[test]
+#[ignore = "needs a running Templar testlab and Bitcoin/Liquid testnet Electrum (TEMPLAR_LIVE_TESTLAB_URL)"]
+fn live_testlab_wallet_created_before_joining_sees_its_regtest_funds() {
+    let lab = std::env::var("TEMPLAR_LIVE_TESTLAB_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8096".to_string());
+    let lab = lab.trim_end_matches('/').to_string();
+    let mut env = TestEnv::new();
+    let words = env.ok("generate_mnemonic", json!({ "word_count": 12 }));
+    let mnemonic = words
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Before the lab", "mnemonic": mnemonic, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let synced = env.ok("sync_wallet", json!({ "wallet_id": id }));
+    eprintln!("[live] testnet sync before joining: {synced}");
+
+    env.ok("set_test_server", json!({ "url": lab }));
+    let addr = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "BTC" }),
+    )["address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(addr.starts_with("bcrt1"), "{addr}");
+    let sent = lab_post(
+        &format!("{lab}/admin/api/send"),
+        json!({ "network": "bitcoin-regtest", "address": addr, "amount": "0.01" }),
+    );
+    lab_post(
+        &format!("{lab}/admin/api/mine"),
+        json!({ "chain": "bitcoin", "blocks": 1 }),
+    );
+    eprintln!("[live] admin send to {addr}: {}", sent["txid"]);
+    let started = std::time::Instant::now();
+    for attempt in 1..=90 {
+        let s = env.ok("sync_wallet", json!({ "wallet_id": id }));
+        assert_eq!(s["btc"], json!("ok"), "{s}");
+        let d = env.ok("get_wallet_summary", json!({ "wallet_id": id }));
+        let btc = d["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["asset_id"] == json!("BTC"))
+            .unwrap()["amount"]
+            .as_i64()
+            .unwrap();
+        if btc == 1_000_000 {
+            eprintln!(
+                "[live] the regtest funds showed at sync {attempt}, after {:?}",
+                started.elapsed()
+            );
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    panic!("the regtest funds never showed in this engine");
 }
 
 // ── Live: the native peg on a Templar testlab ──────────────────────
