@@ -681,7 +681,7 @@ pub fn list_utxos(state: &AppState, chain: &str) -> Result<Vec<UtxoDto>, String>
                         confirmations,
                         state: state_label.to_string(),
                         label: None,
-                        address: None,
+                        address: btc.utxo_address(&u),
                         ticker: Some("BTC".to_string()),
                         asset_id: None,
                     }

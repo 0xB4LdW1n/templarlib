@@ -805,6 +805,17 @@ impl WalletManager {
         })
     }
 
+    /// The address a coin sits on, on this wallet's network (`tb1…` on
+    /// testnet, `bcrt1…` beside a test server), or `None` when its script
+    /// has no address form. Two coins on one address are linked on-chain for
+    /// anyone to see, so a host groups them by this. Offline: the script is
+    /// all it reads.
+    pub fn utxo_address(&self, utxo: &bdk::LocalUtxo) -> Option<String> {
+        Address::from_script(&utxo.txout.script_pubkey, self.backend.network)
+            .ok()
+            .map(|a| a.to_string())
+    }
+
     /// Builds an unsigned transaction (PSBT).
     ///
     /// Not wrapped in catch_unwind — requires mutable wallet builder access.
@@ -2278,6 +2289,33 @@ mod tests {
         assert!(!info.fingerprint.is_empty());
         assert!(info.xpub.starts_with("tpub"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utxo_address_is_the_address_the_coin_was_received_on() {
+        // Two coins, each on its own receive address: what a host groups by
+        // is the address the wallet handed out, read back from the script.
+        let (mut mgr, _) = funded_wallet(&[100_000, 25_000]);
+        let utxos = mgr.list_unspent().unwrap();
+        assert_eq!(utxos.len(), 2);
+        let addresses: Vec<String> = utxos
+            .iter()
+            .map(|u| mgr.utxo_address(u).expect("a wpkh coin has an address"))
+            .collect();
+        assert!(addresses.iter().all(|a| a.starts_with("tb1q")));
+        assert_ne!(addresses[0], addresses[1]);
+        for (u, a) in utxos.iter().zip(&addresses) {
+            let script = Address::from_str(a)
+                .unwrap()
+                .require_network(Network::Testnet)
+                .unwrap()
+                .script_pubkey();
+            assert_eq!(script, u.txout.script_pubkey);
+        }
+        // The same coin beside a test server reads in regtest encoding.
+        mgr.backend = BitcoinBackend::regtest("tcp://127.0.0.1:1");
+        let on_regtest = mgr.utxo_address(&utxos[0]).unwrap();
+        assert!(on_regtest.starts_with("bcrt1q"), "{on_regtest}");
     }
 
     #[test]

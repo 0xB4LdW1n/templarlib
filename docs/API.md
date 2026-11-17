@@ -701,7 +701,10 @@ common ones.
 
 Returns: `[{outpoint, amount: int, display_amount, confirmations: u32,
 state: "available" | "frozen" | "dusty" | "unconfirmed", label?, address?,
-ticker?, asset_id?}]`. Errors: the chain's side is missing.
+ticker?, asset_id?}]`. `address` is the address the coin sits on, on both
+chains and in the wallet's network encoding (absent only for a script with
+no address form): coins that share one are linked on-chain, and a host
+groups them by it. Errors: the chain's side is missing.
 
 ### `set_utxos_frozen`
 

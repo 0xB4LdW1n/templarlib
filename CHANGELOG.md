@@ -110,6 +110,10 @@ with 0, any release may change the method contract.
 
 ### Changed
 
+- `list_utxos` names the address of a Bitcoin coin too (`address`, as it
+  already did on Liquid, in the wallet's network encoding), so a host can
+  group the coins that share one. `WalletManager::utxo_address` derives it
+  from the coin's script, offline.
 - The peg methods no longer refuse regtest as such: `peg_quote`,
   `peg_start`, `peg_fund` and `peg_claim` need a provider for the active
   network (`PEG_UNAVAILABLE: <why>` otherwise; Liquid testnet has none);
