@@ -11,6 +11,7 @@ pub mod endpoints;
 pub mod error;
 pub mod frozen;
 pub mod liquid;
+pub(crate) mod net;
 pub mod peg;
 pub mod policy;
 pub mod qr;

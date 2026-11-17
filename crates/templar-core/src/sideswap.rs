@@ -10,11 +10,12 @@
 //! Everything received is parsed strictly (bounded sizes, hex ids, integer
 //! amounts, printable text) and a server that answers for another chain
 //! (its `policy_asset` is not Liquid testnet L-BTC) is refused, so a
-//! broken or malicious server can only make an order fail. Every call is
-//! bounded in time; the socket lives for one call.
+//! broken or malicious server can only make an order fail. The connection
+//! (TCP, TLS, WebSocket upgrade) and each call are bounded by a deadline
+//! for the whole step, not per read ([`crate::net`]), so a server that
+//! trickles bytes cannot hold the engine; the socket lives for one engine
+//! call.
 
-use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -24,14 +25,31 @@ use tungstenite::{Connector, Message, WebSocket};
 
 use crate::error::{PegError, TemplarError};
 use crate::liquid::liquidex::LBTC_TESTNET_ASSET_ID;
+use crate::net::{self, Deadline, DeadlineStream};
 
 /// SideSwap's testnet endpoint.
 pub const DEFAULT_TESTNET_URL: &str = "wss://api-testnet.sideswap.io/json-rpc-ws";
 /// Overrides the SideSwap endpoint (see [`crate::Endpoints::peg_provider`]).
 pub const ENV_SIDESWAP_URL: &str = "TEMPLAR_SIDESWAP_URL";
 
+/// Longest TCP connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
-const IO_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long one step may take, from first byte to last.
+#[derive(Debug, Clone, Copy)]
+pub struct Budget {
+    /// TCP connect, TLS handshake and WebSocket upgrade together.
+    pub connect: Duration,
+    /// One JSON-RPC call: the request and its answer (notifications in
+    /// between included).
+    pub call: Duration,
+}
+
+/// The budgets every engine call uses.
+pub const BUDGET: Budget = Budget {
+    connect: Duration::from_secs(15),
+    call: Duration::from_secs(15),
+};
 /// Largest message read. A `peg_status` with a long transaction list is a
 /// few kB.
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
@@ -373,8 +391,10 @@ pub fn check_url(raw: &str) -> Result<reqwest::Url, TemplarError> {
 
 /// One connection to SideSwap, for the calls of one engine call.
 pub struct SideSwapClient {
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    socket: WebSocket<MaybeTlsStream<DeadlineStream>>,
     next_id: u64,
+    deadline: Deadline,
+    call_budget: Duration,
 }
 
 impl SideSwapClient {
@@ -382,28 +402,18 @@ impl SideSwapClient {
     /// the webpki roots through the ring provider, then the WebSocket
     /// handshake with bounded frames and messages.
     pub fn connect(url: &str) -> Result<Self, TemplarError> {
+        Self::connect_with(url, BUDGET)
+    }
+
+    /// [`Self::connect`] with explicit budgets (tests use short ones).
+    pub fn connect_with(url: &str, budget: Budget) -> Result<Self, TemplarError> {
         let url = check_url(url)?;
-        let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+        let host = url.host_str().unwrap_or_default().to_string();
         let port = url.port_or_known_default().unwrap_or(443);
-        let addr = (host, port)
-            .to_socket_addrs()
-            .map_err(|e| bad(format!("cannot resolve {host}: {e}")))?
-            .next()
-            .ok_or_else(|| bad(format!("cannot resolve {host}")))?;
-        let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        let deadline = Deadline::new(budget.connect);
+        let tcp = net::connect(&host, port, &deadline, CONNECT_TIMEOUT)
             .map_err(|e| bad(format!("cannot connect: {e}")))?;
-        tcp.set_read_timeout(Some(IO_TIMEOUT))
-            .and_then(|_| tcp.set_write_timeout(Some(IO_TIMEOUT)))
-            .map_err(|e| bad(format!("socket: {e}")))?;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let tls = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
-            .map_err(|e| bad(format!("TLS: {e}")))?
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let tls = net::tls_config().map_err(|e| bad(e.to_string()))?;
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_MESSAGE_BYTES))
             .max_frame_size(Some(MAX_MESSAGE_BYTES));
@@ -411,15 +421,21 @@ impl SideSwapClient {
             url.as_str(),
             tcp,
             Some(config),
-            Some(Connector::Rustls(Arc::new(tls))),
+            Some(Connector::Rustls(tls)),
         )
         .map_err(|e| bad(format!("handshake: {e}")))?;
-        Ok(Self { socket, next_id: 1 })
+        Ok(Self {
+            socket,
+            next_id: 1,
+            deadline,
+            call_budget: budget.call,
+        })
     }
 
     /// One JSON-RPC call: its `result`. Notifications in between are
     /// skipped, up to a bound.
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, TemplarError> {
+        self.deadline.reset(self.call_budget);
         let id = self.next_id;
         self.next_id += 1;
         let request = json!({ "id": id, "method": method, "params": params });
@@ -481,6 +497,8 @@ impl SideSwapClient {
 
 impl Drop for SideSwapClient {
     fn drop(&mut self) {
+        // A polite close, but never a wait on a server that stalls.
+        self.deadline.reset(Duration::from_secs(1));
         let _ = self.socket.close(None);
         let _ = self.socket.flush();
     }
@@ -695,6 +713,63 @@ mod tests {
             }
         });
         url
+    }
+
+    const SHORT: Budget = Budget {
+        connect: Duration::from_millis(800),
+        call: Duration::from_millis(800),
+    };
+
+    #[test]
+    fn a_server_trickling_its_handshake_is_cut_off() {
+        // Never finishes the HTTP upgrade: one byte every 50 ms.
+        let addr = crate::net::trickling_server(
+            b"HTTP/1.1 101 Switching Protocols\r\nX-Slow: ".to_vec(),
+            Duration::from_millis(50),
+        );
+        let started = std::time::Instant::now();
+        let err = SideSwapClient::connect_with(&format!("ws://{addr}/ws"), SHORT)
+            .err()
+            .expect("the handshake must fail")
+            .to_string();
+        assert!(err.contains("SideSwap"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "held for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_server_trickling_an_answer_is_cut_off() {
+        // A real handshake, then an answer frame dribbled byte by byte.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let _ = ws.read();
+            let payload = format!(r#"{{"id":1,"result":"{}"}}"#, "x".repeat(200));
+            let mut frame = vec![0x81u8, 126, 0, payload.len() as u8];
+            frame.extend_from_slice(payload.as_bytes());
+            let tcp = ws.get_mut();
+            for b in frame {
+                use std::io::Write;
+                if tcp.write_all(&[b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let mut c = SideSwapClient::connect_with(&url, SHORT).unwrap();
+        let started = std::time::Instant::now();
+        let err = c.call("slow", Value::Null).unwrap_err().to_string();
+        assert!(err.contains("SideSwap"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "held for {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -17,16 +17,18 @@
 //! Every network client here is built inside the call that needs it, with a
 //! timeout (the engine mutex is held while it waits).
 
-use std::io::Read;
+use std::io::{self, Read, Write};
 use std::str::FromStr;
 use std::time::Duration;
 
-use electrum_client::{ConfigBuilder, ElectrumApi};
+use electrum_client::raw_client::RawClient;
+use electrum_client::{ElectrumApi, Param};
 use lwk_wollet::elements::bitcoin::{self, hashes::Hash, BlockHash, ScriptBuf, Txid};
 use lwk_wollet::elements::{self, opcodes, script::Builder};
 use lwk_wollet::{PeginAddress, PeginFunding};
 
 use crate::error::{PegError, TemplarError};
+use crate::net::{self, Deadline, DeadlineStream};
 
 /// Smallest peg-in or peg-out the wallet starts: it leaves room for the
 /// claim's or the payout's fee and stays far above any dust limit.
@@ -34,8 +36,25 @@ pub const MIN_PEG_SATS: u64 = 10_000;
 /// 21 million BTC: the largest amount any peg-in can carry.
 pub const MAX_MONEY_SATS: u64 = 2_100_000_000_000_000;
 
-/// Socket timeout of the Bitcoin Electrum client, as the Bitcoin wallet's.
-const ELECTRUM_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest TCP connect to the Bitcoin Electrum server, as the Bitcoin
+/// wallet's socket timeout.
+const ELECTRUM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one step of the Bitcoin chain view may take, first byte to
+/// last ([`crate::net`]).
+#[derive(Debug, Clone, Copy)]
+pub struct ElectrumBudget {
+    /// TCP connect, TLS handshake and the `server.version` exchange.
+    pub connect: Duration,
+    /// One request and its answer.
+    pub call: Duration,
+}
+
+/// The budgets every engine call uses.
+pub const ELECTRUM_BUDGET: ElectrumBudget = ElectrumBudget {
+    connect: Duration::from_secs(10),
+    call: Duration::from_secs(10),
+};
 /// Esplora connect and whole-request bounds.
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -98,29 +117,105 @@ pub struct ScriptHistoryItem {
     pub height: Option<u32>,
 }
 
+/// The Electrum connection: plain TCP or TLS, both under one deadline.
+enum ElectrumStream {
+    Plain(DeadlineStream),
+    Tls(Box<rustls::StreamOwned<rustls::ClientConnection, DeadlineStream>>),
+}
+
+impl Read for ElectrumStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            ElectrumStream::Plain(s) => s.read(buf),
+            ElectrumStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for ElectrumStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            ElectrumStream::Plain(s) => s.write(buf),
+            ElectrumStream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            ElectrumStream::Plain(s) => s.flush(),
+            ElectrumStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
 /// The wallet's Bitcoin Electrum server, read with bitcoin 0.32 types (the
-/// ones LWK's peg-in types use). Built per call; nothing is kept open.
+/// ones LWK's peg-in types use). Built per call; nothing is kept open. The
+/// connection and every request are bounded by a deadline for the whole
+/// step, so a server that trickles bytes cannot hold the engine.
 pub struct BitcoinChainView {
-    client: electrum_client::Client,
+    client: RawClient<ElectrumStream>,
+    deadline: Deadline,
+    call_budget: Duration,
 }
 
 impl BitcoinChainView {
     /// Connects to `electrum_url` (`tcp://host:port` or `ssl://host:port`,
-    /// the format of [`crate::BitcoinBackend::electrum_url`]).
+    /// the format of [`crate::BitcoinBackend::electrum_url`]; no scheme =
+    /// `tcp`). TLS certificates are validated against the host.
     pub fn connect(electrum_url: &str) -> Result<Self, TemplarError> {
-        let config = ConfigBuilder::new()
-            .timeout(Some(ELECTRUM_TIMEOUT))
-            .validate_domain(true)
-            .build();
-        let client = electrum_client::Client::from_config(electrum_url, config)
-            .map_err(|e| chain_err("Bitcoin Electrum connection failed", e))?;
-        Ok(Self { client })
+        Self::connect_with(electrum_url, ELECTRUM_BUDGET)
+    }
+
+    /// [`Self::connect`] with explicit budgets (tests use short ones).
+    pub fn connect_with(electrum_url: &str, budget: ElectrumBudget) -> Result<Self, TemplarError> {
+        let fail = |e: &dyn std::fmt::Display| chain_err("Bitcoin Electrum connection failed", e);
+        let (tls, rest) = match electrum_url.split_once("://") {
+            Some(("ssl", rest)) => (true, rest),
+            Some(("tcp", rest)) => (false, rest),
+            Some((other, _)) => return Err(fail(&format!("unknown scheme {other:?}"))),
+            None => (false, electrum_url),
+        };
+        let (host, port) = rest
+            .rsplit_once(':')
+            .and_then(|(h, p)| Some((h, p.parse::<u16>().ok()?)))
+            .ok_or_else(|| fail(&"no host:port"))?;
+        let host = host.trim_matches(['[', ']']);
+        let deadline = Deadline::new(budget.connect);
+        let tcp =
+            net::connect(host, port, &deadline, ELECTRUM_CONNECT_TIMEOUT).map_err(|e| fail(&e))?;
+        let stream = if tls {
+            ElectrumStream::Tls(Box::new(net::tls(tcp, host).map_err(|e| fail(&e))?))
+        } else {
+            ElectrumStream::Plain(tcp)
+        };
+        let client = RawClient::from(stream);
+        // The protocol's opening exchange, inside the connect budget.
+        client
+            .raw_call(
+                "server.version",
+                vec![
+                    Param::String("templar".into()),
+                    Param::StringVec(vec!["1.4".into(), "1.6".into()]),
+                ],
+            )
+            .map_err(|e| fail(&e))?;
+        Ok(Self {
+            client,
+            deadline,
+            call_budget: budget.call,
+        })
+    }
+
+    /// Opens the deadline of one request.
+    fn step(&self) -> &RawClient<ElectrumStream> {
+        self.deadline.reset(self.call_budget);
+        &self.client
     }
 
     /// Height of the best chain's tip.
     pub fn tip_height(&self) -> Result<u32, TemplarError> {
         let tip = self
-            .client
+            .step()
             .block_headers_subscribe()
             .map_err(|e| chain_err("Bitcoin tip", e))?;
         u32::try_from(tip.height).map_err(|e| chain_err("Bitcoin tip", e))
@@ -129,7 +224,7 @@ impl BitcoinChainView {
     /// Hash of the best chain's block at `height`.
     pub fn block_hash_at(&self, height: u32) -> Result<BlockHash, TemplarError> {
         let header = self
-            .client
+            .step()
             .block_header(height as usize)
             .map_err(|e| chain_err("Bitcoin block header", e))?;
         Ok(header.block_hash())
@@ -141,7 +236,7 @@ impl BitcoinChainView {
         script: &bitcoin::Script,
     ) -> Result<Vec<ScriptHistoryItem>, TemplarError> {
         let items = self
-            .client
+            .step()
             .script_get_history(script)
             .map_err(|e| chain_err("Bitcoin script history", e))?;
         Ok(items
@@ -156,7 +251,7 @@ impl BitcoinChainView {
     /// A transaction by id; its bytes are checked to hash to `txid`.
     pub fn transaction(&self, txid: &Txid) -> Result<bitcoin::Transaction, TemplarError> {
         let raw = self
-            .client
+            .step()
             .transaction_get_raw(txid)
             .map_err(|e| chain_err("Bitcoin transaction", e))?;
         let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw)
@@ -172,7 +267,7 @@ impl BitcoinChainView {
 
     /// Broadcasts a serialized transaction; returns its txid.
     pub fn broadcast_raw(&self, raw: &[u8]) -> Result<Txid, TemplarError> {
-        self.client
+        self.step()
             .transaction_broadcast_raw(raw)
             .map_err(|e| chain_err("Bitcoin broadcast", e))
     }
@@ -607,6 +702,32 @@ mod tests {
         c.facts.block_hash = proof.header.block_hash();
         let err = verify(&c).unwrap_err();
         assert!(err.starts_with("PEG_PROOF_REJECTED:"), "{err}");
+    }
+
+    #[test]
+    fn a_trickling_electrum_server_is_cut_off() {
+        let short = ElectrumBudget {
+            connect: Duration::from_millis(800),
+            call: Duration::from_millis(800),
+        };
+        // An answer to server.version that never ends.
+        let addr = crate::net::trickling_server(
+            br#"{"jsonrpc":"2.0","id":0,"result":["electrs","1.4"#.to_vec(),
+            Duration::from_millis(50),
+        );
+        let started = std::time::Instant::now();
+        let err = BitcoinChainView::connect_with(&format!("tcp://{addr}"), short)
+            .err()
+            .expect("must time out")
+            .to_string();
+        assert!(err.contains("Bitcoin Electrum connection failed"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "held for {:?}",
+            started.elapsed()
+        );
+        assert!(BitcoinChainView::connect_with("udp://h:1", short).is_err());
+        assert!(BitcoinChainView::connect_with("tcp://nohostport", short).is_err());
     }
 
     #[test]
