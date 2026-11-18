@@ -7,6 +7,8 @@ with 0, any release may change the method contract.
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-18
+
 ### Added
 
 - `test_server_faucet {wallet_id, asset}`: test coins from the joined
@@ -348,6 +350,7 @@ local Liquid regtest for development. Mainnet is refused by design.
 - Templar Protocol connector: the escrow account key and PSET inspection a
   wallet needs to connect to a site and sign loan transactions.
 
-[Unreleased]: https://github.com/0xB4LdW1n/templarlib/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/0xB4LdW1n/templarlib/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/0xB4LdW1n/templarlib/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/0xB4LdW1n/templarlib/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/0xB4LdW1n/templarlib/commit/62bf911
