@@ -334,9 +334,10 @@ fn newest_first(a_ts: i64, a_conf: u32, b_ts: i64, b_conf: u32) -> std::cmp::Ord
 /// The receive screen loads the last unused address (so revisiting it does not
 /// burn indexes); the "New address" button asks for `fresh`, which advances the
 /// derivation index even if the current address never received anything.
-/// Liquid CT addresses stay stable and ignore `fresh`.
+/// Both chains work the same way; a Liquid address also comes in its
+/// unconfidential form.
 pub fn generate_receive_address(
-    state: &AppState,
+    state: &mut AppState,
     asset: &str,
     fresh: bool,
 ) -> Result<AddressInfoDto, String> {
@@ -345,15 +346,21 @@ pub fn generate_receive_address(
         // "LBTC"/"liquid". Accept all so the Liquid tab never silently falls
         // through to the Bitcoin branch and hands back a BTC address.
         "LBTC" | "L-BTC" | "liquid" => {
-            let liq = state.liquid.as_ref().ok_or("Liquid wallet not open")?;
-            let addr = liq.get_new_address().map_err(|e| e.to_string())?;
+            let liq = state.liquid.as_mut().ok_or("Liquid wallet not open")?;
+            let info = if fresh {
+                liq.fresh_receive_address()
+            } else {
+                liq.receive_address()
+            }
+            .map_err(|e| e.to_string())?;
             Ok(AddressInfoDto {
-                address: addr,
-                index: 0,
+                address: info.address,
+                index: info.index,
                 asset: asset.to_string(),
                 label: None,
                 received_sats: 0,
                 derivation_path: None,
+                unconfidential_address: Some(info.unconfidential),
             })
         }
         _ => {
@@ -370,6 +377,7 @@ pub fn generate_receive_address(
                 label: None,
                 received_sats: 0,
                 derivation_path: None,
+                unconfidential_address: None,
             })
         }
     }
@@ -1243,7 +1251,9 @@ fn placeholder_info() -> (
     )
 }
 
-/// Lists external BTC addresses that have received funds (received_sats > 0).
+/// Lists external addresses that have received funds, from the wallet's whole
+/// synced history. On Liquid, every address that received an output of any
+/// asset, in both its forms.
 pub fn list_previous_addresses(
     state: &AppState,
     asset: &str,
@@ -1260,6 +1270,7 @@ pub fn list_previous_addresses(
             Ok(addrs
                 .into_iter()
                 .map(|(address, index, received)| AddressInfoDto {
+                    unconfidential_address: templar_core::unconfidential_address(&address),
                     address,
                     index,
                     asset: asset.to_string(),
@@ -1283,6 +1294,7 @@ pub fn list_previous_addresses(
                     label: None,
                     received_sats: received as i64,
                     derivation_path: Some(format!("m/84'/1'/0'/0/{index}")),
+                    unconfidential_address: None,
                 })
                 .collect())
         }

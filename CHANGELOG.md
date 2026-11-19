@@ -7,6 +7,17 @@ with 0, any release may change the method contract.
 
 ## [Unreleased]
 
+### Changed
+
+- `generate_receive_address` honours `fresh` on Liquid as on Bitcoin: the
+  next address even when the current one never received. The index is
+  saved per descriptor under the data directory and every Liquid sync
+  scans up to it. Liquid addresses come with `unconfidential_address`
+  (also on `list_previous_addresses`), the form an explorer shows, and the
+  Liquid `index` is the real one instead of `0`. New in `templar-core`:
+  `LiquidWalletManager::receive_address`, `fresh_receive_address` and
+  `unconfidential_address`.
+
 ## [0.3.0] — 2026-11-18
 
 ### Added

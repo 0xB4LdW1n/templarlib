@@ -317,6 +317,68 @@ fn open_wallet_and_generate_receive_address_offline() {
 }
 
 #[test]
+fn liquid_receive_address_advances_on_fresh_like_bitcoin() {
+    let mut env = TestEnv::new();
+    let created = env.ok(
+        "create_wallet",
+        json!({ "name": "Liquid addresses", "mnemonic": MNEMONIC, "liquid": true }),
+    );
+    let id = created["id"].as_str().unwrap().to_string();
+    let get = |env: &mut TestEnv, fresh: bool| {
+        env.ok(
+            "generate_receive_address",
+            json!({ "wallet_id": id, "asset": "LBTC", "fresh": fresh }),
+        )
+    };
+
+    let first = get(&mut env, false);
+    assert_keys(
+        "generate_receive_address",
+        &first,
+        &[
+            "address",
+            "index",
+            "asset",
+            "label",
+            "received_sats",
+            "derivation_path",
+            "unconfidential_address",
+        ],
+    );
+    let addr = first["address"].as_str().unwrap().to_string();
+    let plain = first["unconfidential_address"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(addr.starts_with("tlq1"), "confidential address: {addr}");
+    assert!(plain.starts_with("tex1"), "unconfidential address: {plain}");
+    assert_eq!(first["index"], json!(0));
+
+    // Revisiting reuses the unused address instead of burning an index.
+    assert_eq!(get(&mut env, false)["address"], json!(addr));
+
+    // "New address" hands out the next one although this one never received.
+    let fresh = get(&mut env, true);
+    assert_eq!(fresh["index"], json!(1), "{fresh}");
+    assert_ne!(fresh["address"], json!(addr));
+    assert_ne!(fresh["unconfidential_address"], json!(plain));
+    assert_eq!(get(&mut env, false)["address"], fresh["address"]);
+
+    // The index survives closing and reopening the wallet.
+    env.state.liquid = None;
+    env.state.active_wallet_id = None;
+    assert_eq!(get(&mut env, false)["address"], fresh["address"]);
+    assert_eq!(get(&mut env, true)["index"], json!(2));
+
+    // A Bitcoin address has no unconfidential form: the key stays absent.
+    let btc = env.ok(
+        "generate_receive_address",
+        json!({ "wallet_id": id, "asset": "BTC" }),
+    );
+    assert!(btc.get("unconfidential_address").is_none(), "{btc}");
+}
+
+#[test]
 fn open_wallet_unknown_id_errs() {
     let mut env = TestEnv::new();
     let err = env.err("open_wallet", json!({ "wallet_id": "no-such-wallet" }));

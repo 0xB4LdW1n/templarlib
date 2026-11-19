@@ -130,7 +130,11 @@ Bitcoin or
 on Liquid. Nothing was broadcast.
 
 **AddressInfo** (`AddressInfoDto`): `address`, `index: u32`, `asset`,
-`label: string?`, `received_sats: int`, `derivation_path: string?`.
+`label: string?`, `received_sats: int`, `derivation_path: string?`,
+`unconfidential_address: string?`. On Liquid `address` is the confidential
+form to hand out (`tlq1…`, `el1…` on regtest) and `unconfidential_address`
+the same script without the blinding key (`tex1…`, `ert1…`): the form an
+explorer shows, since the key never goes on chain. Absent on Bitcoin.
 
 **PsbtInspection** (`PsbtInspectionDto`): `inputs: [{outpoint,
 amount_sats: int?, display_amount, utxo_status: "ok" | "missing" |
@@ -762,11 +766,19 @@ local_fingerprints: [string], liquid_network}`. Errors: the common ones.
 | `asset` | string | yes | `LBTC`, `L-BTC` or `liquid` for Liquid; anything else is Bitcoin |
 | `fresh` | bool | no | `true` advances the index; default: the current unused address |
 
+Both chains alike: without `fresh`, the last address handed out while it
+has received nothing, else the next unused one; with `fresh`, the one after
+it, even when the current one never received. On Liquid the advanced index
+is saved under the data directory (`<network>/revealed_external/`) and
+every sync scans at least up to it.
+
 Returns: **AddressInfo**. Errors: the chain's side is missing.
 
 ### `list_previous_addresses`
 
-*opens*. External addresses that have received funds.
+*opens*. External addresses that have received funds, from the wallet's
+whole synced history: on Liquid every address that received an output of
+any asset (`received_sats` counts L-BTC only).
 
 | Param | Type | Req. | Notes |
 |---|---|---|---|

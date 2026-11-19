@@ -106,6 +106,91 @@ pub struct LiquidWalletManager {
     /// ([`crate::endpoints::Endpoints::liquid_backend`]); `None` = the
     /// environment's ([`LiquidChain::from_env`]).
     backend: Option<LiquidBackend>,
+    /// The highest external index "New address" has handed out, and where it
+    /// is kept. See [`RevealedIndex`].
+    revealed: RevealedIndex,
+}
+
+/// A receive address in both its forms.
+///
+/// `address` is the confidential one (`tlq1…` on testnet, `el1…` on
+/// regtest): it carries the wallet's blinding public key, so a payer's
+/// wallet hides amount and asset. It is the one to hand out.
+///
+/// `unconfidential` (`tex1…` / `ert1…`) is the same output script without the
+/// blinding key. The key never goes on chain, so this is the only form an
+/// explorer can show for the outputs. Paying it sends amount and asset in
+/// the clear.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveAddress {
+    pub address: String,
+    pub unconfidential: String,
+    pub index: u32,
+}
+
+/// The unconfidential form of a Liquid address (itself if it already is
+/// one), or `None` when `address` is not a Liquid address. Offline.
+pub fn unconfidential_address(address: &str) -> Option<String> {
+    address
+        .parse::<Address>()
+        .ok()
+        .map(|a| a.to_unconfidential().to_string())
+}
+
+/// The highest external index handed out on request — Liquid's counterpart
+/// of the index BDK keeps in its database for `AddressIndex::New`.
+///
+/// LWK keeps no such counter: `Wollet::address(None)` is always the first
+/// index above the highest one that received, so without this an unused
+/// address could never be followed by another. The value is kept in a file
+/// of its own beside the LWK cache, not inside it: the cache may be deleted
+/// and rebuilt at any time, the counter must not be. It is an index, not a
+/// secret; the file is named by a hash of the descriptor, never the
+/// descriptor itself.
+///
+/// Every sync scans at least up to this index, so a payment to an address
+/// handed out past the gap limit is still found by this wallet.
+#[derive(Default)]
+struct RevealedIndex {
+    value: Option<u32>,
+    file: Option<std::path::PathBuf>,
+}
+
+impl RevealedIndex {
+    fn open(data_dir: Option<&Path>, network: ElementsNetwork, descriptor: &str) -> Self {
+        use lwk_wollet::elements::hashes::sha256;
+        let Some(dir) = data_dir else {
+            return Self::default();
+        };
+        let name = sha256::Hash::hash(descriptor.as_bytes()).to_string();
+        let file = dir
+            .join(network.as_str())
+            .join("revealed_external")
+            .join(name);
+        let value = std::fs::read_to_string(&file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok());
+        Self {
+            value,
+            file: Some(file),
+        }
+    }
+
+    /// Records `index`, on disk first: an address is handed out only once
+    /// the wallet will remember to scan for it.
+    fn set(&mut self, index: u32) -> Result<(), TemplarError> {
+        if let Some(file) = &self.file {
+            let io = |e: std::io::Error| LiquidError::SyncFailed(format!("Address index: {e}"));
+            if let Some(dir) = file.parent() {
+                std::fs::create_dir_all(dir).map_err(io)?;
+            }
+            let tmp = file.with_extension("tmp");
+            std::fs::write(&tmp, index.to_string()).map_err(io)?;
+            std::fs::rename(&tmp, file).map_err(io)?;
+        }
+        self.value = Some(index);
+        Ok(())
+    }
 }
 
 /// Returns the compressed 33-byte issuer public key from a software signer.
@@ -431,6 +516,7 @@ impl LiquidWalletManager {
         let signer = SwSigner::new_with_network(mnemonic_str, ElementsNetwork::TestnetLiquid)
             .map_err(|e| LiquidError::InvalidDescriptor(format!("SwSigner: {e}")))?;
 
+        let revealed = RevealedIndex::open(data_dir, network, &descriptor_string);
         let wollet = Self::make_wollet(network, descriptor, data_dir)?;
 
         Ok(Self {
@@ -438,6 +524,7 @@ impl LiquidWalletManager {
             signer: Some(signer),
             descriptor: descriptor_string,
             backend: None,
+            revealed,
         })
     }
 
@@ -527,6 +614,9 @@ impl LiquidWalletManager {
             .parse()
             .map_err(|e| LiquidError::InvalidDescriptor(format!("Parse descriptor: {e}")))?;
 
+        // Keyed by the parsed form, as a signing wallet is, so one descriptor
+        // opened either way shares one counter.
+        let revealed = RevealedIndex::open(data_dir, network, &descriptor.to_string());
         let wollet = Self::make_wollet(network, descriptor, data_dir)?;
 
         Ok(Self {
@@ -534,6 +624,7 @@ impl LiquidWalletManager {
             signer: None,
             descriptor: descriptor_str.to_string(),
             backend: None,
+            revealed,
         })
     }
 
@@ -585,12 +676,15 @@ impl LiquidWalletManager {
     /// testnet, `elementsd` RPC on regtest by default).
     pub fn sync(&mut self) -> Result<(), TemplarError> {
         let chain = self.chain()?;
-        chain.sync(&mut self.wollet)
+        self.sync_with(&chain)
     }
 
     /// Syncs through an explicit chain handle (its network must match).
+    ///
+    /// Scans at least up to the highest address "New address" handed out,
+    /// so a payment past the gap limit is not missed.
     pub fn sync_with(&mut self, chain: &LiquidChain) -> Result<(), TemplarError> {
-        chain.sync(&mut self.wollet)
+        chain.sync_to_index(&mut self.wollet, self.revealed.value.unwrap_or(0))
     }
 
     /// Returns the multi-asset balance.
@@ -609,13 +703,57 @@ impl LiquidWalletManager {
         Ok(bal)
     }
 
-    /// Generates a new confidential receive address.
+    /// The current confidential receive address — see [`Self::receive_address`].
     pub fn get_new_address(&self) -> Result<String, TemplarError> {
-        let info = self
+        Ok(self.receive_address()?.address)
+    }
+
+    /// The current receive address: the last one handed out while it has
+    /// received nothing, else the first unused one. Revisiting the receive
+    /// screen shows the same address instead of burning indexes — Bitcoin's
+    /// `AddressIndex::LastUnused`. Offline.
+    pub fn receive_address(&self) -> Result<ReceiveAddress, TemplarError> {
+        self.address_at(self.current_external_index()?)
+    }
+
+    /// The next receive address, one past the current one even when the
+    /// current one never received — what "New address" asks for, as Bitcoin's
+    /// `AddressIndex::New`. The index is saved before the address is returned,
+    /// so it survives a restart and every later sync scans up to it. Offline.
+    pub fn fresh_receive_address(&mut self) -> Result<ReceiveAddress, TemplarError> {
+        let next = self
+            .current_external_index()?
+            .checked_add(1)
+            .ok_or_else(|| LiquidError::SyncFailed("Address index exhausted".into()))?;
+        let address = self.address_at(next)?;
+        self.revealed.set(next)?;
+        Ok(address)
+    }
+
+    /// LWK's first unused external index, or the last one handed out when
+    /// that is higher: every index from LWK's on has received nothing, so a
+    /// handed-out index at or above it is still unused.
+    fn current_external_index(&self) -> Result<u32, TemplarError> {
+        let first_unused = self
             .wollet
             .address(None)
-            .map_err(|e| LiquidError::SyncFailed(format!("Address: {e}")))?;
-        Ok(info.address().to_string())
+            .map_err(|e| LiquidError::SyncFailed(format!("Address: {e}")))?
+            .index();
+        Ok(first_unused.max(self.revealed.value.unwrap_or(0)))
+    }
+
+    fn address_at(&self, index: u32) -> Result<ReceiveAddress, TemplarError> {
+        let address = self
+            .wollet
+            .address(Some(index))
+            .map_err(|e| LiquidError::SyncFailed(format!("Address: {e}")))?
+            .address()
+            .clone();
+        Ok(ReceiveAddress {
+            unconfidential: address.to_unconfidential().to_string(),
+            address: address.to_string(),
+            index,
+        })
     }
 
     /// Lists external receive addresses that have received at least one
@@ -1921,6 +2059,68 @@ mod tests {
     }
 
     const CT_DESC: &str = "ct(slip77(addfe14f6d96eb091712439190737b901b6b5558d7039ed1d0dd19a7305cb747),elwpkh([f0b68896/84'/1'/0']tpubDCVwWj4hEpeWNFcWe3Eo1DrkLnPC4c2iitjw5wAuTkSZgofJbRMD4KESh1uhsqLCCjcjR36JooEFwfWf1ezwmAfjcPCxc7KNtnfBCrMPdtT/<0;1>/*))";
+
+    #[test]
+    fn fresh_address_advances_persists_and_keeps_the_script() {
+        let dir = std::env::temp_dir().join(format!(
+            "templar-liquid-revealed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let open = || {
+            LiquidWalletManager::watch_only_with_persist_on(
+                &LiquidNetwork::testnet(),
+                CT_DESC,
+                Some(&dir),
+            )
+            .unwrap()
+        };
+
+        let mut w = open();
+        let first = w.receive_address().unwrap();
+        assert_eq!(first.index, 0);
+        assert_eq!(w.receive_address().unwrap(), first);
+        let fresh = w.fresh_receive_address().unwrap();
+        assert_eq!(fresh.index, 1);
+        assert_eq!(w.get_new_address().unwrap(), fresh.address);
+
+        // Both forms pay the same output script; only the blinding key differs.
+        let conf: Address = fresh.address.parse().unwrap();
+        let plain: Address = fresh.unconfidential.parse().unwrap();
+        assert!(conf.is_blinded() && !plain.is_blinded());
+        assert_eq!(conf.script_pubkey(), plain.script_pubkey());
+        assert!(fresh.unconfidential.starts_with("tex1"));
+        assert_eq!(
+            unconfidential_address(&fresh.address).as_deref(),
+            Some(fresh.unconfidential.as_str())
+        );
+        assert_eq!(
+            unconfidential_address(&fresh.unconfidential).as_deref(),
+            Some(fresh.unconfidential.as_str())
+        );
+        assert_eq!(unconfidential_address("tb1qnotliquid"), None);
+
+        // Reopened, the wallet resumes where "New address" left it.
+        drop(w);
+        let mut w = open();
+        assert_eq!(w.receive_address().unwrap(), fresh);
+        assert_eq!(w.fresh_receive_address().unwrap().index, 2);
+
+        // Without a data directory the counter lives for the session only.
+        let mut mem = LiquidWalletManager::watch_only_with_persist_on(
+            &LiquidNetwork::testnet(),
+            CT_DESC,
+            None,
+        )
+        .unwrap();
+        assert_eq!(mem.fresh_receive_address().unwrap().index, 1);
+        assert_eq!(mem.receive_address().unwrap().index, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wallet_reports_the_network_it_was_opened_on() {

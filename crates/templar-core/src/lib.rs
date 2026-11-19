@@ -100,8 +100,8 @@ pub use liquid::pset::{
     PsetRecipient,
 };
 pub use liquid::wallet::{
-    fetch_asset_metadata, fetch_asset_metadata_on, LiquidBalance, LiquidTx, LiquidWalletManager,
-    Pset, LIQUID_ELECTRUM_URL,
+    fetch_asset_metadata, fetch_asset_metadata_on, unconfidential_address, LiquidBalance, LiquidTx,
+    LiquidWalletManager, Pset, ReceiveAddress, LIQUID_ELECTRUM_URL,
 };
 pub use liquid::watch_only::{create_watch_only, validate_ct_descriptor};
 pub use policy::engine::{PolicyCompiler, PolicyKeyResolver};

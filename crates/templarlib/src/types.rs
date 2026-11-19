@@ -529,6 +529,11 @@ pub struct AddressInfoDto {
     pub label: Option<String>,
     pub received_sats: i64,
     pub derivation_path: Option<String>,
+    /// Liquid only: the address without its blinding key — the form an
+    /// explorer shows, since the key never goes on chain. `address` stays
+    /// the confidential one to hand out. Absent on Bitcoin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unconfidential_address: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
