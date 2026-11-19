@@ -7,6 +7,8 @@ with 0, any release may change the method contract.
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-19
+
 ### Changed
 
 - `generate_receive_address` honours `fresh` on Liquid as on Bitcoin: the
@@ -361,7 +363,8 @@ local Liquid regtest for development. Mainnet is refused by design.
 - Templar Protocol connector: the escrow account key and PSET inspection a
   wallet needs to connect to a site and sign loan transactions.
 
-[Unreleased]: https://github.com/0xB4LdW1n/templarlib/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/0xB4LdW1n/templarlib/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/0xB4LdW1n/templarlib/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/0xB4LdW1n/templarlib/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/0xB4LdW1n/templarlib/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/0xB4LdW1n/templarlib/commit/62bf911

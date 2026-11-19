@@ -3059,7 +3059,7 @@ dependencies = [
 
 [[package]]
 name = "templar-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3096,7 +3096,7 @@ dependencies = [
 
 [[package]]
 name = "templarlib"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bdk",
  "dirs-next",
